@@ -1,6 +1,6 @@
 # highlightctx
 
-Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional `ignore_drop` integration.
+Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional [`ignore_drop`](../ignore_drop/README.md) integration.
 
 Current module version in source: **0.6.0**
 
@@ -8,7 +8,7 @@ Current module version in source: **0.6.0**
 
 ## What this module is for
 
-`highlightctx` is designed for a very specific gap in the usual ZNC workflow:
+[`highlightctx`](./src/highlightctx.cpp) is designed for a very specific gap in the usual ZNC workflow:
 
 when you are **detached** from a network, you may still want a clean, focused replay of the most important conversations that happened while you were away — not a full playback dump, and not a dependency on the normal channel buffer length.
 
@@ -42,7 +42,7 @@ The source is explicit about the intended behavior:
 - **Sort replay by channel, then event time**
 - **Clear delivered events after replay**
 - **Use native IRCv3 time/server-time replay when supported by the client**, otherwise fall back to inline UTC timestamps
-- **Optional `ignore_drop` integration** with `off`, `on`, and `auto` modes
+- **Optional [`ignore_drop`]((../ignore_drop/README.md) integration** with `off`, `on`, and `auto` modes
 
 ---
 
@@ -229,7 +229,7 @@ Internal threshold in the source:
 
 ## `ignore_drop` integration
 
-The module supports three integration modes for `ignore_drop`:
+The module supports three integration modes for [`ignore_drop`]((../ignore_drop/README.md):
 
 - `off`
 - `on`
