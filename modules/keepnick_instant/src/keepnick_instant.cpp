@@ -1,11 +1,13 @@
-// keepnick_instant.cpp — ISON-only, idle-aware, join-safe nick reclaim for ZNC
-// Version: 1.2.0
+// keepnick_instant.cpp — auto-backend, idle-aware, join-safe nick reclaim for ZNC
+// Version: 1.5.1
 // Behavior:
-//   • Polls with ISON every Interval seconds (default 5s) ONLY when you don't own the Primary nick
-//   • Idle-aware: skips a poll if you sent any command in the last IdleGap seconds (default 2s)
-//   • Join-safe: first poll is delayed StartDelay seconds after connect (default 90s)
+//   • Backend mode: Auto (default) uses MONITOR when advertised via 005, and can also live-probe MONITOR on hot-swapped already-connected sessions; otherwise falls back to ISON
+//   • Polls with ISON every Interval seconds (default 5s) ONLY when backend resolves to ISON and you don't own the Primary nick
+//   • MONITOR mode subscribes after StartDelay and reacts to 731/730 events when the server supports it
+//   • Idle-aware: skips a backend check if you sent any command in the last IdleGap seconds (default 2s)
+//   • Join-safe: first backend action is delayed StartDelay seconds after connect (default 90s)
 //   • Dedupes: won't send repeated NICK within MinGap seconds (default 3s)
-//   • Jitter: adds 0..Jitter seconds (default 0) to each poll so it doesn't align with other timers
+//   • Jitter: adds 0..Jitter seconds (default 0) to each scheduled backend tick so it doesn't align with other timers
 //
 // Build: znc-buildmod keepnick_instant.cpp
 #include <znc/Modules.h>
@@ -21,15 +23,15 @@ class CKeepNickInstant;
 
 class CISONOnceTimer : public CTimer {
  public:
-  CISONOnceTimer(CModule* pMod, unsigned int secs)
-    : CTimer(pMod, secs, 1, "ISON poll (single)", "ison_once") {}
+  CISONOnceTimer(CModule* pMod, unsigned int secs, const CString& sLabel)
+    : CTimer(pMod, secs, 1, sLabel, "Backend tick (single)") {}
   void RunJob() override;
 };
 
 class CRearmTimer : public CTimer {
  public:
   CRearmTimer(CModule* pMod, unsigned int secs)
-    : CTimer(pMod, secs, 1, "Reclaim dedupe", "rearm") {}
+    : CTimer(pMod, secs, 1, "", "Reclaim dedupe") {}
   void RunJob() override;
 };
 
@@ -38,21 +40,51 @@ class CKeepNickInstant : public CModule {
   friend class CRearmTimer;
 
  private:
+  enum EBackendMode {
+    BACKEND_AUTO = 0,
+    BACKEND_ISON,
+    BACKEND_MONITOR,
+  };
+
   // ---- Config (persisted) ----
-  CString  Primary;
-  bool     Enabled           = true;   // Enable/disable module logic
-  unsigned IntervalSec       = 5;      // ISON interval (s) when you DON'T own the nick
-  unsigned IdleGapSec        = 2;      // Skip poll if you were active in last N seconds
-  unsigned StartDelaySec     = 90;     // First poll after connect (join-safe)
-  unsigned JitterSec         = 0;      // Add 0..J seconds to each poll (DEFAULT 0)
-  unsigned MinGapSec         = 3;      // Min spacing between actual NICK attempts
+  CString      Primary;
+  bool         Enabled           = true;           // Enable/disable module logic
+  EBackendMode BackendMode       = BACKEND_AUTO;   // Auto / Ison / Monitor
+  unsigned     IntervalSec       = 5;              // ISON interval (s) when backend resolves to ISON and you DON'T own the nick
+  unsigned     IdleGapSec        = 2;              // Skip backend tick if you were active in last N seconds
+  unsigned     StartDelaySec     = 90;             // First backend action after connect (join-safe)
+  unsigned     JitterSec         = 0;              // Add 0..J seconds to each scheduled backend tick (DEFAULT 0)
+  unsigned     MinGapSec         = 3;              // Min spacing between actual NICK attempts
 
   // ---- State ----
-  bool   TimerArmed       = false;     // Is a single-shot ISON timer active
-  time_t LastUserActivity = 0;         // Updated on any user-sent line
-  time_t LastAttempt      = 0;         // Last time we sent NICK <Primary>
+  bool     TimerArmed              = false;        // Is a single-shot backend timer active
+  time_t   LastUserActivity        = 0;            // Updated on any user-sent line
+  time_t   LastAttempt             = 0;            // Last time we sent NICK <Primary>
+  bool     MonitorSupported        = false;        // Saw MONITOR in 005 / ISUPPORT for this connection
+  bool     MonitorUsable           = true;         // Cleared if MONITOR add failed (e.g. 734)
+  bool     MonitorActive           = false;        // Did we add Primary to MONITOR on this connection?
+  bool     MonitorProbeSent        = false;        // Sent a live MONITOR probe on an already-connected session without having seen 005 yet
+  unsigned MonitorLimit            = 0;            // Optional MONITOR=<n> limit from ISUPPORT
+  unsigned BackendTimerSerial      = 0;            // Unique backend timer label suffix
+  CString  BackendTimerLabel;                      // Currently armed backend timer label
 
   // ---- Helpers ----
+  static CString BackendModeToString(EBackendMode mode) {
+    switch (mode) {
+      case BACKEND_ISON:    return "Ison";
+      case BACKEND_MONITOR: return "Monitor";
+      default:              return "Auto";
+    }
+  }
+
+  static bool ParseBackendMode(const CString& s, EBackendMode& mode) {
+    CString x = s.AsLower();
+    if (x == "auto")    { mode = BACKEND_AUTO; return true; }
+    if (x == "ison")    { mode = BACKEND_ISON; return true; }
+    if (x == "monitor") { mode = BACKEND_MONITOR; return true; }
+    return false;
+  }
+
   void LoadPrimary(const CString& arg) {
     if (!arg.empty()) { Primary = arg; SetNV("PrimaryNick", Primary); return; }
     CString stored = GetNV("PrimaryNick");
@@ -64,14 +96,23 @@ class CKeepNickInstant : public CModule {
 
   void LoadNV() {
     Enabled = GetNV("Enabled").empty() ? true : (GetNV("Enabled") == "1");
+    {
+      CString r = GetNV("BackendMode");
+      if (!r.empty()) {
+        EBackendMode mode;
+        if (ParseBackendMode(r, mode)) BackendMode = mode;
+      }
+    }
     { CString r=GetNV("IntervalSec");   if (!r.empty()) { unsigned v=r.ToUInt(); if (v>=5 && v<=300) IntervalSec=v; } }
     { CString r=GetNV("IdleGapSec");    if (!r.empty()) { unsigned v=r.ToUInt(); if (v<=30)          IdleGapSec=v; } }
     { CString r=GetNV("StartDelaySec"); if (!r.empty()) { unsigned v=r.ToUInt(); if (v<=600)         StartDelaySec=v; } }
     { CString r=GetNV("JitterSec");     if (!r.empty()) { unsigned v=r.ToUInt(); if (v<=10)          JitterSec=v; } }
     { CString r=GetNV("MinGapSec");     if (!r.empty()) { unsigned v=r.ToUInt(); if (v<=30)          MinGapSec=v; } }
   }
+
   void SaveNV() {
     SetNV("Enabled",       Enabled ? "1" : "0");
+    SetNV("BackendMode",   BackendModeToString(BackendMode));
     SetNV("IntervalSec",   CString(IntervalSec));
     SetNV("IdleGapSec",    CString(IdleGapSec));
     SetNV("StartDelaySec", CString(StartDelaySec));
@@ -85,15 +126,111 @@ class CKeepNickInstant : public CModule {
            GetNetwork()->GetIRCNick().GetNick().Equals(Primary, false);
   }
 
-  void ArmISON(unsigned delay) {
+  bool IsConnected() const {
+    return GetNetwork() && GetNetwork()->IsIRCConnected();
+  }
+
+  bool UseMonitorBackend() const {
+    if (BackendMode == BACKEND_ISON) return false;
+    if (!MonitorSupported || !MonitorUsable) return false;
+    return true; // Auto and Monitor both use MONITOR when it's actually available/usable
+  }
+
+  CString EffectiveBackendName() const {
+    return UseMonitorBackend() ? "MONITOR" : "ISON";
+  }
+
+  void ArmBackend(unsigned delay) {
     if (!Enabled || TimerArmed) return;
     TimerArmed = true;
-    AddTimer(new CISONOnceTimer(this, delay));
+    BackendTimerLabel = "backend_once_" + CString(++BackendTimerSerial);
+    if (!AddTimer(new CISONOnceTimer(this, delay, BackendTimerLabel))) {
+      TimerArmed = false;
+      BackendTimerLabel = "";
+      PutModule("Warning: failed to arm backend timer.");
+    }
   }
-  void RearmISON() {
+
+  void ForceArmBackend(unsigned delay) {
+    if (!Enabled) return;
+    if (TimerArmed && !BackendTimerLabel.empty()) RemTimer(BackendTimerLabel);
     TimerArmed = false;
+    BackendTimerLabel = "";
+    ArmBackend(delay);
+  }
+
+  void RearmBackend() {
+    TimerArmed = false;
+    BackendTimerLabel = "";
     unsigned next = IntervalSec + Rand0To(JitterSec);
-    ArmISON(next);
+    ArmBackend(next);
+  }
+
+  void RunBackendCheckNow(bool bIgnoreIdle) {
+    if (!Enabled) return;
+
+    if (HavePrimary()) {
+      if (MonitorActive) StopMonitor(Primary);
+      return;
+    }
+
+    time_t now = std::time(nullptr);
+    if (!bIgnoreIdle && LastUserActivity && (now - LastUserActivity) < (time_t)IdleGapSec) return;
+
+    if (UseMonitorBackend()) {
+      if (!MonitorActive) EnsureMonitor();
+      else PutIRC("MONITOR S");
+    } else if (!MaybeProbeMonitor()) {
+      if (MonitorActive) StopMonitor(Primary);
+      PutIRC("ISON " + Primary);
+    }
+  }
+
+  void KickBackendNow(bool bIgnoreIdle) {
+    if (!Enabled || Primary.empty()) return;
+    RunBackendCheckNow(bIgnoreIdle);
+    if (!HavePrimary()) ForceArmBackend(IntervalSec + Rand0To(JitterSec));
+  }
+
+  bool MaybeProbeMonitor() {
+    if (!Enabled) return false;
+    if (BackendMode == BACKEND_ISON) return false;
+    if (!MonitorUsable || MonitorSupported || MonitorProbeSent || MonitorActive) return false;
+    if (!IsConnected()) return false;
+    if (Primary.empty() || HavePrimary()) return false;
+    PutIRC("MONITOR + " + Primary);
+    MonitorProbeSent = true;
+    // MonitorActive is intentionally NOT set here — it is only set to true
+    // once the server confirms support via a 730/731 response. Setting it
+    // prematurely here would cause other code paths to treat an unconfirmed
+    // probe as an active subscription, which can lead to spurious MONITOR -
+    // commands and silent fallback failures on servers that drop unknown commands.
+    return true;
+  }
+
+  void StopMonitor(const CString& nick) {
+    if (!MonitorActive || nick.empty()) return;
+    PutIRC("MONITOR - " + nick);
+    MonitorActive = false;
+  }
+
+  void EnsureMonitor() {
+    if (!Enabled) return;
+    if (HavePrimary()) return;
+    if (!UseMonitorBackend()) return;
+    if (MonitorActive) return;
+    PutIRC("MONITOR + " + Primary);
+    MonitorActive = true;
+  }
+
+  bool MonitorListContainsPrimary(const CString& rawList, bool allowHostmask) const {
+    VCString targets;
+    rawList.Split(",", targets, false);
+    for (const auto& entry : targets) {
+      CString nick = allowHostmask ? entry.Token(0, false, "!") : entry;
+      if (nick.Equals(Primary, false)) return true;
+    }
+    return false;
   }
 
   void TryReclaim() {
@@ -103,7 +240,9 @@ class CKeepNickInstant : public CModule {
     if (LastAttempt && now - LastAttempt < (time_t)MinGapSec) return; // dedupe
     LastAttempt = now;
     PutIRC("NICK " + Primary);
-    AddTimer(new CRearmTimer(this, MinGapSec)); // harmless spacing guard
+    if (!AddTimer(new CRearmTimer(this, MinGapSec))) {
+      PutModule("Warning: failed to arm reclaim dedupe timer.");
+    }
   }
 
  public:
@@ -113,19 +252,32 @@ class CKeepNickInstant : public CModule {
     std::srand((unsigned)std::time(nullptr) ^ (unsigned)(uintptr_t)this);
     LoadPrimary(sArgs.Trim_n());
     LoadNV();
-    ArmISON(StartDelaySec); // join-safe start
+    MaybeProbeMonitor();       // lets hot-swapped reloads discover MONITOR on an already-live session
+    ArmBackend(StartDelaySec); // join-safe start
     return true;
   }
 
   void OnIRCConnected() override {
     TimerArmed = false;
+    BackendTimerLabel = "";
     LastAttempt = 0;
-    ArmISON(StartDelaySec); // join-safe start
+    MonitorSupported = false;
+    MonitorUsable = true;
+    MonitorActive = false;
+    MonitorProbeSent = false;
+    MonitorLimit = 0;
+    ArmBackend(StartDelaySec); // join-safe start
   }
 
   void OnIRCDisconnected() override {
     TimerArmed = false;
+    BackendTimerLabel = "";
     LastAttempt = 0;
+    MonitorSupported = false;
+    MonitorUsable = true;
+    MonitorActive = false;
+    MonitorProbeSent = false;
+    MonitorLimit = 0;
   }
 
   // Track user activity: any outbound line from your client through ZNC
@@ -134,17 +286,33 @@ class CKeepNickInstant : public CModule {
     return CONTINUE;
   }
 
-  // Handle ISON reply and visible NICK/QUIT (when you share a channel)
+  // Handle 005 ISUPPORT, ISON replies, MONITOR numerics, MONITOR probe fallbacks, and visible NICK/QUIT (when you share a channel)
   EModRet OnRaw(CString& sLine) override {
     VCString v; sLine.Split(" ", v, false);
     if (v.size() < 2) return CONTINUE;
     const CString& cmd = v[1];
 
+    // ISUPPORT: 005 <me> token token ... :are supported by this server
+    if (cmd == "005") {
+      for (size_t i = 3; i < v.size(); ++i) {
+        const CString& tok = v[i];
+        if (tok.StartsWith(":")) break;
+
+        CString key = tok.Token(0, false, "=");
+        if (key.Equals("MONITOR", false)) {
+          MonitorSupported = true;
+          CString val = tok.Token(1, false, "=");
+          if (!val.empty()) MonitorLimit = val.ToUInt();
+        }
+      }
+      return CONTINUE;
+    }
+
     // ISON result: 303 <me> :nick1 nick2 ...
     if (cmd == "303") {
       // Older ZNC API compat: trailing starts at token index 3
       CString trailing = sLine.Token(3, true);    // ":nick1 nick2 ..."
-      trailing.TrimLeft(CString(":"));            // Trim leading ':'
+      trailing.TrimLeft(CString(":"));           // Trim leading ':'
 
       bool present = false;
       VCString names; trailing.Split(" ", names, false);
@@ -155,15 +323,51 @@ class CKeepNickInstant : public CModule {
       return CONTINUE;
     }
 
+    // MONITOR online/offline numerics
+    if (cmd == "730" || cmd == "731") {
+      MonitorSupported = true;
+      MonitorUsable = true;
+      MonitorActive = true;
+      CString trailing = sLine.Token(3, true);
+      trailing.TrimLeft(CString(":"));
+      bool match = MonitorListContainsPrimary(trailing, cmd == "730");
+      if (cmd == "731" && match) TryReclaim();
+      return CONTINUE;
+    }
+
+    // MONITOR list full for our add; fall back to ISON on this connection
+    if (cmd == "734") {
+      if (v.size() >= 5 && MonitorListContainsPrimary(v[4], false)) {
+        MonitorSupported = true;
+        MonitorUsable = false;
+        MonitorActive = false;
+        PutModule("MONITOR list full/unusable for this target on this connection; falling back to ISON.");
+        ForceArmBackend(IntervalSec);
+      }
+      return CONTINUE;
+    }
+
+    // MONITOR unsupported on this connection/server; fall back to ISON
+    if (cmd == "421") {
+      if (v.size() >= 4 && v[3].Equals("MONITOR", false)) {
+        MonitorSupported = false;
+        MonitorUsable = false;
+        MonitorActive = false;
+        PutModule("MONITOR unsupported on this connection; falling back to ISON.");
+        ForceArmBackend(IntervalSec);
+      }
+      return CONTINUE;
+    }
+
     // Visible events: :old!u@h NICK :new   /   :nick!u@h QUIT :msg
     if (v[0].StartsWith(":")) {
       if (cmd.Equals("NICK", false)) {
         CString oldnick = v[0].TrimPrefix_n(":"); oldnick = oldnick.Token(0, false, "!");
         CString newnick; if (v.size() >= 3 && v[2].StartsWith(":")) newnick = v[2].TrimPrefix_n(":");
-        if (oldnick.Equals(Primary, false) && !newnick.Equals(Primary, false)) TryReclaim();
+        if (oldnick.Equals(Primary, false) && !newnick.Equals(Primary, false)) { TryReclaim(); KickBackendNow(true); }
       } else if (cmd.Equals("QUIT", false)) {
         CString qnick = v[0].TrimPrefix_n(":"); qnick = qnick.Token(0, false, "!");
-        if (qnick.Equals(Primary, false)) TryReclaim();
+        if (qnick.Equals(Primary, false)) { TryReclaim(); KickBackendNow(true); }
       }
     }
     return CONTINUE;
@@ -173,31 +377,65 @@ class CKeepNickInstant : public CModule {
   void OnModCommand(const CString& sCmdLine) override {
     CString cmd = sCmdLine.Token(0).AsLower();
 
-    if (cmd == "enable")   { Enabled = true;  SaveNV(); PutModule("Enabled. Polling runs only when you don't own the nick."); if (!TimerArmed) ArmISON(IntervalSec); }
-    else if (cmd == "disable"){ Enabled = false; SaveNV(); PutModule("Disabled. No ISON polls or reclaim attempts."); }
+    if (cmd == "enable") {
+      Enabled = true;
+      SaveNV();
+      PutModule("Enabled. Backend checks run only when you don't own the nick.");
+      if (!HavePrimary()) KickBackendNow(true);
+    }
+    else if (cmd == "disable") {
+      Enabled = false;
+      SaveNV();
+      if (MonitorActive) StopMonitor(Primary);
+      PutModule("Disabled. No backend checks or reclaim attempts.");
+    }
     else if (cmd == "setnick") {
       CString nick = sCmdLine.Token(1, true).Trim_n();
       if (nick.empty()) { PutModule("Usage: SetNick <nick> — Set & persist the primary nick to reclaim."); return; }
-      Primary = nick; SaveNV(); PutModule("Primary nick set to: " + Primary);
+      CString old = Primary;
+      if (MonitorActive && !old.empty() && !old.Equals(nick, false)) StopMonitor(old);
+      Primary = nick;
+      SaveNV();
+      MonitorUsable = true;
+      MonitorProbeSent = false;
+      PutModule("Primary nick set to: " + Primary);
+      if (!HavePrimary()) {
+        KickBackendNow(true);
+      }
+    }
+    else if (cmd == "backend") {
+      EBackendMode mode;
+      if (ParseBackendMode(sCmdLine.Token(1), mode)) {
+        BackendMode = mode;
+        SaveNV();
+        MonitorUsable = true;
+        if (MonitorActive && !UseMonitorBackend()) StopMonitor(Primary);
+        if (!HavePrimary()) {
+          KickBackendNow(true);
+        }
+        PutModule("Backend mode set to " + BackendModeToString(BackendMode) + ". Effective backend now: " + EffectiveBackendName() + ".");
+      } else {
+        PutModule("Usage: Backend <Auto|Ison|Monitor> — Default Auto.");
+      }
     }
     else if (cmd == "interval") {
       unsigned v = sCmdLine.Token(1).ToUInt();
-      if (v>=5 && v<=300) { IntervalSec=v; SaveNV(); PutModule("Interval set to " + CString(v) + "s (ISON frequency when you don't own the nick)."); }
+      if (v>=5 && v<=300) { IntervalSec=v; SaveNV(); PutModule("Interval set to " + CString(v) + "s (ISON frequency when backend resolves to ISON and you don't own the nick)."); }
       else PutModule("Usage: Interval <seconds 5-300> — Default 5s.");
     }
     else if (cmd == "idlegap") {
       unsigned v = sCmdLine.Token(1).ToUInt();
-      if (v<=30) { IdleGapSec=v; SaveNV(); PutModule("IdleGap set to " + CString(v) + "s. Skip a poll if you've sent anything in the last IdleGap seconds."); }
+      if (v<=30) { IdleGapSec=v; SaveNV(); PutModule("IdleGap set to " + CString(v) + "s. Skip a backend tick if you've sent anything in the last IdleGap seconds."); }
       else PutModule("Usage: IdleGap <seconds 0-30> — Default 2s.");
     }
     else if (cmd == "startdelay") {
       unsigned v = sCmdLine.Token(1).ToUInt();
-      if (v<=600) { StartDelaySec=v; SaveNV(); PutModule("StartDelay set to " + CString(v) + "s. First ISON after connect (join-safe). Effective next connect."); }
+      if (v<=600) { StartDelaySec=v; SaveNV(); PutModule("StartDelay set to " + CString(v) + "s. First backend action after connect (join-safe). Effective next connect."); }
       else PutModule("Usage: StartDelay <seconds 0-600> — Default 90s.");
     }
     else if (cmd == "jitter") {
       unsigned v = sCmdLine.Token(1).ToUInt();
-      if (v<=10) { JitterSec=v; SaveNV(); PutModule("Jitter set to 0.." + CString(v) + "s. Random extra wait added to each poll."); }
+      if (v<=10) { JitterSec=v; SaveNV(); PutModule("Jitter set to 0.." + CString(v) + "s. Random extra wait added to each scheduled backend tick."); }
       else PutModule("Usage: Jitter <seconds 0-10> — Default 0s.");
     }
     else if (cmd == "mingap") {
@@ -207,30 +445,38 @@ class CKeepNickInstant : public CModule {
     }
     else if (cmd == "poke") {
       LastUserActivity = 0; // ensure it's considered idle
-      ArmISON(0);
-      PutModule("Poke: scheduling an immediate ISON once.");
+      if (MonitorActive && !UseMonitorBackend()) StopMonitor(Primary);
+      KickBackendNow(true);
+      PutModule("Poke: forcing an immediate backend check now.");
     }
     else if (cmd == "show" || cmd.empty() || cmd == "help") {
       CString cur = GetNetwork() ? GetNetwork()->GetIRCNick().GetNick() : "<none>";
-      PutModule("keepnick_instant — ISON-only nick reclaim (idle-aware & join-safe).");
-      PutModule("Version: 1.2.0");
+      PutModule("keepnick_instant — auto-backend nick reclaim (MONITOR when available, otherwise ISON; idle-aware & join-safe).");
+      PutModule("Version: 1.5.1");
       PutModule("Current state:");
       PutModule("  Status: " + CString(Enabled ? "ENABLED" : "DISABLED"));
       PutModule("  Primary: " + Primary + "   |   Current: " + cur);
+      PutModule("  Backend mode: " + BackendModeToString(BackendMode) + "   |   Effective: " + EffectiveBackendName());
+      CString monLine = "  MONITOR advertised/detected: " + CString(MonitorSupported ? "yes" : "no");
+      if (MonitorLimit) monLine += "   |   Limit: " + CString(MonitorLimit);
+      monLine += "   |   Active: " + CString(MonitorActive ? "yes" : "no");
+      monLine += "   |   Live probe sent: " + CString(MonitorProbeSent ? "yes" : "no");
+      PutModule(monLine);
       PutModule("  Interval: " + CString(IntervalSec) + "s   (default 5s)");
       PutModule("  IdleGap: " + CString(IdleGapSec) + "s     (default 2s)");
-      PutModule("  StartDelay: " + CString(StartDelaySec) + "s (default 90s; first poll after connect)");
+      PutModule("  StartDelay: " + CString(StartDelaySec) + "s (default 90s; first backend action after connect)");
       PutModule("  Jitter: 0.." + CString(JitterSec) + "s      (default 0s; random extra wait)");
       PutModule("  MinGap: " + CString(MinGapSec) + "s        (default 3s; dedupe NICK attempts)");
       PutModule("Commands:");
       PutModule("  Enable | Disable");
       PutModule("  SetNick <nick>            — Set primary nick (persisted).");
-      PutModule("  Interval <5-300>          — ISON interval when you don't own the nick (default 5s).");
-      PutModule("  IdleGap <0-30>            — Skip poll if active in last N seconds (default 2s).");
-      PutModule("  StartDelay <0-600>        — First poll after connect (default 90s).");
-      PutModule("  Jitter <0-10>             — Add 0..J seconds to each poll (default 0s).");
+      PutModule("  Backend <Auto|Ison|Monitor> — Select backend mode (default Auto).");
+      PutModule("  Interval <5-300>          — ISON interval when effective backend is ISON (default 5s).");
+      PutModule("  IdleGap <0-30>            — Skip backend tick if active in last N seconds (default 2s).");
+      PutModule("  StartDelay <0-600>        — First backend action after connect (default 90s).");
+      PutModule("  Jitter <0-10>             — Add 0..J seconds to each scheduled backend tick (default 0s).");
       PutModule("  MinGap <0-30>             — Minimum spacing between NICK attempts (default 3s).");
-      PutModule("  Poke                      — Run one immediate ISON now (ignores StartDelay, still idle-aware).");
+      PutModule("  Poke                      — Force an immediate backend check now (ignores StartDelay and idle suppression; may live-probe MONITOR if needed).");
       PutModule("  Show | Help               — Show this status/help.");
     }
     else {
@@ -243,28 +489,27 @@ class CKeepNickInstant : public CModule {
 void CISONOnceTimer::RunJob() {
   auto* m = (CKeepNickInstant*)GetModule();
   m->TimerArmed = false;
+  m->BackendTimerLabel = "";
 
   if (!m->Enabled) return;
-  if (m->HavePrimary()) { m->RearmISON(); return; }
 
-  // Idle-aware: skip if you were active recently
-  time_t now = std::time(nullptr);
-  if (m->LastUserActivity && (now - m->LastUserActivity) < (time_t)m->IdleGapSec) {
-    m->RearmISON(); return;
-  }
-
-  // Send single-nick ISON
-  m->PutIRC("ISON " + m->Primary);
-  m->RearmISON();
+  m->RunBackendCheckNow(false);
+  m->RearmBackend();
 }
 
 void CRearmTimer::RunJob() {
-  // spacing guard; no action needed
+  // After a reactive reclaim attempt (triggered by a visible NICK/QUIT event),
+  // verify the reclaim loop is still running. If the reclaim was rejected
+  // (e.g. a race where someone else grabbed the nick first), this ensures
+  // the backend scheduler picks back up rather than going silent until the
+  // next incidentally scheduled tick.
+  auto* m = (CKeepNickInstant*)GetModule();
+  if (!m->TimerArmed && !m->HavePrimary())
+    m->ForceArmBackend(m->IntervalSec + Rand0To(m->JitterSec));
 }
 
 template<> void TModInfo<CKeepNickInstant>(CModInfo& Info) {
   Info.SetHasArgs(true);
-  Info.SetDescription("ISON-only, idle-aware, join-safe nick reclaim for ZNC");
+  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available, otherwise ISON; immediate backend kick and corrected timer labels)");
 }
-NETWORKMODULEDEFS(CKeepNickInstant, "ISON-only keepnick (instant-ish)")
-
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload aware, corrected timer labels)")

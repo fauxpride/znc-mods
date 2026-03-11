@@ -1,12 +1,27 @@
 # keepnick_instant
 
-[`keepnick_instant`](./src/keepnick_instant.cpp) is a lightweight ZNC network module that tries to reclaim your preferred nickname as soon as it becomes available again, while still being conservative enough to avoid noisy or risky behavior on IRC networks.
+[`keepnick_instant`](./src/keepnick_instant.cpp) is a ZNC network module that quickly regains your preferred nickname on networks without nick registration services.
 
-It is designed for networks where nicknames are **not reserved by channel services / nickname services**, so simply switching back to your preferred nick is enough when that nick becomes free. In practice, that makes it especially useful on networks such as **Undernet**, which is the primary target this module was tuned around.
+It is designed for the classic IRC case where there is no NickServ-style ownership gate keeping your preferred nick reserved for you, and where the right recovery action is simply to switch back the moment that nick becomes available.
+
+As of version **1.5.1**, the module supports two reclaim backends:
+
+- **`MONITOR` when the server advertises it via `005` / ISUPPORT**
+- **`ISON` otherwise**
+
+The default behavior is **`Backend Auto`**, which means the module will automatically use `MONITOR` where available and fall back to the original `ISON` logic everywhere else.
+
+That makes it a good fit for mixed IRC environments:
+
+- it keeps the original Undernet-style `ISON` behavior on networks that do not offer `MONITOR`,
+- it gains push-style reclaim on daemons and networks that do support `MONITOR`,
+- it still preserves the same safety model: idle-awareness, join-safe startup delay, optional jitter, and deduped `NICK` attempts.
+
+This is especially useful on networks such as **Undernet**, which remains the primary environment this module was tuned around.
 
 In other words: this module exists for the classic IRC case where your preferred nick may be temporarily occupied, you connect under an alternate nick, and you want ZNC to quietly and safely switch back the moment the preferred nick becomes available.
 
-Compared with ZNC's built-in `keepnick` module, `keepnick_instant` is deliberately more cautious and more explicit about *when* it will try to reclaim. Stock `keepnick` periodically attempts a direct `NICK` back to the network's configured nick and also reacts to visible `NICK`/`QUIT` events for that nick, while `keepnick_instant` adds `ISON`-based availability checks, post-connect delay, idle-awareness, optional jitter, and deduped reclaim spacing. That makes the stock module a fine generic default, but makes `keepnick_instant` a better fit for Undernet-style networks where you want quick reclaim once the nick is truly free without adding unnecessary nick-change traffic.
+Compared with ZNC's built-in `keepnick` module, `keepnick_instant` is deliberately more cautious and more explicit about *when* it will try to reclaim. Stock `keepnick` periodically attempts a direct `NICK` back to the network's configured nick and also reacts to visible `NICK`/`QUIT` events for that nick, while `keepnick_instant` adds backend-aware availability checks, post-connect delay, idle-awareness, optional jitter, and deduped reclaim spacing. That makes the stock module a fine generic default, but makes `keepnick_instant` a better fit for Undernet-style networks where you want quick reclaim once the nick is truly free without adding unnecessary nick-change traffic.
 
 ---
 
@@ -18,12 +33,12 @@ When ZNC connects to a network and your primary nick is already in use, the serv
 
 It does so with a deliberately cautious design:
 
-- It polls using `ISON` instead of hammering nick changes blindly.
-- It only polls while you **do not** currently own the target nick.
+- It uses **`MONITOR` when available**, and **`ISON` when not**.
+- It only runs reclaim logic while you **do not** currently own the target nick.
 - It waits after connect before it begins checking, so it does not interfere with initial connect/join phases.
-- It avoids polling immediately after you send commands, reducing the chance of clashing with your own activity.
+- It avoids a backend tick immediately after you send commands, reducing the chance of clashing with your own activity.
 - It spaces out actual `NICK` attempts so duplicate reclaims are not sent too aggressively.
-- It can optionally add jitter so multiple clients or bouncers do not fall into the same polling rhythm.
+- It can optionally add jitter so multiple clients or bouncers do not fall into the same timing rhythm.
 
 The end result is an “instant-ish” nick reclaim module: responsive enough to recover your nick quickly, but careful enough to behave well on networks that are sensitive to bursts of activity.
 
@@ -35,7 +50,8 @@ This module is intended for:
 
 - IRC networks that **do not** have channel/nick services reserving nicks in the modern NickServ sense
 - users who want ZNC to recover a preferred nick automatically
-- environments where conservative, low-noise polling is preferable to aggressive reclaim logic
+- environments where conservative, low-noise reclaim behavior is preferable to aggressive direct nick-change logic
+- mixed environments where some networks advertise `MONITOR` and others do not
 
 This module is **mainly designed to work for Undernet** and similar networks.
 
@@ -51,7 +67,7 @@ ZNC already ships with a core module called `keepnick`, so it is reasonable to a
 
 ZNC's built-in `keepnick` is a small, generic reclaim module. In current ZNC source, it:
 
-- tries to regain the network's configured nick with a repeating 30-second timer,
+- tries to regain the network's configured nick with a repeating timer,
 - also reacts quickly when it sees a visible `NICK` or `QUIT` for the target nick,
 - disables itself in some cases where continuing would be counterproductive, such as specific nickname-change errors or when you intentionally change away from the configured nick.
 
@@ -61,12 +77,14 @@ That behavior is straightforward and useful, and it is one reason `keepnick` has
 
 `keepnick_instant` keeps the same overall objective, but changes the operational model in several important ways:
 
-- it uses `ISON` to check whether the preferred nick is currently present before sending `NICK`,
-- it only polls while you *do not* already own the preferred nick,
+- it has an explicit backend mode: `Auto`, `Ison`, or `Monitor`,
+- in `Auto`, it uses `MONITOR` if the server advertises it in `005`,
+- otherwise it uses `ISON` to check whether the preferred nick is currently present before sending `NICK`,
+- it only runs reclaim logic while you *do not* already own the preferred nick,
 - it waits after connect before starting, so reclaim logic stays out of the initial connect/join burst,
-- it can skip a poll if you were just active,
+- it can skip a backend tick if you were just active,
 - it dedupes actual reclaim attempts with `MinGap`,
-- it can add per-poll jitter to avoid perfectly regular timing.
+- it can add per-tick jitter to avoid perfectly regular timing.
 
 In practice, that makes this module feel more deliberate, less spammy, and easier to tune for networks where being conservative matters.
 
@@ -74,7 +92,7 @@ In practice, that makes this module feel more deliberate, less spammy, and easie
 
 When both modules are aimed at the **same preferred nick**, they are not logically fighting each other: they both converge on the same end state, namely “you got your preferred nick back.” They do not share mutable state, do not patch or disable one another, and neither module depends on private behavior from the other.
 
-The overlap is mostly limited to the possibility that both may send a `NICK` attempt around roughly the same time. That is usually just redundant, not adversarial. Once the nick is successfully reclaimed, `keepnick_instant` stops polling because you already own the target nick, and the stock module has nothing useful left to do either.
+The overlap is mostly limited to the possibility that both may send a `NICK` attempt around roughly the same time. That is usually just redundant, not adversarial. Once the nick is successfully reclaimed, `keepnick_instant` stops doing useful reclaim work because you already own the target nick, and the stock module has nothing useful left to do either.
 
 That said, loading both at once is usually unnecessary. In most real setups, `keepnick_instant` should be treated as a more controlled **alternative** to stock `keepnick`, not as something that needs to be layered on top of it.
 
@@ -88,29 +106,42 @@ For the intended use case, keep them aligned — or just run `keepnick_instant` 
 
 ## Feature summary
 
-- **ISON-only polling**
-  - Uses `ISON <nick>` to check whether the preferred nick is currently online.
-- **Poll only when needed**
-  - If you already have the preferred nick, it does not keep polling to no purpose.
+- **Automatic backend selection**
+  - `Backend Auto` uses `MONITOR` when the server advertises it and falls back to `ISON` otherwise.
+- **Hot-reload MONITOR detection**
+  - On an already-connected session, the module can send a one-time live `MONITOR` probe after a hot-swapped reload so it can discover support without waiting for a reconnect.
+- **Forceable backend mode**
+  - You can explicitly set `Backend Auto`, `Backend Ison`, or `Backend Monitor`.
+- **MONITOR support**
+  - Subscribes to the primary nick, reacts to server online/offline notifications when available, and refreshes current status with `MONITOR S` on later backend ticks while reclaim is still needed.
+- **ISON fallback**
+  - Preserves the original single-nick `ISON` reclaim path on networks that do not offer `MONITOR`.
+- **Run only when needed**
+  - If you already have the preferred nick, it does not send reclaim traffic.
 - **Idle-aware behavior**
-  - If you were just active, the next poll can be skipped.
+  - If you were just active, the next scheduled backend tick can be skipped.
 - **Join-safe startup**
-  - The first poll is delayed after connect.
+  - The first backend action is delayed after connect.
 - **Deduped reclaim attempts**
   - Prevents repeated `NICK <primary>` attempts from being sent too close together.
-- **Optional poll jitter**
-  - Adds a random `0..J` second delay to each scheduled poll.
+- **Optional tick jitter**
+  - Adds a random `0..J` second delay to each scheduled backend tick.
 - **Persisted configuration**
   - Settings are stored with ZNC NV storage.
+- **Immediate backend kick on nick loss**
+  - When the module sees that the primary nick was just vacated, it immediately kicks the selected backend instead of waiting for the next scheduled tick.
+- **Robust backend scheduling**
+  - Backend timers are force-rearmable and use unique labels so hot-swaps, `Poke`, and reactive retries do not silently stall the reclaim loop.
 - **Manual poke command**
-  - Lets you trigger an immediate single `ISON` check.
+  - Forces an immediate backend check now instead of merely requesting the next scheduled one.
 
 ---
 
 ## Default behavior
 
-The module source currently identifies itself as version **1.2.0** and defaults to:
+The module source currently identifies itself as version **1.5.1** and defaults to:
 
+- `Backend = Auto`
 - `Interval = 5s`
 - `IdleGap = 2s`
 - `StartDelay = 90s`
@@ -122,30 +153,69 @@ These defaults reflect a cautious, Undernet-friendly balance:
 
 - fast enough to reclaim a nick quickly,
 - conservative enough to avoid needless churn during connect and join activity,
-- simple enough to reason about when debugging.
+- simple enough to reason about when debugging,
+- backward-compatible with the original ISON behavior on networks that do not advertise `MONITOR`.
+
+---
+
+## Backend model
+
+### `Backend Auto`
+
+This is the default and recommended mode.
+
+Behavior:
+
+- if the server advertises `MONITOR` in `005` / ISUPPORT, the module uses `MONITOR`,
+- if the module is hot-swapped onto an already-connected session and has not seen `005`, it can send a one-time live `MONITOR` probe to detect support immediately,
+- otherwise it uses the original `ISON` path,
+- if `MONITOR` is advertised or live-detected but cannot be used for this target on the current connection, the module falls back to `ISON`,
+- once `MONITOR` is active and reclaim is still needed, later backend ticks can issue `MONITOR S` so the module re-checks persistent offline state instead of relying on a single one-shot event.
+
+This gives you the best compatibility without needing per-network hardcoding.
+
+### `Backend Ison`
+
+Forces the module to use the original `ISON` reclaim behavior even if the server advertises `MONITOR`.
+
+This is mainly useful if:
+
+- you want fully predictable legacy behavior,
+- you are troubleshooting,
+- you want to keep the exact original strategy on a specific network.
+
+### `Backend Monitor`
+
+Requests the `MONITOR` path when possible.
+
+In practice, the module still only uses `MONITOR` when the current server connection actually advertises it or the module has successfully live-detected it on an already-connected session, and the subscription is usable. If not, the effective behavior falls back to `ISON` so the module still functions.
 
 ---
 
 ## How it works at a high level
 
-1. ZNC connects to the IRC network.
-2. The module waits `StartDelay` seconds before the first check.
-3. If you already own the preferred nick, the module stays passive except for its timer cycle.
-4. If you do **not** own the preferred nick, it periodically sends:
+1. ZNC connects to the IRC network, or the module is hot-swapped onto an already-connected network.
+2. On a normal connection, the module waits `StartDelay` seconds before the first backend action.
+3. On a hot-swapped already-live connection, it may send a one-time live `MONITOR` probe immediately so it can detect support without waiting for a reconnect.
+4. If you already own the preferred nick, the module stays passive apart from its internal timer cycle.
+5. If you lose the preferred nick through a visible `NICK` or `QUIT` event, the module immediately kicks the selected backend instead of waiting for the next ordinary scheduled tick.
+6. If you do **not** own the preferred nick:
+   - with `MONITOR`, it subscribes to that nick, reacts to server notifications, and can later issue `MONITOR S` on backend ticks while reclaim is still needed,
+   - with `ISON`, it periodically sends:
 
    ```irc
    ISON <PrimaryNick>
    ```
 
-5. If the nick is not present in the `303` reply, the module sends:
+7. When the module determines the nick is no longer in use, it sends:
 
    ```irc
    NICK <PrimaryNick>
    ```
 
-6. It continues polling on its timer schedule until you successfully recover the nick.
+8. It continues its low-noise scheduler until you successfully recover the nick.
 
-It also reacts opportunistically to visible `NICK` and `QUIT` messages for the target nick when those are visible to you through shared channels, which can let it attempt recovery sooner than the next poll.
+It also reacts opportunistically to visible `NICK` and `QUIT` messages for the target nick when those are visible to you through shared channels, which can let it attempt recovery sooner than the next scheduled backend action.
 
 ---
 
@@ -224,9 +294,17 @@ Example:
 /msg *keepnick_instant Show
 ```
 
+`Show` now includes backend-related state such as:
+
+- configured backend mode,
+- effective backend currently in use,
+- whether `MONITOR` was advertised by the server,
+- whether a `MONITOR` subscription is currently active,
+- optional server-advertised `MONITOR` limit if present.
+
 ### `Enable`
 
-Enables polling and reclaim behavior.
+Enables scheduled backend checks and reclaim behavior.
 
 ```irc
 /msg *keepnick_instant Enable
@@ -234,11 +312,13 @@ Enables polling and reclaim behavior.
 
 ### `Disable`
 
-Disables polling and reclaim behavior.
+Disables backend checks and reclaim behavior.
 
 ```irc
 /msg *keepnick_instant Disable
 ```
+
+If the module is actively using `MONITOR`, it removes its subscription when disabled.
 
 ### `SetNick <nick>`
 
@@ -248,17 +328,37 @@ Sets and persists the primary nickname the module should try to reclaim.
 /msg *keepnick_instant SetNick MyNick
 ```
 
+If the active backend is `MONITOR`, the module updates the monitored target accordingly.
+
+### `Backend <Auto|Ison|Monitor>`
+
+Sets the backend mode.
+
+```irc
+/msg *keepnick_instant Backend Auto
+/msg *keepnick_instant Backend Ison
+/msg *keepnick_instant Backend Monitor
+```
+
+Recommended setting:
+
+```irc
+/msg *keepnick_instant Backend Auto
+```
+
 ### `Interval <5-300>`
 
-Sets the poll interval, in seconds, used while you do **not** own the primary nick.
+Sets the poll interval, in seconds, used while the **effective backend is `ISON`** and you do **not** own the primary nick.
 
 ```irc
 /msg *keepnick_instant Interval 5
 ```
 
+With the `MONITOR` backend, `Interval` still governs the module's lightweight internal scheduler, but it is no longer the thing that discovers nick availability.
+
 ### `IdleGap <0-30>`
 
-If you sent any outbound line within the last `IdleGap` seconds, the next poll is skipped and rescheduled.
+If you sent any outbound line within the last `IdleGap` seconds, the next scheduled backend tick is skipped and rescheduled.
 
 ```irc
 /msg *keepnick_instant IdleGap 2
@@ -266,7 +366,7 @@ If you sent any outbound line within the last `IdleGap` seconds, the next poll i
 
 ### `StartDelay <0-600>`
 
-Sets the startup delay before the first `ISON` after connect.
+Sets the startup delay before the first backend action after connect.
 
 ```irc
 /msg *keepnick_instant StartDelay 90
@@ -276,7 +376,7 @@ Note: the new value becomes relevant on the next connect cycle.
 
 ### `Jitter <0-10>`
 
-Adds a random `0..J` second delay to each subsequent poll schedule.
+Adds a random `0..J` second delay to each subsequent backend tick schedule.
 
 ```irc
 /msg *keepnick_instant Jitter 0
@@ -292,13 +392,13 @@ Sets the minimum spacing between actual `NICK` reclaim attempts.
 
 ### `Poke`
 
-Schedules an immediate one-shot `ISON` check.
+Forces an immediate backend check now.
 
 ```irc
 /msg *keepnick_instant Poke
 ```
 
-This is useful when you want to force a fresh availability check without waiting for the normal timer.
+This is useful when you want to force a fresh backend action without waiting for the normal schedule, and in 1.5.1+ it is designed to bypass a pending backend timer rather than silently deferring to it.
 
 ---
 
@@ -308,13 +408,27 @@ This is useful when you want to force a fresh availability check without waiting
 
 The source defaults are already a sensible baseline for Undernet-style usage:
 
+- `Backend Auto`
 - `Interval 5`
 - `IdleGap 2`
 - `StartDelay 90`
 - `Jitter 0`
 - `MinGap 3`
 
-These settings keep the module responsive without making it too eager around connect time.
+On Undernet-like networks, `Backend Auto` will typically behave the same as the original module because the server does not normally advertise `MONITOR`.
+
+### Recommended baseline for mixed-network use
+
+If you use the same module design on different IRC networks or daemon families, the recommended baseline is still:
+
+- `Backend Auto`
+- `Interval 5`
+- `IdleGap 2`
+- `StartDelay 90`
+- `Jitter 0`
+- `MinGap 3`
+
+That lets the module use `MONITOR` where available without sacrificing compatibility elsewhere.
 
 ### When to increase `StartDelay`
 
@@ -331,37 +445,62 @@ Increase it if:
 
 - you want even more conservative behavior,
 - you do not care about reclaiming the nick within a few seconds,
-- you are tuning for especially strict network etiquette.
+- you are tuning for especially strict network etiquette,
+- you are mostly using the `ISON` backend and want fewer checks.
 
 ### When to use `Jitter`
 
 Enable a small jitter if:
 
 - you run multiple clients/bouncers with similar behavior,
-- you want to avoid perfectly regular polling cadence,
+- you want to avoid perfectly regular scheduler cadence,
 - you want timing to look less mechanically synchronized.
 
 ---
 
-## Example session
+## Example sessions
+
+### Example A: ISON path
 
 Suppose your preferred nick is `Alice`, but on connect you end up as `Alice_` because `Alice` is in use.
 
 1. The module waits `StartDelay` seconds.
-2. It begins sending one-shot checks like:
+2. The server does not advertise `MONITOR`, so `Backend Auto` resolves to `ISON`.
+3. The module begins sending one-shot checks like:
 
    ```irc
    ISON Alice
    ```
 
-3. As long as the server reports `Alice` is present, nothing happens beyond rescheduling.
-4. Once `Alice` disappears from `ISON`, the module sends:
+4. As long as the server reports `Alice` is present, nothing happens beyond rescheduling.
+5. Once `Alice` disappears from `ISON`, the module sends:
 
    ```irc
    NICK Alice
    ```
 
-5. You recover the nick, and future polling becomes effectively dormant because you now own the primary nick.
+6. You recover the nick, and future reclaim behavior becomes effectively dormant because you now own the primary nick.
+
+### Example B: MONITOR path
+
+Suppose the same nick is in use, but the server advertises `MONITOR`.
+
+1. The module waits `StartDelay` seconds.
+2. `Backend Auto` resolves to `MONITOR`.
+3. The module sends:
+
+   ```irc
+   MONITOR + Alice
+   ```
+
+4. While `Alice` is still online, the server can report that state using `MONITOR` numerics.
+5. Once the server reports `Alice` offline, the module sends:
+
+   ```irc
+   NICK Alice
+   ```
+
+6. After you have the nick back, the module removes its `MONITOR` subscription on a later scheduler pass because it no longer needs to watch the nick.
 
 ---
 
@@ -374,7 +513,7 @@ This section documents the code-level behavior in more detail for maintainers an
 The source declares:
 
 ```cpp
-NETWORKMODULEDEFS(CKeepNickInstant, "ISON-only keepnick (instant-ish)")
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish)")
 ```
 
 So this is a **network module**, not a global or user module.
@@ -384,6 +523,7 @@ So this is a **network module**, not a global or user module.
 The module stores configuration through ZNC NV storage using these keys:
 
 - `Enabled`
+- `BackendMode`
 - `IntervalSec`
 - `IdleGapSec`
 - `StartDelaySec`
@@ -412,17 +552,53 @@ The module uses two single-shot timer classes:
 - `CISONOnceTimer`
 - `CRearmTimer`
 
-`CISONOnceTimer` performs the actual scheduled `ISON` logic.
+`CISONOnceTimer` now acts as the general **backend tick** timer.
 
-`CRearmTimer` acts as a lightweight spacing guard after a reclaim attempt. It does not itself send anything; it exists as a harmless dedupe spacing mechanism around `MinGap` handling.
+- If the effective backend is `ISON`, it sends the single-nick `ISON` check.
+- If the effective backend is `MONITOR`, it either establishes the subscription or, if a confirmed subscription is already active, sends `MONITOR S` to refresh current status while reclaim is still needed.
 
-The module does **not** keep a permanently repeating timer object. Instead, it re-arms one-shot checks, which makes scheduling behavior explicit and easier to control.
+Backend timers are armed with unique labels, and forced actions such as `Poke` or reactive recovery can replace a pending backend timer cleanly. This avoids the earlier failure mode where a pending timer could keep an immediate backend check from actually being scheduled.
 
-### Why `ISON`
+`CRearmTimer` fires after a reactive reclaim attempt (`TryReclaim()` triggered by a visible `NICK` or `QUIT` event). If the reclaim was rejected — for example because someone else grabbed the nick in the same moment — it force-rearms the backend scheduler so the module does not go silent waiting for the next coincidental tick.
 
-`ISON` is a simple and low-cost IRC primitive for checking whether a nick is online.
+The module does **not** keep a permanently repeating timer object. Instead, it re-arms one-shot backend ticks, which makes scheduling behavior explicit and easier to control.
 
-This module uses a **single-nick `ISON`** request:
+### Backend detection
+
+The module does **not** try to identify networks or daemons by name.
+
+Instead, it watches `005` / ISUPPORT for the `MONITOR` token.
+
+If the module is loaded or hot-swapped onto an already-connected session and has not seen `005`, it can also send a one-time live `MONITOR + <PrimaryNick>` probe. A working `MONITOR` response effectively confirms support on that live connection; an unsupported or unusable response falls back to `ISON`.
+
+That means behavior is selected by what the current server connection actually advertises or demonstrably supports, not by hardcoded assumptions.
+
+### MONITOR path
+
+When the effective backend is `MONITOR`, the module uses:
+
+```irc
+MONITOR + <PrimaryNick>
+```
+
+The module tracks four pieces of `MONITOR` state:
+
+- whether `MONITOR` has been advertised or otherwise detected for the current connection,
+- whether the current connection can use it for this target,
+- whether the module currently has an active, **server-confirmed** subscription,
+- whether a one-time live probe has already been sent on a hot-swapped already-live session.
+
+`MonitorActive` is only set to `true` when the server has confirmed the subscription via a `730` or `731` response. It is deliberately **not** set at probe-send time, which prevents other code paths from treating an unconfirmed probe as an active subscription. This matters on servers that silently drop unknown commands — without this guard, the module could get stuck believing `MONITOR` was working when no subscription was ever established.
+
+When it receives the offline numeric for the primary nick, it immediately attempts reclaim. If reclaim is still needed later and the `MONITOR` subscription remains active, scheduled backend ticks can send `MONITOR S` to ask the server for the current status again. This restores persistent retry behavior without falling back to blind polling.
+
+If the server reports that the monitor list is full or unusable for the target, the module marks `MONITOR` unusable for the current connection and falls back to `ISON`.
+
+If the module probes `MONITOR` on a hot-swapped already-live session and the server answers with an unknown-command style failure, it marks `MONITOR` unusable for that connection and continues with `ISON`.
+
+### ISON path
+
+When the effective backend is `ISON`, the module uses a **single-nick `ISON`** request:
 
 ```irc
 ISON <PrimaryNick>
@@ -432,6 +608,8 @@ That keeps the logic straightforward:
 
 - if the nick appears in `303`, it is still in use,
 - if it does not appear, attempt reclaim.
+
+This is the original behavior of the module and remains the fallback path.
 
 ### Idle-aware behavior
 
@@ -443,13 +621,17 @@ EModRet OnUserRaw(CString& /*line*/) override
 
 Every user-sent line updates `LastUserActivity`.
 
-When the `ISON` timer fires, the module checks whether the last user activity was within `IdleGapSec`. If yes, it skips this poll and reschedules.
+When the backend timer fires, the module checks whether the last user activity was within `IdleGapSec`. If yes, it skips this backend tick and reschedules.
 
-This is a subtle but important design decision: it helps keep reclaim checks from interleaving too tightly with your own manual commands.
+Forced paths such as reactive backend kicks after visible nick-loss events and the `Poke` command intentionally bypass this idle suppression so they behave immediately.
+
+This is a subtle but important design decision: it helps keep ordinary reclaim checks from interleaving too tightly with your own manual commands, while still allowing deliberate immediate recovery actions when you ask for them or when the nick visibly becomes available.
 
 ### Join-safe startup
 
-On both initial load and `OnIRCConnected()`, the module arms the first `ISON` with `StartDelaySec`.
+On both initial load and `OnIRCConnected()`, the module arms the first backend action with `StartDelaySec`.
+
+The one exception is hot-swapped already-live reloads: in that case, the module may send a one-time live `MONITOR` probe immediately so backend detection can become accurate without waiting for the server to replay registration numerics. That probe is for backend discovery, not because the normal join-safe scheduler changed. Outside that hot-reload discovery case, the join-safe post-connect delay remains intact.
 
 That means the module intentionally stays quiet during the early phase after connection, which is typically the busiest period for:
 
@@ -471,18 +653,19 @@ This avoids duplicate back-to-back nick changes in edge cases such as:
 
 - repeated timer firings,
 - multiple visible events implying availability,
-- clustered server responses.
+- clustered server responses,
+- closely spaced backend notifications.
 
 ### Opportunistic event handling
 
-In addition to `303` processing, `OnRaw()` watches visible raw traffic for:
+In addition to `303` processing and `MONITOR` numerics, `OnRaw()` watches visible raw traffic for:
 
 - `NICK`
 - `QUIT`
 
-If the nick currently held by someone else changes away from the primary nick, or if that nick quits and the event is visible to you, the module may attempt reclaim immediately.
+If the nick currently held by someone else changes away from the primary nick, or if that nick quits and the event is visible to you, the module may attempt reclaim immediately and also kick the selected backend right away.
 
-This can reduce the time-to-reclaim compared with waiting for the next `ISON` poll.
+This can reduce the time-to-reclaim compared with waiting for the next scheduled backend action, and it also helps ensure the normal reclaim loop keeps running if that first direct reclaim does not succeed.
 
 ### Case-insensitive nick comparisons
 
@@ -490,7 +673,7 @@ Nick comparisons use `Equals(..., false)`, so behavior is case-insensitive in th
 
 ### Random jitter
 
-The module seeds `std::rand()` on load and computes an added delay in the range `0..JitterSec` for re-armed polls.
+The module seeds `std::rand()` on load and computes an added delay in the range `0..JitterSec` for re-armed backend ticks.
 
 This is intentionally simple. It is not trying to provide cryptographic randomness; it only needs enough variation to avoid rigid timer alignment.
 
@@ -503,10 +686,11 @@ This module aims to be **conservative rather than aggressive**.
 That philosophy shows up in several places:
 
 - it does not spam `NICK` attempts blindly,
-- it defers its first poll after connect,
+- it defers its first backend action after connect,
 - it backs off around your own activity,
-- it only polls while reclaim is actually needed,
-- it rate-limits actual nick attempts.
+- it only runs reclaim logic while reclaim is actually needed,
+- it rate-limits actual nick attempts,
+- it uses `MONITOR` only when the server explicitly advertises it, or when a one-time live probe confirms it on an already-connected hot-swapped session.
 
 This makes it suitable for users who want reliable reclaim behavior without a noisy “fight for the nick” pattern.
 
@@ -518,7 +702,8 @@ This makes it suitable for users who want reliable reclaim behavior without a no
 - It is not a replacement for NickServ-style account workflows.
 - It assumes reclaiming the nick is valid on the target network once that nick is free.
 - `NICK`/`QUIT` opportunism only works when those events are visible to you.
-- The “instant” part is bounded by poll interval, idle suppression, and network visibility.
+- `MONITOR` is only used when the current server connection advertises it or when a hot-swapped already-live session successfully confirms it with a one-time live probe.
+- The “instant” part is still bounded by startup delay, idle suppression, rate spacing, server behavior, and network visibility.
 
 Those trade-offs are intentional.
 
@@ -530,7 +715,8 @@ Undernet and similar networks are exactly the sort of environment where a module
 
 - there may be no modern services-backed nickname reservation workflow to solve the problem for you,
 - simply switching back to the nick is often the correct action once it becomes available,
-- users may still want that reclaim behavior to be measured and network-friendly.
+- users may still want that reclaim behavior to be measured and network-friendly,
+- `Backend Auto` naturally preserves the original `ISON` path where `MONITOR` is not offered, while still being able to detect `MONITOR` correctly after a hot-swapped reload on networks that do support it.
 
 That is why this module was primarily shaped around **Undernet-friendly** behavior.
 
@@ -547,7 +733,24 @@ Check:
 - the module is `ENABLED`,
 - you are not already on the primary nick,
 - the target nick is actually becoming free,
-- your current timing values are not too conservative for your expectations.
+- your current timing values are not too conservative for your expectations,
+- `Show` reports the backend state you expect.
+
+### It is using ISON when I expected MONITOR
+
+Check:
+
+- whether `Show` says `MONITOR advertised/detected: yes`,
+- whether the server actually advertised `MONITOR` in `005` or the module live-detected it after load,
+- whether `Backend` is set to `Ison`,
+- whether the current connection marked `MONITOR` unusable and fell back to `ISON`,
+- whether the session was hot-swapped and the live probe has already run.
+
+### MONITOR is detected, but `Active` stays `no`
+
+In 1.5.1 and later, if reclaim is needed and the effective backend is `MONITOR`, `Active` should flip to `yes` once the module actually sends `MONITOR + <PrimaryNick>`.
+
+If it does not, try `Poke` once and check again. `Poke` is now a true force-run path and should not be blocked by a pending backend timer.
 
 ### It feels too slow
 
@@ -555,7 +758,7 @@ Try:
 
 - lowering `StartDelay`,
 - keeping `Interval` at `5`,
-- ensuring `IdleGap` is not suppressing polls during heavy manual use.
+- ensuring `IdleGap` is not suppressing backend ticks during heavy manual use.
 
 ### It feels too aggressive
 
@@ -577,8 +780,8 @@ This module may not be the right solution model for that network. A services/acc
 From the source header:
 
 - **Name:** `keepnick_instant`
-- **Version:** `1.2.0`
-- **Description:** ISON-only, idle-aware, join-safe nick reclaim for ZNC
+- **Version:** `1.5.1`
+- **Description:** Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available, otherwise ISON; immediate backend kick and corrected timer labels)
 
 ---
 
