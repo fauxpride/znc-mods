@@ -4,5 +4,5 @@ A place to store and share my custom ZNC mods. More info to be added later.
 
 ## Modules
 
-- [`highlightctx`](./modules/highlightctx/README.md) — detached-only highlight context capture and replay
-- [`ignore_drop`](./modules/ignore_drop/README.md) — ignore-aware filtering / integration helper
+- [`highlightctx`](./modules/highlightctx/README.md) — detached-only highlight context capture and replay with durable journaling
+- [`ignore_drop`](./modules/ignore_drop/README.md) — provides bouncer-side ignore filtering with optional playback hiding.
