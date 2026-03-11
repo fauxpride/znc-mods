@@ -5,4 +5,5 @@ A place to store and share my custom ZNC mods. More info to be added later.
 ## Modules
 
 - [`highlightctx`](./modules/highlightctx/README.md) — detached-only highlight context capture and replay with durable journaling
-- [`ignore_drop`](./modules/ignore_drop/README.md) — bouncer-side ignore filtering with optional playback hiding.
+- [`ignore_drop`](./modules/ignore_drop/README.md) — bouncer-side ignore filtering with optional playback hiding
+- [`keepnick_instant`](./modules/keepnick_instant/README.md) - quickly regains your preferred nick using ISON, with more aggressive recovery than ZNC’s default keepnick on networks without nick registration services

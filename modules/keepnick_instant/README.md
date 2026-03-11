@@ -1,6 +1,6 @@
 # keepnick_instant
 
-`keepnick_instant` is a lightweight ZNC network module that tries to reclaim your preferred nickname as soon as it becomes available again, while still being conservative enough to avoid noisy or risky behavior on IRC networks.
+[`keepnick_instant`](./src/keepnick_instant.cpp) is a lightweight ZNC network module that tries to reclaim your preferred nickname as soon as it becomes available again, while still being conservative enough to avoid noisy or risky behavior on IRC networks.
 
 It is designed for networks where nicknames are **not reserved by channel services / nickname services**, so simply switching back to your preferred nick is enough when that nick becomes free. In practice, that makes it especially useful on networks such as **Undernet**, which is the primary target this module was tuned around.
 
