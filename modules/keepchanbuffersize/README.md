@@ -4,7 +4,7 @@ Preserve per-channel `BufferSize` across quick `PART`/`JOIN` cycles.
 
 ## Overview
 
-[`keepchanbuffersize`](./src/keepchanbuffersize/keepchanbuffersize.cpp) is a ZNC network module for one specific pain point: when you have manually customized channel buffer sizes, those per-channel settings can be lost when a channel object is torn down and recreated during a fast part/rejoin sequence.
+[`keepchanbuffersize`](./src/keepchanbuffersize.cpp) is a ZNC network module for one specific pain point: when you have manually customized channel buffer sizes, those per-channel settings can be lost when a channel object is torn down and recreated during a fast part/rejoin sequence.
 
 That matters most in real-world operator workflows where you may deliberately `/cycle` a channel — or `PART` and quickly `JOIN` again — to inspect spam-on-join behavior, check for join drones, or verify how a channel behaves when you enter it fresh as an op. In those cases, you usually want the channel to come back exactly as before from a buffer-retention perspective. This module is designed to keep that per-channel buffer sizing intact.
 
