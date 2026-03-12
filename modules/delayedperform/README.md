@@ -508,32 +508,6 @@ So the pacing is explicit and manual: you decide which commands run when.
 
 ---
 
-## Example root README blurbs
-
-Here are several short blurbs you can reuse in a top-level repository README.
-
-### Variant 1
-
-**delayedperform** — a delayed post-connect command runner for networks where sending too many `perform` commands at once can trigger throttling, especially when rejoining many channels.
-
-### Variant 2
-
-**delayedperform** — a per-network ZNC module that staggers post-connect IRC commands so channel rejoins and service messages do not all burst at once.
-
-### Variant 3
-
-**delayedperform** — a safer alternative to a bursty `perform` setup, letting you schedule IRC commands a few seconds after connect instead of firing everything immediately.
-
-### Variant 4
-
-**delayedperform** — runs post-connect IRC commands with per-command delays, useful when immediate `perform` bursts can hit flood or join throttles.
-
-### Variant 5
-
-**delayedperform** — spreads out connect-time IRC automation to reduce the risk of server-side throttling during reconnects and mass channel rejoins.
-
----
-
 ## Summary
 
 `delayedperform` is a small but practical ZNC network module for people who want the convenience of `perform`-style automation without the all-at-once burst. It is aimed squarely at reconnect scenarios where pacing matters, especially if immediate channel rejoins or service commands can run into throttling.

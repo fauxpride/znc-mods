@@ -97,7 +97,7 @@ That combination is what makes the module suitable for “make sure everything g
 ## Module identity
 
 - **Module name:** `missingchans`
-- **Source file:** `missingchansv6.cpp`
+- **Source file:** `missingchans.cpp`
 - **Current build marker in source:** `2026-02-11+r6 (robust 319 + case-insensitive chans + 443 fallback)`
 
 The module advertises itself as:
@@ -672,32 +672,6 @@ A good way to deploy this module is:
 5. add `RetryPerform` after confirming that re-running `perform` is safe in your environment.
 
 That gives you confidence in the verification logic before enabling automated repair actions.
-
----
-
-## Example root README blurbs
-
-Here are a few short descriptions you could use in the repository root `README.md`.
-
-### Variant 1
-
-**missingchans** — verifies your expected channels against server-side reality after connect and retries missing joins, which is useful on networks where helper bots, cloaks, or temporary outages can leave you only partially rejoined.
-
-### Variant 2
-
-**missingchans** — a per-network recovery module that checks which channels you are actually on after reconnect and re-joins any that were missed, including setups that depend on post-connect auth bots or special cloaks.
-
-### Variant 3
-
-**missingchans** — detects and repairs partial channel rejoin failures by comparing ZNC's expected channel list with server-side membership, with optional `perform` integration for bot-driven auth flows.
-
-### Variant 4
-
-**missingchans** — helps ensure all configured channels eventually get joined after reconnects, especially when channel access depends on custom auth bots, cloak assignment, or transient network/service outages.
-
-### Variant 5
-
-**missingchans** — a delayed verify-and-rejoin module for cases where reconnect timing, helper-bot authentication, or outage-related failures can leave some channels missing after connect.
 
 ---
 
