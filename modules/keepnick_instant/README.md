@@ -1,10 +1,12 @@
 # keepnick_instant
 
+See [CHANGELOG.md](./CHANGELOG.md) for version history and release notes.
+
 [`keepnick_instant`](./src/keepnick_instant.cpp) is a ZNC network module that quickly regains your preferred nickname on networks without nick registration services.
 
 It is designed for the classic IRC case where there is no NickServ-style ownership gate keeping your preferred nick reserved for you, and where the right recovery action is simply to switch back the moment that nick becomes available.
 
-As of version **1.5.1**, the module supports two reclaim backends:
+As of version **1.6.2**, the module supports two reclaim backends:
 
 - **`MONITOR` when the server advertises it via `005` / ISUPPORT**
 - **`ISON` otherwise**
@@ -109,11 +111,11 @@ For the intended use case, keep them aligned — or just run `keepnick_instant` 
 - **Automatic backend selection**
   - `Backend Auto` uses `MONITOR` when the server advertises it and falls back to `ISON` otherwise.
 - **Hot-reload MONITOR detection**
-  - On an already-connected session, the module can send a one-time live `MONITOR` probe after a hot-swapped reload so it can discover support without waiting for a reconnect.
+  - On an already-connected session, the module sends a one-time `MONITOR + <Primary>` probe at the first backend tick after a hot-swapped reload, regardless of whether you currently own your primary nick. This ensures MONITOR support is correctly established for the session even if you are already on your primary nick at reload time. The probe is deferred to the first tick after `IntervalSec` rather than fired synchronously on load.
 - **Forceable backend mode**
   - You can explicitly set `Backend Auto`, `Backend Ison`, or `Backend Monitor`.
 - **MONITOR support**
-  - Subscribes to the primary nick, reacts to server online/offline notifications when available, and refreshes current status with `MONITOR S` on later backend ticks while reclaim is still needed.
+  - Subscribes to the primary nick, reacts to server online/offline notifications when available, remembers when the nick is known free, and retries locally on the normal scheduler cadence without periodic `MONITOR S` polling.
 - **ISON fallback**
   - Preserves the original single-nick `ISON` reclaim path on networks that do not offer `MONITOR`.
 - **Run only when needed**
@@ -121,15 +123,17 @@ For the intended use case, keep them aligned — or just run `keepnick_instant` 
 - **Idle-aware behavior**
   - If you were just active, the next scheduled backend tick can be skipped.
 - **Join-safe startup**
-  - The first backend action is delayed after connect.
+  - The first backend action is delayed after connect. On a fresh connect the full `StartDelay` applies. On a hot reload via `updatemod` into an already-live connection, a single `IntervalSec` tick is used instead — the connection is already stable so the full join-safe delay is unnecessary.
 - **Deduped reclaim attempts**
   - Prevents repeated `NICK <primary>` attempts from being sent too close together.
 - **Optional tick jitter**
   - Adds a random `0..J` second delay to each scheduled backend tick.
 - **Persisted configuration**
   - Settings are stored with ZNC NV storage.
-- **Immediate backend kick on nick loss**
-  - When the module sees that the primary nick was just vacated, it immediately kicks the selected backend instead of waiting for the next scheduled tick.
+- **Reactive reclaim on visible nick loss**
+  - When the module sees a visible `NICK` or `QUIT` freeing the primary nick, it immediately attempts `NICK <Primary>` and ensures the backend loop re-arms if that attempt is rejected.
+- **Low-overhead raw line filtering**
+  - `OnRaw` performs a cheap single-token extraction to pre-filter every incoming IRC line. A full vector split is only performed for the eight command types the module actually handles. All other traffic (PRIVMSG, NOTICE, JOIN, PART, MODE, etc.) is rejected before any heap allocation occurs.
 - **Robust backend scheduling**
   - Backend timers are force-rearmable and use unique labels so hot-swaps, `Poke`, and reactive retries do not silently stall the reclaim loop.
 - **Manual poke command**
@@ -139,7 +143,7 @@ For the intended use case, keep them aligned — or just run `keepnick_instant` 
 
 ## Default behavior
 
-The module source currently identifies itself as version **1.5.1** and defaults to:
+The module source currently identifies itself as version **1.6.2** and defaults to:
 
 - `Backend = Auto`
 - `Interval = 5s`
@@ -170,7 +174,7 @@ Behavior:
 - if the module is hot-swapped onto an already-connected session and has not seen `005`, it can send a one-time live `MONITOR` probe to detect support immediately,
 - otherwise it uses the original `ISON` path,
 - if `MONITOR` is advertised or live-detected but cannot be used for this target on the current connection, the module falls back to `ISON`,
-- once `MONITOR` is active and reclaim is still needed, later backend ticks can issue `MONITOR S` so the module re-checks persistent offline state instead of relying on a single one-shot event.
+- once `MONITOR` is active and the server has reported the nick offline, the module remembers that state locally and uses its own scheduler cadence for retry attempts instead of issuing periodic `MONITOR S` refreshes.
 
 This gives you the best compatibility without needing per-network hardcoding.
 
@@ -198,9 +202,9 @@ In practice, the module still only uses `MONITOR` when the current server connec
 2. On a normal connection, the module waits `StartDelay` seconds before the first backend action.
 3. On a hot-swapped already-live connection, it may send a one-time live `MONITOR` probe immediately so it can detect support without waiting for a reconnect.
 4. If you already own the preferred nick, the module stays passive apart from its internal timer cycle.
-5. If you lose the preferred nick through a visible `NICK` or `QUIT` event, the module immediately kicks the selected backend instead of waiting for the next ordinary scheduled tick.
+5. If you lose the preferred nick through a visible `NICK` or `QUIT` event, the module immediately calls `TryReclaim()`. If that attempt is rejected, `CRearmTimer` ensures the backend scheduler re-arms so the loop continues.
 6. If you do **not** own the preferred nick:
-   - with `MONITOR`, it subscribes to that nick, reacts to server notifications, and can later issue `MONITOR S` on backend ticks while reclaim is still needed,
+   - with `MONITOR`, it subscribes to that nick, reacts to server notifications, and if the server has reported the nick offline it retries locally on later backend ticks without `MONITOR S` polling,
    - with `ISON`, it periodically sends:
 
    ```irc
@@ -555,7 +559,7 @@ The module uses two single-shot timer classes:
 `CISONOnceTimer` now acts as the general **backend tick** timer.
 
 - If the effective backend is `ISON`, it sends the single-nick `ISON` check.
-- If the effective backend is `MONITOR`, it either establishes the subscription or, if a confirmed subscription is already active, sends `MONITOR S` to refresh current status while reclaim is still needed.
+- If the effective backend is `MONITOR`, it either establishes the subscription or, if a confirmed subscription is already active and the nick is locally known free, retries `NICK <PrimaryNick>` on the normal scheduler cadence.
 
 Backend timers are armed with unique labels, and forced actions such as `Poke` or reactive recovery can replace a pending backend timer cleanly. This avoids the earlier failure mode where a pending timer could keep an immediate backend check from actually being scheduled.
 
@@ -590,7 +594,7 @@ The module tracks four pieces of `MONITOR` state:
 
 `MonitorActive` is only set to `true` when the server has confirmed the subscription via a `730` or `731` response. It is deliberately **not** set at probe-send time, which prevents other code paths from treating an unconfirmed probe as an active subscription. This matters on servers that silently drop unknown commands — without this guard, the module could get stuck believing `MONITOR` was working when no subscription was ever established.
 
-When it receives the offline numeric for the primary nick, it immediately attempts reclaim. If reclaim is still needed later and the `MONITOR` subscription remains active, scheduled backend ticks can send `MONITOR S` to ask the server for the current status again. This restores persistent retry behavior without falling back to blind polling.
+When it receives the offline numeric for the primary nick, it immediately attempts reclaim and remembers that the nick is locally known free. If reclaim is still needed later and the `MONITOR` subscription remains active, scheduled backend ticks use that remembered offline state to retry `NICK <PrimaryNick>` locally without sending periodic `MONITOR S` refreshes.
 
 If the server reports that the monitor list is full or unusable for the target, the module marks `MONITOR` unusable for the current connection and falls back to `ISON`.
 
@@ -623,9 +627,9 @@ Every user-sent line updates `LastUserActivity`.
 
 When the backend timer fires, the module checks whether the last user activity was within `IdleGapSec`. If yes, it skips this backend tick and reschedules.
 
-Forced paths such as reactive backend kicks after visible nick-loss events and the `Poke` command intentionally bypass this idle suppression so they behave immediately.
+The `Poke` command intentionally bypasses this idle suppression so it behaves immediately regardless of recent activity.
 
-This is a subtle but important design decision: it helps keep ordinary reclaim checks from interleaving too tightly with your own manual commands, while still allowing deliberate immediate recovery actions when you ask for them or when the nick visibly becomes available.
+This is a subtle but important design decision: it helps keep ordinary reclaim checks from interleaving too tightly with your own manual commands.
 
 ### Join-safe startup
 
@@ -658,14 +662,14 @@ This avoids duplicate back-to-back nick changes in edge cases such as:
 
 ### Opportunistic event handling
 
-In addition to `303` processing and `MONITOR` numerics, `OnRaw()` watches visible raw traffic for:
+In addition to `303` processing and `MONITOR` numerics, `OnRaw()` watches visible raw traffic for (after a cheap pre-filter that skips all other line types without allocating):
 
 - `NICK`
 - `QUIT`
 
-If the nick currently held by someone else changes away from the primary nick, or if that nick quits and the event is visible to you, the module may attempt reclaim immediately and also kick the selected backend right away.
+If the nick currently held by someone else changes away from the primary nick, or if that nick quits and the event is visible to you, the module attempts reclaim immediately via `TryReclaim()`. The existing `CRearmTimer` then ensures the backend scheduler re-arms if that reclaim attempt was rejected, so the loop continues without waiting for the next coincidental tick.
 
-This can reduce the time-to-reclaim compared with waiting for the next scheduled backend action, and it also helps ensure the normal reclaim loop keeps running if that first direct reclaim does not succeed.
+This can reduce the time-to-reclaim compared with waiting for the next scheduled backend action.
 
 ### Case-insensitive nick comparisons
 
@@ -690,7 +694,7 @@ That philosophy shows up in several places:
 - it backs off around your own activity,
 - it only runs reclaim logic while reclaim is actually needed,
 - it rate-limits actual nick attempts,
-- it uses `MONITOR` only when the server explicitly advertises it, or when a one-time live probe confirms it on an already-connected hot-swapped session.
+- it uses `MONITOR` only when the server explicitly advertises it, or when a one-time live probe confirms it on an already-connected hot-swapped session (deferred to the first backend tick, not fired synchronously on load).
 
 This makes it suitable for users who want reliable reclaim behavior without a noisy “fight for the nick” pattern.
 
@@ -702,7 +706,7 @@ This makes it suitable for users who want reliable reclaim behavior without a no
 - It is not a replacement for NickServ-style account workflows.
 - It assumes reclaiming the nick is valid on the target network once that nick is free.
 - `NICK`/`QUIT` opportunism only works when those events are visible to you.
-- `MONITOR` is only used when the current server connection advertises it or when a hot-swapped already-live session successfully confirms it with a one-time live probe.
+- `MONITOR` is only used when the current server connection advertises it or when a hot-swapped already-live session confirms it with a one-time probe. On a hot reload, that probe happens at the first backend tick after `IntervalSec` and fires unconditionally — even if you already own your primary nick — so MONITOR support is established before it is ever needed.
 - The “instant” part is still bounded by startup delay, idle suppression, rate spacing, server behavior, and network visibility.
 
 Those trade-offs are intentional.
@@ -748,7 +752,7 @@ Check:
 
 ### MONITOR is detected, but `Active` stays `no`
 
-In 1.5.1 and later, if reclaim is needed and the effective backend is `MONITOR`, `Active` should flip to `yes` once the module actually sends `MONITOR + <PrimaryNick>`.
+In 1.6.2 and later, on a hot reload into an already-live session, `Active` should flip to `yes` shortly after reload once the server responds to the one-time detection probe. On a normal connect, `Active` flips to `yes` once the server confirms the subscription via a `730` or `731` numeric after `StartDelaySec`. It will not flip immediately when the command is sent in either case.
 
 If it does not, try `Poke` once and check again. `Poke` is now a true force-run path and should not be blocked by a pending backend timer.
 
@@ -780,5 +784,13 @@ This module may not be the right solution model for that network. A services/acc
 From the source header:
 
 - **Name:** `keepnick_instant`
-- **Version:** `1.5.1`
-- **Description:** Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available, otherwise ISON; immediate backend kick and corrected timer labels)
+- **Version:** `1.6.2`
+- **Description:** Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available, otherwise ISON; OnRaw pre-filter, consistent MONITOR subscription guards, hot-reload MONITOR detect)
+
+---
+
+## License
+
+Add the license appropriate for your repository here.
+
+If you intend to publish this module publicly, it is a good idea to include an explicit license file in the repository root.
