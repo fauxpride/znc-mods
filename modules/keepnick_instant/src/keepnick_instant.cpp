@@ -1,9 +1,9 @@
 // keepnick_instant.cpp — auto-backend, idle-aware, join-safe nick reclaim for ZNC
-// Version: 1.5.1
+// Version: 1.6.2
 // Behavior:
 //   • Backend mode: Auto (default) uses MONITOR when advertised via 005, and can also live-probe MONITOR on hot-swapped already-connected sessions; otherwise falls back to ISON
 //   • Polls with ISON every Interval seconds (default 5s) ONLY when backend resolves to ISON and you don't own the Primary nick
-//   • MONITOR mode subscribes after StartDelay and reacts to 731/730 events when the server supports it
+//   • MONITOR mode subscribes after StartDelay, reacts to 731/730 events when the server supports it, and uses remembered offline state for local retry cadence (no periodic MONITOR S polling)
 //   • Idle-aware: skips a backend check if you sent any command in the last IdleGap seconds (default 2s)
 //   • Join-safe: first backend action is delayed StartDelay seconds after connect (default 90s)
 //   • Dedupes: won't send repeated NICK within MinGap seconds (default 3s)
@@ -64,7 +64,9 @@ class CKeepNickInstant : public CModule {
   bool     MonitorUsable           = true;         // Cleared if MONITOR add failed (e.g. 734)
   bool     MonitorActive           = false;        // Did we add Primary to MONITOR on this connection?
   bool     MonitorProbeSent        = false;        // Sent a live MONITOR probe on an already-connected session without having seen 005 yet
+  bool     MonitorKnownFree        = false;        // In MONITOR mode, last known state for Primary is offline/free; local scheduler retries NICK without MONITOR S polling
   unsigned MonitorLimit            = 0;            // Optional MONITOR=<n> limit from ISUPPORT
+  bool     HotReloadDetectPending   = false;        // Fire a one-time MONITOR probe on hot reload even when HavePrimary() is true
   unsigned BackendTimerSerial      = 0;            // Unique backend timer label suffix
   CString  BackendTimerLabel;                      // Currently armed backend timer label
 
@@ -89,9 +91,13 @@ class CKeepNickInstant : public CModule {
     if (!arg.empty()) { Primary = arg; SetNV("PrimaryNick", Primary); return; }
     CString stored = GetNV("PrimaryNick");
     if (!stored.empty()) { Primary = stored; return; }
-    Primary = GetNetwork() && !GetNetwork()->GetNick().empty()
-               ? GetNetwork()->GetNick()
-               : (GetUser() ? GetUser()->GetNick() : "ZNCUser");
+    // Use the ZNC-configured nick as the authoritative source, not
+    // GetNetwork()->GetNick() which returns the current IRC nick. On a hot reload
+    // while connected as an alternate (e.g. fauxpride-), GetNetwork()->GetNick()
+    // would return the alternate and the module would poll for the wrong nick.
+    // GetUser()->GetNick() is what the user has configured ZNC to use and is the
+    // correct fallback when no PrimaryNick is stored.
+    Primary = GetUser() ? GetUser()->GetNick() : "ZNCUser";
   }
 
   void LoadNV() {
@@ -169,8 +175,26 @@ class CKeepNickInstant : public CModule {
   void RunBackendCheckNow(bool bIgnoreIdle) {
     if (!Enabled) return;
 
+    // Hot-reload MONITOR detection: fires once at the first backend tick after a hot
+    // reload into an already-live session, regardless of whether we currently own the
+    // primary nick. MaybeProbeMonitor() is gated by HavePrimary() and would silently
+    // skip the probe if we are already on our primary nick, leaving MonitorSupported
+    // false for the entire session. This path bypasses that gate so MONITOR support is
+    // correctly established before it is ever needed.
+    if (HotReloadDetectPending) {
+      HotReloadDetectPending = false;
+      if (BackendMode != BACKEND_ISON && MonitorUsable && !MonitorSupported &&
+          !MonitorProbeSent && !MonitorActive && IsConnected() && !Primary.empty()) {
+        PutIRC("MONITOR + " + Primary);
+        MonitorProbeSent = true;
+        // MonitorActive is not set here; only set on 730/731 server confirmation.
+        return; // wait for server response before doing anything else this tick
+      }
+    }
+
     if (HavePrimary()) {
       if (MonitorActive) StopMonitor(Primary);
+      MonitorKnownFree = false;
       return;
     }
 
@@ -179,7 +203,7 @@ class CKeepNickInstant : public CModule {
 
     if (UseMonitorBackend()) {
       if (!MonitorActive) EnsureMonitor();
-      else PutIRC("MONITOR S");
+      else if (MonitorKnownFree) TryReclaim();
     } else if (!MaybeProbeMonitor()) {
       if (MonitorActive) StopMonitor(Primary);
       PutIRC("ISON " + Primary);
@@ -209,18 +233,25 @@ class CKeepNickInstant : public CModule {
   }
 
   void StopMonitor(const CString& nick) {
-    if (!MonitorActive || nick.empty()) return;
+    if (!MonitorActive || nick.empty()) { MonitorKnownFree = false; return; }
     PutIRC("MONITOR - " + nick);
     MonitorActive = false;
+    MonitorProbeSent = false; // allow EnsureMonitor to re-subscribe if needed
+    MonitorKnownFree = false;
   }
 
   void EnsureMonitor() {
     if (!Enabled) return;
     if (HavePrimary()) return;
     if (!UseMonitorBackend()) return;
-    if (MonitorActive) return;
+    if (MonitorActive || MonitorProbeSent) return; // already active or sent but awaiting server confirmation
     PutIRC("MONITOR + " + Primary);
-    MonitorActive = true;
+    MonitorProbeSent = true;
+    // MonitorActive is intentionally NOT set here. Same policy as MaybeProbeMonitor():
+    // MonitorActive is only set to true once the server confirms the subscription via
+    // a 730 or 731 numeric. Setting it here optimistically would cause the backend
+    // to treat an unconfirmed subscription as active and block the ISON fallback
+    // on servers that silently drop the MONITOR command.
   }
 
   bool MonitorListContainsPrimary(const CString& rawList, bool allowHostmask) const {
@@ -252,8 +283,25 @@ class CKeepNickInstant : public CModule {
     std::srand((unsigned)std::time(nullptr) ^ (unsigned)(uintptr_t)this);
     LoadPrimary(sArgs.Trim_n());
     LoadNV();
-    MaybeProbeMonitor();       // lets hot-swapped reloads discover MONITOR on an already-live session
-    ArmBackend(StartDelaySec); // join-safe start
+    // Do not send any IRC commands synchronously in OnLoad. Any PutIRC() here fires
+    // directly into the send queue without the StartDelay guard, which is problematic
+    // during a hot reload into a lagged or busy connection.
+    //
+    // Distinguish between two cases:
+    //   - Hot reload (IsConnected() == true): the connection is already live and stable;
+    //     the join-safe StartDelay is unnecessary. Use one normal IntervalSec tick so we
+    //     do not fire synchronously but also do not wait 90s to discover MONITOR or begin
+    //     reclaim on an already-established session.
+    //   - Normal load (not yet connected): ArmBackend here is a no-op since
+    //     OnIRCConnected() will call ArmBackend(StartDelaySec) when the connection
+    //     actually comes up. The call below is kept for the edge case where the module
+    //     is loaded while the network thinks it is connected (e.g. a brief state window).
+    if (IsConnected()) {
+      HotReloadDetectPending = (BackendMode != BACKEND_ISON); // probe MONITOR support regardless of nick ownership
+      ArmBackend(IntervalSec); // hot reload into live session: short delay, no join-burst risk
+    } else {
+      ArmBackend(StartDelaySec); // normal load: join-safe delay (also armed by OnIRCConnected)
+    }
     return true;
   }
 
@@ -265,7 +313,9 @@ class CKeepNickInstant : public CModule {
     MonitorUsable = true;
     MonitorActive = false;
     MonitorProbeSent = false;
+    MonitorKnownFree = false;
     MonitorLimit = 0;
+    HotReloadDetectPending = false;
     ArmBackend(StartDelaySec); // join-safe start
   }
 
@@ -277,7 +327,9 @@ class CKeepNickInstant : public CModule {
     MonitorUsable = true;
     MonitorActive = false;
     MonitorProbeSent = false;
+    MonitorKnownFree = false;
     MonitorLimit = 0;
+    HotReloadDetectPending = false;
   }
 
   // Track user activity: any outbound line from your client through ZNC
@@ -288,9 +340,17 @@ class CKeepNickInstant : public CModule {
 
   // Handle 005 ISUPPORT, ISON replies, MONITOR numerics, MONITOR probe fallbacks, and visible NICK/QUIT (when you share a channel)
   EModRet OnRaw(CString& sLine) override {
+    // Cheap pre-filter: extract only the command token before allocating a VCString.
+    // OnRaw fires for every IRC line including PRIVMSG, NOTICE, JOIN, PART, MODE, etc.
+    // A full Split() on every line wastes CPU and heap when we only care about 8 types.
+    CString cmd = sLine.Token(1);
+    if (cmd != "005" && cmd != "303" &&
+        cmd != "730" && cmd != "731" && cmd != "734" && cmd != "421" &&
+        !cmd.Equals("NICK", false) && !cmd.Equals("QUIT", false))
+      return CONTINUE;
+
     VCString v; sLine.Split(" ", v, false);
     if (v.size() < 2) return CONTINUE;
-    const CString& cmd = v[1];
 
     // ISUPPORT: 005 <me> token token ... :are supported by this server
     if (cmd == "005") {
@@ -331,7 +391,10 @@ class CKeepNickInstant : public CModule {
       CString trailing = sLine.Token(3, true);
       trailing.TrimLeft(CString(":"));
       bool match = MonitorListContainsPrimary(trailing, cmd == "730");
-      if (cmd == "731" && match) TryReclaim();
+      if (match) {
+        MonitorKnownFree = (cmd == "731");
+        if (cmd == "731") TryReclaim();
+      }
       return CONTINUE;
     }
 
@@ -341,6 +404,7 @@ class CKeepNickInstant : public CModule {
         MonitorSupported = true;
         MonitorUsable = false;
         MonitorActive = false;
+        MonitorKnownFree = false;
         PutModule("MONITOR list full/unusable for this target on this connection; falling back to ISON.");
         ForceArmBackend(IntervalSec);
       }
@@ -353,6 +417,7 @@ class CKeepNickInstant : public CModule {
         MonitorSupported = false;
         MonitorUsable = false;
         MonitorActive = false;
+        MonitorKnownFree = false;
         PutModule("MONITOR unsupported on this connection; falling back to ISON.");
         ForceArmBackend(IntervalSec);
       }
@@ -364,10 +429,10 @@ class CKeepNickInstant : public CModule {
       if (cmd.Equals("NICK", false)) {
         CString oldnick = v[0].TrimPrefix_n(":"); oldnick = oldnick.Token(0, false, "!");
         CString newnick; if (v.size() >= 3 && v[2].StartsWith(":")) newnick = v[2].TrimPrefix_n(":");
-        if (oldnick.Equals(Primary, false) && !newnick.Equals(Primary, false)) { TryReclaim(); KickBackendNow(true); }
+        if (oldnick.Equals(Primary, false) && !newnick.Equals(Primary, false)) TryReclaim();
       } else if (cmd.Equals("QUIT", false)) {
         CString qnick = v[0].TrimPrefix_n(":"); qnick = qnick.Token(0, false, "!");
-        if (qnick.Equals(Primary, false)) { TryReclaim(); KickBackendNow(true); }
+        if (qnick.Equals(Primary, false)) TryReclaim();
       }
     }
     return CONTINUE;
@@ -387,6 +452,7 @@ class CKeepNickInstant : public CModule {
       Enabled = false;
       SaveNV();
       if (MonitorActive) StopMonitor(Primary);
+      MonitorKnownFree = false;
       PutModule("Disabled. No backend checks or reclaim attempts.");
     }
     else if (cmd == "setnick") {
@@ -398,6 +464,7 @@ class CKeepNickInstant : public CModule {
       SaveNV();
       MonitorUsable = true;
       MonitorProbeSent = false;
+      MonitorKnownFree = false;
       PutModule("Primary nick set to: " + Primary);
       if (!HavePrimary()) {
         KickBackendNow(true);
@@ -409,6 +476,7 @@ class CKeepNickInstant : public CModule {
         BackendMode = mode;
         SaveNV();
         MonitorUsable = true;
+        MonitorKnownFree = false;
         if (MonitorActive && !UseMonitorBackend()) StopMonitor(Primary);
         if (!HavePrimary()) {
           KickBackendNow(true);
@@ -452,7 +520,7 @@ class CKeepNickInstant : public CModule {
     else if (cmd == "show" || cmd.empty() || cmd == "help") {
       CString cur = GetNetwork() ? GetNetwork()->GetIRCNick().GetNick() : "<none>";
       PutModule("keepnick_instant — auto-backend nick reclaim (MONITOR when available, otherwise ISON; idle-aware & join-safe).");
-      PutModule("Version: 1.5.1");
+      PutModule("Version: 1.6.2");
       PutModule("Current state:");
       PutModule("  Status: " + CString(Enabled ? "ENABLED" : "DISABLED"));
       PutModule("  Primary: " + Primary + "   |   Current: " + cur);
@@ -510,6 +578,6 @@ void CRearmTimer::RunJob() {
 
 template<> void TModInfo<CKeepNickInstant>(CModInfo& Info) {
   Info.SetHasArgs(true);
-  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available, otherwise ISON; immediate backend kick and corrected timer labels)");
+  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect)");
 }
-NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload aware, corrected timer labels)")
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.2")

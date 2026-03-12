@@ -4,6 +4,88 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.2] - 2026-03-12
+
+### Fixed
+- Fixed MONITOR support not being detected after a hot reload via `updatemod` when the module loads while you already own your primary nick. `MaybeProbeMonitor()` is gated by `HavePrimary()` and silently skips the probe in that case, leaving `MonitorSupported` false for the entire session. If you later lost your primary nick, the module would fall back to ISON even on a MONITOR-capable network like EFNet and remain on ISON for the rest of that session. A new `HotReloadDetectPending` flag is set in `OnLoad` when the module loads into an already-live connection. At the first backend tick, this flag triggers a one-time `MONITOR + <Primary>` probe unconditionally (bypassing the `HavePrimary()` gate). The server responds with `730` (online) or `731` (offline), which sets `MonitorSupported = true` and `MonitorActive = true` via the existing numeric handler. From that point on, any future `731` correctly triggers reclaim via the MONITOR path.
+
+### Changed
+- Bumped version from `1.6.1` to `1.6.2`.
+- Added `HotReloadDetectPending` state field (bool, default false). Set to true in `OnLoad` when `IsConnected()` and `BackendMode != BACKEND_ISON`. Cleared at the first backend tick, in `OnIRCConnected`, and in `OnIRCDisconnected`.
+
+### Notes
+- The `HotReloadDetectPending` check is the first thing evaluated in `RunBackendCheckNow()`, before the `HavePrimary()` early-exit, specifically so the probe fires regardless of nick ownership. It is cleared immediately on first evaluation so it only fires once per hot reload.
+- `MonitorActive` is still not set by the probe itself. It is only set to true when the server confirms the subscription via `730` or `731`, consistent with the policy established in `1.4.0` and `1.6.0`.
+- On a hot reload where `Backend` is set to `Ison`, `HotReloadDetectPending` is not set and no probe is sent. The flag is only set when the module could meaningfully use MONITOR.
+- This fix is specific to the hot-reload case. On a normal connect, `005` / ISUPPORT delivers MONITOR capability before the first backend tick fires, so the existing detection path is sufficient.
+
+## [1.6.1] - 2026-03-12
+
+### Fixed
+- Fixed `OnLoad()` applying `StartDelaySec` (default 90s) unconditionally on hot reloads via `updatemod`. The 90-second join-safe delay exists to avoid reclaim traffic during the initial connect burst — CAP negotiation, auto-joins, channel floods — none of which are present on an already-live connection. Using the same delay on a hot reload meant MONITOR detection and reclaim were unnecessarily suppressed for up to 90 seconds on a session that was already stable. `OnLoad()` now checks `IsConnected()`: if the connection is already live (hot reload), it arms the backend with a single `IntervalSec` tick (default 5s) instead, which is long enough to avoid firing synchronously into the event loop but short enough to be effectively immediate. If the connection is not yet live, `StartDelaySec` is used as before, and `OnIRCConnected()` will re-arm with `StartDelaySec` when the connection comes up regardless.
+
+### Changed
+- Bumped version from `1.6.0` to `1.6.1`.
+
+### Notes
+- `OnIRCConnected()` continues to arm with `StartDelaySec` unconditionally, so the join-safe behavior on fresh connects is unchanged.
+- The `IntervalSec` delay on hot reload is deliberately not zero. `OnLoad` fires synchronously in ZNC's event loop and a zero-delay timer would run in the same iteration, which is the same problem as calling `PutIRC()` directly. One `IntervalSec` tick defers the first action to the next loop iteration while keeping the delay functionally invisible to the user.
+
+## [1.6.0] - 2026-03-12
+
+### Fixed
+- Fixed `OnRaw()` allocating a `VCString` and performing a full `Split()` on every incoming IRC line regardless of type. `OnRaw` fires for every PRIVMSG, NOTICE, JOIN, PART, MODE, and so on. The prior behavior caused unnecessary heap allocation and CPU overhead on every line in every channel. A cheap token extraction now filters the command field first; the full split is only performed for the eight command types the handler actually cares about (`005`, `303`, `730`, `731`, `734`, `421`, `NICK`, `QUIT`). This is the most likely contributor to ZNC send-queue buildup and observed high lag on busy connections.
+- Fixed `EnsureMonitor()` prematurely setting `MonitorActive = true` before the server confirmed the MONITOR subscription. This was inconsistent with the same intentional guard already present in `MaybeProbeMonitor()` since `1.4.0`. The premature flag could cause the module to treat an unconfirmed subscription as active, preventing the ISON fallback on servers that silently drop unknown commands. `EnsureMonitor()` now uses `MonitorProbeSent` as the sent-but-unconfirmed guard, matching `MaybeProbeMonitor()` behavior. `MonitorActive` is only set to `true` when the server responds with a `730` or `731` numeric.
+- Fixed `StopMonitor()` not resetting `MonitorProbeSent`, which would have prevented `EnsureMonitor()` from re-subscribing after an explicit stop if the probe had previously been sent via `EnsureMonitor()`.
+- Fixed `LoadPrimary()` fallback using `GetNetwork()->GetNick()` — the current IRC nick — when no stored `PrimaryNick` is available. On a hot reload via `updatemod` while connected under an alternate nick (e.g. `fauxpride-`), this caused the module to poll for the wrong nick for the duration of that session. The fallback now uses `GetUser()->GetNick()`, which reflects the nick the user has configured in ZNC and is the correct authoritative source. `GetNV("PrimaryNick")` remains the first preference; the user-configured nick is only reached if no stored value exists.
+- Fixed `OnLoad()` calling `MaybeProbeMonitor()` immediately on load. On a hot reload via `updatemod`, this fires synchronously into an already-live connection that may already have queue pressure, bypassing the `StartDelay` guard entirely. `MaybeProbeMonitor()` is already invoked from within `RunBackendCheckNow()`, so the MONITOR live-probe for already-connected sessions now happens naturally at the first backend tick after `StartDelaySec`. Hot reloads are treated the same as fresh connects in terms of how eagerly they interact with the server.
+
+### Changed
+- Bumped version from `1.5.3` to `1.6.0`.
+- `EnsureMonitor()` now sets `MonitorProbeSent = true` (rather than `MonitorActive = true`) to guard against duplicate subscription sends while awaiting server confirmation, consistent with `MaybeProbeMonitor()`.
+
+### Notes
+- The `MonitorActive` flag continues to serve as the server-confirmed subscription indicator. The newly consistent use of `MonitorProbeSent` as the sent-but-unconfirmed guard applies to both the `MaybeProbeMonitor()` path (unconfirmed MONITOR support) and the `EnsureMonitor()` path (confirmed MONITOR support but subscription not yet acknowledged).
+- The `OnRaw` pre-filter does not change any observable behavior. The same eight command types are still processed; all others are now rejected before a split is performed.
+- Hot reload via `updatemod` no longer sends any IRC traffic synchronously during `OnLoad`. The first backend tick on a hot reload fires after `IntervalSec` (see 1.6.1 for the distinction between hot-reload and fresh-connect delay). The `MaybeProbeMonitor()` call that was previously in `OnLoad` was removed; it now happens naturally from within `RunBackendCheckNow()` at the first backend tick.
+
+## [1.5.3] - 2026-03-12
+
+### Changed
+- Bumped version from `1.5.2` to `1.5.3`.
+- Reworked the `MONITOR` backend so scheduled retry behavior now uses locally remembered offline state instead of sending `MONITOR S` on every backend tick.
+
+### Fixed
+- Fixed the `MONITOR` backend design so it no longer recreates polling-like traffic with periodic `MONITOR S` status refreshes while reclaim is still needed.
+- Fixed the `MONITOR` retry path to keep trying on the module's own scheduler cadence after a confirmed offline (`731`) state, without needing to re-query the server every tick.
+
+### Documentation
+- Updated the README backend-model, feature-summary, high-level-behavior, implementation, troubleshooting, and source-summary sections to describe the remembered-offline MONITOR design and the removal of periodic `MONITOR S` refreshes.
+
+### Notes
+- `MONITOR` remains event-driven for state discovery: the module still relies on server `730`/`731` notifications to learn whether the nick is online or offline.
+- Once the nick is known free, the module's own scheduler handles retry cadence locally until the nick is recovered or a later `730` marks it taken again.
+
+## [1.5.2] - 2026-03-12
+
+### Fixed
+- Fixed excessive IRC traffic generated by visible `NICK` and `QUIT` events for the primary nick. In `1.5.0` and `1.5.1`, each such event called both `TryReclaim()` and `KickBackendNow(true)`, which sent a `NICK` attempt followed immediately by an additional ISON or MONITOR command and a forced timer reset. On busy channels with frequent nick changes or quits, this compounded into a rapid burst of outgoing commands that built up ZNC's send queue and caused noticeable client lag. The `KickBackendNow(true)` call has been removed from the `NICK` and `QUIT` handlers. Reactive reclaim now calls only `TryReclaim()`, and the existing `CRearmTimer` mechanism (introduced in `1.4.0`) handles re-arming the backend scheduler if the reclaim attempt was rejected.
+
+### Changed
+- Bumped version from `1.5.1` to `1.5.2`.
+
+### Documentation
+- Updated README opportunistic event handling section to reflect that reactive reclaim no longer kicks the backend immediately.
+- Updated README high-level behavior description (step 5) to match.
+- Updated README idle-aware behavior section to remove the reference to reactive kicks bypassing idle suppression.
+- Updated README feature summary to replace the immediate backend kick bullet with a more accurate reactive reclaim description.
+- Updated README source summary version and description.
+- Updated README troubleshooting MONITOR Active version reference.
+
+### Notes
+- `KickBackendNow` is still used by the `Enable`, `SetNick`, `Backend`, and `Poke` command handlers, where an immediate forced backend action is the deliberate and expected behavior.
+- The fix restores the conservative traffic model of earlier versions while preserving correct reclaim behavior after visible nick-loss events.
+
 ## [1.5.1] - 2026-03-12
 
 ### Fixed
