@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.3] - 2026-03-12
+
+### Fixed
+- Fixed client-side scripts (e.g. mIRC Peace & Protection) activating their own competing nick retake logic in response to `433 :Nickname is already in use` responses caused by the module's own `NICK <Primary>` attempts. When ZNC's built-in `keepnick` module was also loaded, it was incidentally swallowing those `433` numerics before they reached the client, masking the problem. With `keepnick` disabled and `keepnick_instant` as the sole reclaim mechanism, `433` responses flowed through to the client and triggered P&P's retake display and timer on every failed attempt. A `NickAttemptPending` flag is now set in `TryReclaim()` immediately before each `NICK <Primary>` is sent. In `OnRaw`, a new `433` handler checks this flag and, if set and the rejected nick matches `Primary`, halts the numeric before it reaches the client. All other `433` responses — from manual nick changes, other scripts, or any nick other than `Primary` — are passed through to the client unchanged.
+
+### Changed
+- Bumped version from `1.6.2` to `1.6.3`.
+- Added `NickAttemptPending` state field (bool, default false). Set to true in `TryReclaim()` before each `NICK <Primary>`. Cleared on a matching `433` swallow, on any non-matching `433`, in `OnIRCConnected`, and in `OnIRCDisconnected`.
+- Added `433` to the `OnRaw` pre-filter so the cheap command token check includes it before any vector allocation.
+
+### Notes
+- The reclaim logic itself is completely unchanged. `TryReclaim()`, `RunBackendCheckNow()`, ISON polling, MONITOR subscription, `730`/`731` handling, and all timers behave identically to `1.6.2`. The `433` is only intercepted after the attempt has already been made and its outcome recorded internally — the module does not use the `433` response for any decision-making.
+- The swallow is conservative by design: it requires both `NickAttemptPending == true` and `v[3]` matching `Primary` before halting. A race condition where the flag is set but the `433` refers to a different nick will clear the flag and pass the numeric through rather than swallowing it.
+- This fix restores the behavior that users of both `keepnick` and `keepnick_instant` experienced previously, where `keepnick` was incidentally preventing client scripts from seeing module-generated `433` responses.
+
 ## [1.6.2] - 2026-03-12
 
 ### Fixed

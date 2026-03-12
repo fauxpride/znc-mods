@@ -1,5 +1,5 @@
 // keepnick_instant.cpp — auto-backend, idle-aware, join-safe nick reclaim for ZNC
-// Version: 1.6.2
+// Version: 1.6.3
 // Behavior:
 //   • Backend mode: Auto (default) uses MONITOR when advertised via 005, and can also live-probe MONITOR on hot-swapped already-connected sessions; otherwise falls back to ISON
 //   • Polls with ISON every Interval seconds (default 5s) ONLY when backend resolves to ISON and you don't own the Primary nick
@@ -67,6 +67,7 @@ class CKeepNickInstant : public CModule {
   bool     MonitorKnownFree        = false;        // In MONITOR mode, last known state for Primary is offline/free; local scheduler retries NICK without MONITOR S polling
   unsigned MonitorLimit            = 0;            // Optional MONITOR=<n> limit from ISUPPORT
   bool     HotReloadDetectPending   = false;        // Fire a one-time MONITOR probe on hot reload even when HavePrimary() is true
+  bool     NickAttemptPending        = false;        // Set when we fire NICK <Primary>; used to swallow the 433 response so client scripts don't see it
   unsigned BackendTimerSerial      = 0;            // Unique backend timer label suffix
   CString  BackendTimerLabel;                      // Currently armed backend timer label
 
@@ -270,6 +271,7 @@ class CKeepNickInstant : public CModule {
     time_t now = std::time(nullptr);
     if (LastAttempt && now - LastAttempt < (time_t)MinGapSec) return; // dedupe
     LastAttempt = now;
+    NickAttemptPending = true;  // arm 433 swallow for this attempt
     PutIRC("NICK " + Primary);
     if (!AddTimer(new CRearmTimer(this, MinGapSec))) {
       PutModule("Warning: failed to arm reclaim dedupe timer.");
@@ -316,6 +318,7 @@ class CKeepNickInstant : public CModule {
     MonitorKnownFree = false;
     MonitorLimit = 0;
     HotReloadDetectPending = false;
+    NickAttemptPending = false;
     ArmBackend(StartDelaySec); // join-safe start
   }
 
@@ -330,6 +333,7 @@ class CKeepNickInstant : public CModule {
     MonitorKnownFree = false;
     MonitorLimit = 0;
     HotReloadDetectPending = false;
+    NickAttemptPending = false;
   }
 
   // Track user activity: any outbound line from your client through ZNC
@@ -346,6 +350,7 @@ class CKeepNickInstant : public CModule {
     CString cmd = sLine.Token(1);
     if (cmd != "005" && cmd != "303" &&
         cmd != "730" && cmd != "731" && cmd != "734" && cmd != "421" &&
+        cmd != "433" &&
         !cmd.Equals("NICK", false) && !cmd.Equals("QUIT", false))
       return CONTINUE;
 
@@ -422,6 +427,21 @@ class CKeepNickInstant : public CModule {
         ForceArmBackend(IntervalSec);
       }
       return CONTINUE;
+    }
+
+    // 433 Nickname already in use — swallow responses caused by our own NICK attempts
+    // so client-side scripts (e.g. mIRC Peace & Protection) do not see them and activate
+    // their own competing retake logic. Only swallowed when NickAttemptPending is set,
+    // meaning the module fired the NICK attempt. 433 responses from manual nick changes
+    // (NickAttemptPending == false) are passed through normally.
+    // Format: :server 433 <currentnick> <attemptednick> :Nickname is already in use
+    if (cmd == "433") {
+      if (NickAttemptPending && v.size() >= 4 && v[3].Equals(Primary, false)) {
+        NickAttemptPending = false;
+        return HALT; // swallow — client does not see this 433
+      }
+      NickAttemptPending = false; // clear stale flag on any 433 regardless
+      return CONTINUE;            // not ours — pass through to client
     }
 
     // Visible events: :old!u@h NICK :new   /   :nick!u@h QUIT :msg
@@ -520,7 +540,7 @@ class CKeepNickInstant : public CModule {
     else if (cmd == "show" || cmd.empty() || cmd == "help") {
       CString cur = GetNetwork() ? GetNetwork()->GetIRCNick().GetNick() : "<none>";
       PutModule("keepnick_instant — auto-backend nick reclaim (MONITOR when available, otherwise ISON; idle-aware & join-safe).");
-      PutModule("Version: 1.6.2");
+      PutModule("Version: 1.6.3");
       PutModule("Current state:");
       PutModule("  Status: " + CString(Enabled ? "ENABLED" : "DISABLED"));
       PutModule("  Primary: " + Primary + "   |   Current: " + cur);
@@ -578,6 +598,6 @@ void CRearmTimer::RunJob() {
 
 template<> void TModInfo<CKeepNickInstant>(CModInfo& Info) {
   Info.SetHasArgs(true);
-  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect)");
+  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433 swallow)");
 }
-NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.2")
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.3")
