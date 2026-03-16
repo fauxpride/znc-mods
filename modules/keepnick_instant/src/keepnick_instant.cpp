@@ -1,5 +1,5 @@
 // keepnick_instant.cpp — auto-backend, idle-aware, join-safe nick reclaim for ZNC
-// Version: 1.6.3
+// Version: 1.6.4
 // Behavior:
 //   • Backend mode: Auto (default) uses MONITOR when advertised via 005, and can also live-probe MONITOR on hot-swapped already-connected sessions; otherwise falls back to ISON
 //   • Polls with ISON every Interval seconds (default 5s) ONLY when backend resolves to ISON and you don't own the Primary nick
@@ -68,6 +68,7 @@ class CKeepNickInstant : public CModule {
   unsigned MonitorLimit            = 0;            // Optional MONITOR=<n> limit from ISUPPORT
   bool     HotReloadDetectPending   = false;        // Fire a one-time MONITOR probe on hot reload even when HavePrimary() is true
   bool     NickAttemptPending        = false;        // Set when we fire NICK <Primary>; used to swallow the 433 response so client scripts don't see it
+  bool     ISONQueryPending          = false;        // Set when we fire ISON <Primary>; used to swallow the 303 response so it doesn't appear in the client status window
   unsigned BackendTimerSerial      = 0;            // Unique backend timer label suffix
   CString  BackendTimerLabel;                      // Currently armed backend timer label
 
@@ -207,6 +208,7 @@ class CKeepNickInstant : public CModule {
       else if (MonitorKnownFree) TryReclaim();
     } else if (!MaybeProbeMonitor()) {
       if (MonitorActive) StopMonitor(Primary);
+      ISONQueryPending = true;  // arm 303 swallow for this poll
       PutIRC("ISON " + Primary);
     }
   }
@@ -319,6 +321,7 @@ class CKeepNickInstant : public CModule {
     MonitorLimit = 0;
     HotReloadDetectPending = false;
     NickAttemptPending = false;
+    ISONQueryPending = false;
     ArmBackend(StartDelaySec); // join-safe start
   }
 
@@ -334,6 +337,7 @@ class CKeepNickInstant : public CModule {
     MonitorLimit = 0;
     HotReloadDetectPending = false;
     NickAttemptPending = false;
+    ISONQueryPending = false;
   }
 
   // Track user activity: any outbound line from your client through ZNC
@@ -385,6 +389,11 @@ class CKeepNickInstant : public CModule {
         if (n.Equals(Primary, false)) { present = true; break; }
       }
       if (!present) TryReclaim();
+
+      // Swallow 303 responses caused by our own ISON polls so they do not appear
+      // in the client status window. ISONQueryPending is only set when we fired
+      // the ISON; manual /ison commands sent by the user are passed through normally.
+      if (ISONQueryPending) { ISONQueryPending = false; return HALT; }
       return CONTINUE;
     }
 
@@ -540,7 +549,7 @@ class CKeepNickInstant : public CModule {
     else if (cmd == "show" || cmd.empty() || cmd == "help") {
       CString cur = GetNetwork() ? GetNetwork()->GetIRCNick().GetNick() : "<none>";
       PutModule("keepnick_instant — auto-backend nick reclaim (MONITOR when available, otherwise ISON; idle-aware & join-safe).");
-      PutModule("Version: 1.6.3");
+      PutModule("Version: 1.6.4");
       PutModule("Current state:");
       PutModule("  Status: " + CString(Enabled ? "ENABLED" : "DISABLED"));
       PutModule("  Primary: " + Primary + "   |   Current: " + cur);
@@ -598,6 +607,6 @@ void CRearmTimer::RunJob() {
 
 template<> void TModInfo<CKeepNickInstant>(CModInfo& Info) {
   Info.SetHasArgs(true);
-  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433 swallow)");
+  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/303 swallow)");
 }
-NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.3")
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.4")
