@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.4] - 2026-03-12
+
+### Fixed
+- Fixed ISON poll responses (`303`) appearing in the IRC client status window. On every ISON poll the server's `303` reply was passed through ZNC to the client, causing visible noise in the mIRC status window (and any other IRC client connected to ZNC). A new `ISONQueryPending` flag is set in `RunBackendCheckNow()` immediately before each `ISON <Primary>` is sent. In the `303` handler, after all reclaim logic has run, the flag is checked: if set, the `303` is halted before reaching the client. Manual `/ison` commands typed by the user are unaffected since `ISONQueryPending` is not set for those, and their `303` responses continue to pass through normally.
+
+### Changed
+- Bumped version from `1.6.3` to `1.6.4`.
+- Added `ISONQueryPending` state field (bool, default false). Set to true in `RunBackendCheckNow()` before each `ISON <Primary>`. Cleared on `303` swallow, in `OnIRCConnected`, and in `OnIRCDisconnected`.
+
+### Notes
+- The `303` swallow happens after reclaim logic has fully run. `TryReclaim()` is called before the swallow decision, so nick reclaim behavior is completely unchanged — the numeric is only suppressed from the client after it has already been acted on.
+- This mirrors the design of the `433` swallow introduced in `1.6.3`: the flag is specific to module-generated queries, manual user commands are never affected.
+
 ## [1.6.3] - 2026-03-12
 
 ### Fixed
