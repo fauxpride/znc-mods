@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.5] - 2026-03-22
+
+### Fixed
+- Fixed duplicate backend timer cycles created on connect and reconnect. `OnIRCConnected()` and `OnIRCDisconnected()` were clearing `TimerArmed` and `BackendTimerLabel` without first calling `RemTimer()` to cancel the existing timer. The old timer remained in ZNC's internal queue even though the module had lost track of it. When `OnIRCConnected()` then called `ArmBackend()`, a second timer was armed successfully since `TimerArmed` was now false. Both timers then fired independently on their next tick, each sending its own ISON and re-arming into a perpetual 5-second cycle. With two cycles running in parallel, `ISONQueryPending` — a single bool — could only cover one outstanding `303` response per tick. The second response leaked through to the client, producing bursts of visible ISON results in the mIRC status window. The duplicate cycles self-resolved eventually (one branch happened to fire while `TimerArmed` was true from the other, preventing its re-arm), which is why the visible ISONs stopped appearing randomly rather than immediately. The fix adds a `RemTimer(BackendTimerLabel)` call at the top of both `OnIRCConnected()` and `OnIRCDisconnected()`, matching the pattern already used correctly in `ForceArmBackend()`. `RemTimer` is guarded by a `!BackendTimerLabel.empty()` check so it is a no-op when no timer is currently tracked.
+
+### Changed
+- Bumped version from `1.6.4` to `1.6.5`.
+
+### Notes
+- `ForceArmBackend()` already called `RemTimer()` correctly since `1.5.0`. The missing `RemTimer()` calls in `OnIRCConnected()` and `OnIRCDisconnected()` were an oversight in the original connect/disconnect reset paths.
+- The visible ISON bursts and their random self-resolution are explained by the timer race: once one of the two cycles happened to call `ArmBackend()` while `TimerArmed` was already true from the other cycle, it silently dropped out, leaving a single cycle which the `ISONQueryPending` swallow handles correctly.
+- A ZNC restart is recommended after hot-loading this version if duplicate timer cycles are currently active. The fix prevents new duplicates from being created but does not eliminate any already-running stale timers from a previous session. After a restart or once the existing race self-resolves, the fix takes full effect.
+
 ## [1.6.4] - 2026-03-12
 
 ### Fixed
