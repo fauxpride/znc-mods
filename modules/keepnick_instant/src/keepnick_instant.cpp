@@ -1,5 +1,5 @@
 // keepnick_instant.cpp — auto-backend, idle-aware, join-safe nick reclaim for ZNC
-// Version: 1.6.4
+// Version: 1.6.5
 // Behavior:
 //   • Backend mode: Auto (default) uses MONITOR when advertised via 005, and can also live-probe MONITOR on hot-swapped already-connected sessions; otherwise falls back to ISON
 //   • Polls with ISON every Interval seconds (default 5s) ONLY when backend resolves to ISON and you don't own the Primary nick
@@ -310,6 +310,12 @@ class CKeepNickInstant : public CModule {
   }
 
   void OnIRCConnected() override {
+    // Cancel any armed backend timer before clearing the label. Without RemTimer,
+    // the old timer stays in ZNC's queue even though TimerArmed and BackendTimerLabel
+    // are cleared, causing ArmBackend below to arm a second timer. Both then fire
+    // independently on their next tick, creating duplicate ISON cycles that race
+    // against each other and defeat the ISONQueryPending swallow.
+    if (!BackendTimerLabel.empty()) RemTimer(BackendTimerLabel);
     TimerArmed = false;
     BackendTimerLabel = "";
     LastAttempt = 0;
@@ -326,6 +332,11 @@ class CKeepNickInstant : public CModule {
   }
 
   void OnIRCDisconnected() override {
+    // Cancel any armed backend timer before clearing the label, for the same reason
+    // as OnIRCConnected: without RemTimer the stale timer remains in ZNC's queue and
+    // can fire after reconnect, producing a duplicate timer cycle alongside the one
+    // armed by OnIRCConnected.
+    if (!BackendTimerLabel.empty()) RemTimer(BackendTimerLabel);
     TimerArmed = false;
     BackendTimerLabel = "";
     LastAttempt = 0;
@@ -549,7 +560,7 @@ class CKeepNickInstant : public CModule {
     else if (cmd == "show" || cmd.empty() || cmd == "help") {
       CString cur = GetNetwork() ? GetNetwork()->GetIRCNick().GetNick() : "<none>";
       PutModule("keepnick_instant — auto-backend nick reclaim (MONITOR when available, otherwise ISON; idle-aware & join-safe).");
-      PutModule("Version: 1.6.4");
+      PutModule("Version: 1.6.5");
       PutModule("Current state:");
       PutModule("  Status: " + CString(Enabled ? "ENABLED" : "DISABLED"));
       PutModule("  Primary: " + Primary + "   |   Current: " + cur);
@@ -607,6 +618,6 @@ void CRearmTimer::RunJob() {
 
 template<> void TModInfo<CKeepNickInstant>(CModInfo& Info) {
   Info.SetHasArgs(true);
-  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/303 swallow)");
+  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/303 swallow, timer cleanup)");
 }
-NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.4")
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.5")
