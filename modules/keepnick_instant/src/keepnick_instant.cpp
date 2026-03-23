@@ -1,5 +1,5 @@
 // keepnick_instant.cpp — auto-backend, idle-aware, join-safe nick reclaim for ZNC
-// Version: 1.6.5
+// Version: 1.6.6
 // Behavior:
 //   • Backend mode: Auto (default) uses MONITOR when advertised via 005, and can also live-probe MONITOR on hot-swapped already-connected sessions; otherwise falls back to ISON
 //   • Polls with ISON every Interval seconds (default 5s) ONLY when backend resolves to ISON and you don't own the Primary nick
@@ -437,14 +437,24 @@ class CKeepNickInstant : public CModule {
     }
 
     // MONITOR unsupported on this connection/server; fall back to ISON
+    // 421 is matched for any unknown command reply where the rejected command is MONITOR.
+    // If MonitorProbeSent is true, the probe was sent by the module — suppress both the
+    // 421 numeric from reaching the client (which would show "Server does not recognize
+    // MONITOR command" in mIRC) and the PutModule fallback message, since this is expected
+    // on ISON-only networks like Undernet and needs no user-visible notification.
+    // If MonitorProbeSent is false, the user sent the MONITOR command manually — pass the
+    // 421 through to the client and show the informational PutModule message as before.
     if (cmd == "421") {
       if (v.size() >= 4 && v[3].Equals("MONITOR", false)) {
+        bool ours = MonitorProbeSent;
         MonitorSupported = false;
         MonitorUsable = false;
         MonitorActive = false;
         MonitorKnownFree = false;
-        PutModule("MONITOR unsupported on this connection; falling back to ISON.");
+        MonitorProbeSent = false;
         ForceArmBackend(IntervalSec);
+        if (ours) return HALT; // swallow — module-generated probe, no client noise
+        PutModule("MONITOR unsupported on this connection; falling back to ISON.");
       }
       return CONTINUE;
     }
@@ -560,7 +570,7 @@ class CKeepNickInstant : public CModule {
     else if (cmd == "show" || cmd.empty() || cmd == "help") {
       CString cur = GetNetwork() ? GetNetwork()->GetIRCNick().GetNick() : "<none>";
       PutModule("keepnick_instant — auto-backend nick reclaim (MONITOR when available, otherwise ISON; idle-aware & join-safe).");
-      PutModule("Version: 1.6.5");
+      PutModule("Version: 1.6.6");
       PutModule("Current state:");
       PutModule("  Status: " + CString(Enabled ? "ENABLED" : "DISABLED"));
       PutModule("  Primary: " + Primary + "   |   Current: " + cur);
@@ -618,6 +628,6 @@ void CRearmTimer::RunJob() {
 
 template<> void TModInfo<CKeepNickInstant>(CModInfo& Info) {
   Info.SetHasArgs(true);
-  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/303 swallow, timer cleanup)");
+  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/303/421 swallow, timer cleanup)");
 }
-NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.5")
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.6")

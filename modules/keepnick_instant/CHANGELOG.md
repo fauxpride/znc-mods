@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.6] - 2026-03-23
+
+### Fixed
+- Fixed `421 :Unknown command` response from the server appearing in the mIRC status window as "Server does not recognize MONITOR command" when the module sends its own `MONITOR` probe on ISON-only networks (e.g. Undernet). The `421` handler had no ownership check — it handled all `421 MONITOR` responses identically regardless of whether the probe was sent by the module or typed manually by the user. The fix captures the value of `MonitorProbeSent` before clearing state, and if it was true (module-generated probe), returns `HALT` to suppress the `421` from reaching the client entirely. The `PutModule("MONITOR unsupported...")` message is also suppressed in this case since the fallback is expected and silent on ISON-only networks. If `MonitorProbeSent` was false (user-typed `MONITOR` command), the `421` passes through to the client and the informational `PutModule` message is shown as before.
+
+### Changed
+- Bumped version from `1.6.5` to `1.6.6`.
+- `MonitorProbeSent` is now explicitly cleared in the `421` handler alongside the other MONITOR state flags, ensuring it does not linger after a failed probe.
+
+### Notes
+- The suppression applies to both the `HotReloadDetectPending` probe path (hot reload into live session) and the `MaybeProbeMonitor()` path (first backend tick on a fresh connect while not on primary nick). Both set `MonitorProbeSent = true` before sending, so both are covered by the same check.
+- On MONITOR-capable networks (e.g. EFNet), the server responds with `730`/`731` instead of `421`, so this handler is never reached and behavior is unchanged.
+- Manual `/monitor + nick` commands typed by the user do not set `MonitorProbeSent`, so their `421` responses still pass through to the client with the informational message intact.
+
 ## [1.6.5] - 2026-03-22
 
 ### Fixed
