@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.7] - 2026-03-23
+
+### Fixed
+- Fixed `303` ISON responses occasionally leaking through to the client status window as "ison: no such user" when the primary nick was not present in the response. `ISONQueryPending` was a single `bool`, meaning it could only cover one outstanding `303` at a time. If two `303` responses arrived in quick succession — from a brief duplicate timer race, from any residual timing overlap during reconnect, or from any other condition producing multiple in-flight ISONs — the first `303` would clear the flag to `false` and the second would pass through to the client unswallowed. `ISONQueryPending` is now an `int` counter. It is incremented before each module-generated `ISON` is sent, and decremented when a `303` is swallowed. The `303` is swallowed as long as the counter is above zero, correctly covering any number of simultaneous in-flight responses. The counter is reset to zero in `OnIRCConnected` and `OnIRCDisconnected` as before.
+
+### Changed
+- Bumped version from `1.6.6` to `1.6.7`.
+- `ISONQueryPending` field type changed from `bool` (false/true) to `int` (0/counter). All set sites updated from `= true` to `++`, all reset sites updated from `= false` to `= 0`, and the swallow check updated from `if (ISONQueryPending)` to `if (ISONQueryPending > 0)`.
+
+### Notes
+- Manual `/ison` commands typed by the user never increment the counter and are always passed through to the client unchanged.
+- The counter approach is strictly more correct than the bool approach regardless of the timer fix in `1.6.5`. Even with a single timer cycle running, network latency variations could in principle cause two sequential `303` responses to overlap briefly under load. The counter handles this without any assumptions about timing.
+
 ## [1.6.6] - 2026-03-23
 
 ### Fixed
