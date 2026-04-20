@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.8] - 2026-04-19
+
+### Security
+- Hardened every code path that can write `Primary` against IRC protocol injection. `Primary` is concatenated directly into outbound `NICK <Primary>`, `ISON <Primary>`, `MONITOR + <Primary>`, and `MONITOR - <Primary>` lines in `PutIRC()`, with no further escaping. Any framing-significant character in `Primary` would therefore let the writer inject additional IRC commands (via CR/LF), additional command parameters (via space), additional MONITOR list entries (via comma), or reinterpret the parameter as a trailing argument (via a leading `:`). None of the three write paths — the `SetNick` module command, the `LoadMod` argument parsed by `LoadPrimary()`, and the NV-storage `PrimaryNick` value read at load time — previously validated their input. A new static helper `IsValidNick()` now rejects empty strings, leading `:`, all C0 control characters, DEL, space, and comma. The validation is intentionally narrower than full RFC 1459/2812 nick grammar: it only closes the injection surface, so every legitimate IRC nick still passes. The practical impact of this issue was low in all realistic deployments — every write path requires credentials that already grant much stronger capabilities against the same ZNC user — but the fix forecloses a latent footgun regardless of how those inputs are reached in the future.
+- Hardened the `730`/`731` MONITOR-state handler against server-driven state desync. Previously, any `730` (online) or `731` (offline) numeric from the server would unconditionally set `MonitorSupported`, `MonitorUsable`, and `MonitorActive` all to `true`, before the code even checked whether the reply contained the primary nick. On a misbehaving or hostile server sending `730`/`731` numerics for unrelated nicks, this would make the module believe its own subscription to `Primary` was active and confirmed on the current connection — when in reality no such subscription may have been established. The immediate consequence is that the module would suppress its `ISON` fallback path, stopping nick reclaim silently until a reconnect or `Poke`. The handler now only flips `MonitorUsable` and `MonitorActive` to `true` when `MonitorListContainsPrimary()` confirms the reply is actually for the module's own target. `MonitorSupported` continues to be set unconditionally on any `730`/`731` because the presence of those numerics alone is sufficient proof that the server speaks `MONITOR`; only the "subscription confirmed for my target" flags require the match. The realistic exploit probability is low on TLS-protected networks and moderate on plaintext networks (an on-path attacker can forge the numerics), but the availability-only impact makes it uninteresting to target deliberately. The more likely real-world trigger is honest server weirdness during netsplits, rejoins, or oddly-ordered numerics, which this fix also resolves.
+
+### Changed
+- Bumped version from `1.6.7` to `1.6.8`.
+- Added static helper `IsValidNick(const CString& nick)` to the helpers block alongside `BackendModeToString` and `ParseBackendMode`. Returns `false` for empty strings, leading `:`, any byte `< 0x20` or `== 0x7F`, space, and comma. Used at every site that writes `Primary`.
+- `LoadPrimary()` now validates each source before accepting it. Invalid module argument → warning via `PutModule` and fall through to the next source. Invalid stored NV value → warning, `DelNV("PrimaryNick")` to prevent resurrection on every load, and fall through. Invalid `GetUser()->GetNick()` fallback → fall through to the literal `"ZNCUser"`, which is known-safe by construction. The `GetUser()->GetNick()` vs `GetNetwork()->GetNick()` distinction added in `1.6.0` is preserved.
+- `SetNick` command now rejects invalid input with a descriptive error message before any state change. All subsequent behavior (stop-on-change `MonitorActive` handling, state resets, `KickBackendNow`) is preserved unchanged for valid input.
+- `730`/`731` handler in `OnRaw` now gates `MonitorUsable = true` and `MonitorActive = true` behind `match == true`. `MonitorSupported = true` remains unconditional. The `MonitorKnownFree` assignment and the `cmd == "731"` reclaim trigger already lived inside the `if (match)` block and are unchanged.
+- Updated `TModInfo` description and `NETWORKMODULEDEFS` version string to `1.6.8` and to list `nick validation, match-gated MONITOR state` as new properties.
+
+### Documentation
+- Added two new Feature summary bullets covering input-validated primary nick and match-gated MONITOR state.
+- Added a validation note to the `SetNick` command reference in the README.
+- Added a validation paragraph to the Primary nick resolution section of the Implementation details.
+- Added a match-gate paragraph to the MONITOR path section of the Implementation details, alongside the existing `MonitorActive`-on-confirmation note from `1.4.0`.
+- Updated the version reference in the Default behavior section and the Source summary block.
+
+### Notes
+- Both fixes are low-severity security hardening. Neither addresses a known exploit in real-world deployments; both close latent gaps that would matter more if the surrounding trust model changed (e.g. if ZNC ever grew a shared-admin surface that routed less-trusted input to module commands, or if the module ran against a hostile server on a plaintext network).
+- Every existing legitimate IRC nickname passes `IsValidNick()` unchanged. Users with a valid `PrimaryNick` already stored in NV will see no behavior change on upgrade.
+- The `730`/`731` change is strictly stricter than the previous behavior: the new code never flips a flag that the old code would have left alone, and only refuses to flip `MonitorUsable`/`MonitorActive` on replies that are not for the module's own target. Normal servers responding to the module's own subscriptions behave identically to `1.6.7`.
+- Manual `/ison`, manual `/monitor + nick`, and manual nick changes continue to work exactly as before — none of them go through `SetNick` or `LoadPrimary`, and none of them depend on the 730/731 state-flip behavior that was adjusted.
+- No changes to the timer model, the `433`/`303`/`421` swallow logic, the `ISONQueryPending` counter, the hot-reload detection path, or any default value. This release is narrowly scoped to the two hardening fixes.
+
 ## [1.6.7] - 2026-03-23
 
 ### Fixed

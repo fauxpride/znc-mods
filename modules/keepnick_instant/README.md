@@ -6,7 +6,7 @@ See [CHANGELOG.md](./CHANGELOG.md) for version history and release notes.
 
 It is designed for the classic IRC case where there is no NickServ-style ownership gate keeping your preferred nick reserved for you, and where the right recovery action is simply to switch back the moment that nick becomes available.
 
-As of version **1.6.7**, the module supports two reclaim backends:
+As of version **1.6.8**, the module supports two reclaim backends:
 
 - **`MONITOR` when the server advertises it via `005` / ISUPPORT**
 - **`ISON` otherwise**
@@ -140,6 +140,10 @@ For the intended use case, keep them aligned — or just run `keepnick_instant` 
   - `421 :Unknown command` responses to the module's own `MONITOR` probes on ISON-only networks are intercepted before reaching the client, preventing "Server does not recognize MONITOR command" noise in the status window. The informational `PutModule` fallback message is also suppressed for module-generated probes since the ISON fallback on non-MONITOR networks is expected and silent. Manual `MONITOR` commands typed by the user are always passed through unchanged with the informational message intact.
 - **Robust backend scheduling**
   - Backend timers are force-rearmable and use unique labels so hot-swaps, `Poke`, and reactive retries do not silently stall the reclaim loop. On connect and disconnect, any existing timer is explicitly cancelled with `RemTimer` before the label is cleared, preventing stale timers from remaining in ZNC's queue and creating duplicate polling cycles.
+- **Input-validated primary nick**
+  - Every source that can set `Primary` — the `SetNick` command, the `LoadMod` argument, and the stored NV value read on load — is validated to reject characters that would cause IRC protocol injection when concatenated into `NICK`, `ISON`, or `MONITOR` commands. This closes a latent footgun where a nick containing CR/LF, spaces, commas, or a leading `:` could inject additional IRC commands or MONITOR list entries. The check is intentionally narrow (framing-significant characters only), so every legitimate IRC nick passes.
+- **Match-gated MONITOR state**
+  - The module only treats its `MONITOR` subscription as active/usable when a `730`/`731` reply actually contains the primary nick. Replies for unrelated nicks no longer flip `MonitorActive` or `MonitorUsable` to `true`. The `MonitorSupported` flag remains unconditional on any `730`/`731` since that alone proves the server speaks `MONITOR`.
 - **Manual poke command**
   - Forces an immediate backend check now instead of merely requesting the next scheduled one.
 
@@ -147,7 +151,7 @@ For the intended use case, keep them aligned — or just run `keepnick_instant` 
 
 ## Default behavior
 
-The module source currently identifies itself as version **1.6.7** and defaults to:
+The module source currently identifies itself as version **1.6.8** and defaults to:
 
 - `Backend = Auto`
 - `Interval = 5s`
@@ -337,6 +341,8 @@ Sets and persists the primary nickname the module should try to reclaim.
 ```
 
 If the active backend is `MONITOR`, the module updates the monitored target accordingly.
+
+Since `1.6.8`, the nick argument is validated before it is accepted. Nicks that are empty, that start with `:`, or that contain spaces, commas, or control characters (including CR/LF/NUL/TAB) are rejected with an explanatory message and no state change. This prevents a malformed nick from being concatenated into the module's outbound `NICK`, `ISON`, or `MONITOR` commands where framing-significant characters could inject additional IRC commands or MONITOR list entries. The check is intentionally narrow — only the characters that break IRC framing are rejected — so every legitimate IRC nick passes.
 
 ### `Backend <Auto|Ison|Monitor>`
 
@@ -553,6 +559,8 @@ The target nick is established by `LoadPrimary()`:
 
 This gives the module a safe startup path even if no explicit nick was configured.
 
+Since `1.6.8`, each source is validated with `IsValidNick()` before it is accepted. A module argument that fails validation is ignored and the next source is consulted. A stored `PrimaryNick` that fails validation is cleared from NV and the next source is consulted — this ensures that a value persisted by an older version (before the validation existed) or a value written by direct registry edit cannot be resurrected into `Primary` on every load. The final `GetUser()->GetNick()` fallback is also validated; if even that fails, the module falls back to the literal string `ZNCUser`, which is known-safe by construction. The validation rejects the exact set of characters that would cause IRC protocol injection if concatenated into a `PutIRC()` line: empty string, leading `:`, C0 control characters, DEL, space, and comma. All legitimate IRC nicks pass unchanged.
+
 ### Timer model
 
 The module uses two single-shot timer classes:
@@ -597,6 +605,8 @@ The module tracks four pieces of `MONITOR` state:
 - whether a one-time live probe has already been sent on a hot-swapped already-live session.
 
 `MonitorActive` is only set to `true` when the server has confirmed the subscription via a `730` or `731` response. It is deliberately **not** set at probe-send time, which prevents other code paths from treating an unconfirmed probe as an active subscription. This matters on servers that silently drop unknown commands — without this guard, the module could get stuck believing `MONITOR` was working when no subscription was ever established.
+
+Since `1.6.8`, `MonitorActive` and `MonitorUsable` are only flipped to `true` when the `730`/`731` reply **actually contains the primary nick**. Earlier versions flipped both flags on any `730`/`731`, which meant a server sending those numerics for unrelated nicks could make the module believe its own subscription to `Primary` was confirmed when it was not. On hostile or misbehaving servers, that could suppress the `ISON` fallback even though no meaningful subscription existed on the current connection. `MonitorSupported` continues to be set unconditionally on any `730`/`731` because the presence of those numerics alone is sufficient proof that the server speaks `MONITOR` — only the "this subscription is confirmed for my target" flags require the match.
 
 When it receives the offline numeric for the primary nick, it immediately attempts reclaim and remembers that the nick is locally known free. If reclaim is still needed later and the `MONITOR` subscription remains active, scheduled backend ticks use that remembered offline state to retry `NICK <PrimaryNick>` locally without sending periodic `MONITOR S` refreshes.
 
@@ -790,8 +800,8 @@ This module may not be the right solution model for that network. A services/acc
 From the source header:
 
 - **Name:** `keepnick_instant`
-- **Version:** `1.6.7`
-- **Description:** Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available, otherwise ISON; OnRaw pre-filter, consistent MONITOR subscription guards, hot-reload MONITOR detect, 433/303/421 swallow, timer cleanup, ISON counter)
+- **Version:** `1.6.8`
+- **Description:** Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available, otherwise ISON; OnRaw pre-filter, consistent MONITOR subscription guards, hot-reload MONITOR detect, 433/303/421 swallow, timer cleanup, ISON counter, nick validation, match-gated MONITOR state)
 
 ---
 

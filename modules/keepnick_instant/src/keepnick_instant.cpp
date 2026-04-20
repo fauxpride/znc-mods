@@ -1,5 +1,5 @@
 // keepnick_instant.cpp — auto-backend, idle-aware, join-safe nick reclaim for ZNC
-// Version: 1.6.7
+// Version: 1.6.8
 // Behavior:
 //   • Backend mode: Auto (default) uses MONITOR when advertised via 005, and can also live-probe MONITOR on hot-swapped already-connected sessions; otherwise falls back to ISON
 //   • Polls with ISON every Interval seconds (default 5s) ONLY when backend resolves to ISON and you don't own the Primary nick
@@ -89,17 +89,68 @@ class CKeepNickInstant : public CModule {
     return false;
   }
 
+  // Reject any nick string that could cause IRC protocol injection when
+  // concatenated into a PutIRC() line. Primary is concatenated into
+  //   NICK <Primary>, ISON <Primary>, MONITOR + <Primary>, MONITOR - <Primary>
+  // without further escaping, so any framing-significant character here
+  // would let the caller inject additional IRC commands or additional
+  // MONITOR list entries. We reject:
+  //   • empty
+  //   • any C0 control char (CR/LF/NUL/TAB/etc.) and DEL — framing bytes
+  //   • space            — IRC parameter separator
+  //   • comma            — MONITOR target list separator
+  //   • leading ':'      — would be parsed as the trailing-parameter marker
+  // This is intentionally narrower than full RFC 1459/2812 nick validation:
+  // we are only closing the injection surface, not enforcing server-side
+  // nick grammar (servers differ, e.g. on allowed length and casemapping).
+  // Any legitimate IRC nick passes.
+  static bool IsValidNick(const CString& nick) {
+    if (nick.empty()) return false;
+    if (nick[0] == ':') return false;
+    for (size_t i = 0; i < nick.size(); ++i) {
+      unsigned char c = (unsigned char)nick[i];
+      if (c < 0x20 || c == 0x7F) return false;
+      if (c == ' ' || c == ',') return false;
+    }
+    return true;
+  }
+
   void LoadPrimary(const CString& arg) {
-    if (!arg.empty()) { Primary = arg; SetNV("PrimaryNick", Primary); return; }
+    // 1) Explicit module argument wins, but only if it passes injection-safe
+    //    validation. A bad argument falls through to the next source rather
+    //    than being silently accepted and later concatenated into PutIRC().
+    if (!arg.empty()) {
+      if (IsValidNick(arg)) {
+        Primary = arg;
+        SetNV("PrimaryNick", Primary);
+        return;
+      }
+      PutModule("Warning: module argument nick contains invalid characters (control/space/comma/leading-':') and was ignored.");
+    }
+    // 2) Stored NV value. If an old version (pre-1.6.8) persisted a bad
+    //    value, or the registry was manually edited, clear it and fall
+    //    through so the module cannot resurrect an unsafe nick on every
+    //    load.
     CString stored = GetNV("PrimaryNick");
-    if (!stored.empty()) { Primary = stored; return; }
-    // Use the ZNC-configured nick as the authoritative source, not
+    if (!stored.empty()) {
+      if (IsValidNick(stored)) { Primary = stored; return; }
+      PutModule("Warning: stored PrimaryNick contained invalid characters and has been cleared.");
+      DelNV("PrimaryNick");
+    }
+    // 3) Use the ZNC-configured nick as the authoritative source, not
     // GetNetwork()->GetNick() which returns the current IRC nick. On a hot reload
     // while connected as an alternate (e.g. fauxpride-), GetNetwork()->GetNick()
     // would return the alternate and the module would poll for the wrong nick.
     // GetUser()->GetNick() is what the user has configured ZNC to use and is the
     // correct fallback when no PrimaryNick is stored.
-    Primary = GetUser() ? GetUser()->GetNick() : "ZNCUser";
+    CString userNick = GetUser() ? GetUser()->GetNick() : CString("");
+    if (IsValidNick(userNick)) {
+      Primary = userNick;
+    } else {
+      // Defensive: even a corrupted ZNC user config shouldn't let an unsafe
+      // value reach Primary. Fall back to a known-safe literal.
+      Primary = "ZNCUser";
+    }
   }
 
   void LoadNV() {
@@ -413,13 +464,23 @@ class CKeepNickInstant : public CModule {
 
     // MONITOR online/offline numerics
     if (cmd == "730" || cmd == "731") {
+      // Server demonstrably speaks MONITOR — this flag is safe to flip
+      // unconditionally since any 730/731 proves capability regardless of
+      // which nick the reply is about.
       MonitorSupported = true;
-      MonitorUsable = true;
-      MonitorActive = true;
       CString trailing = sLine.Token(3, true);
       trailing.TrimLeft(CString(":"));
       bool match = MonitorListContainsPrimary(trailing, cmd == "730");
       if (match) {
+        // Only flip "active" and "usable" when the reply is actually for
+        // our own subscription target. Previously these were flipped on
+        // any 730/731, which allowed a misbehaving or hostile server to
+        // send 730/731 for unrelated nicks and make the module believe
+        // its own subscription to Primary was confirmed. That could
+        // suppress ISON fallback even though we were never actually
+        // subscribed to Primary on this connection.
+        MonitorUsable = true;
+        MonitorActive = true;
         MonitorKnownFree = (cmd == "731");
         if (cmd == "731") TryReclaim();
       }
@@ -511,6 +572,11 @@ class CKeepNickInstant : public CModule {
     else if (cmd == "setnick") {
       CString nick = sCmdLine.Token(1, true).Trim_n();
       if (nick.empty()) { PutModule("Usage: SetNick <nick> — Set & persist the primary nick to reclaim."); return; }
+      if (!IsValidNick(nick)) {
+        PutModule("Rejected: nick must not be empty, start with ':', or contain spaces, commas, or control characters. "
+                  "(These would be interpreted as IRC framing when the module concatenates the nick into NICK / ISON / MONITOR commands.)");
+        return;
+      }
       CString old = Primary;
       if (MonitorActive && !old.empty() && !old.Equals(nick, false)) StopMonitor(old);
       Primary = nick;
@@ -573,7 +639,7 @@ class CKeepNickInstant : public CModule {
     else if (cmd == "show" || cmd.empty() || cmd == "help") {
       CString cur = GetNetwork() ? GetNetwork()->GetIRCNick().GetNick() : "<none>";
       PutModule("keepnick_instant — auto-backend nick reclaim (MONITOR when available, otherwise ISON; idle-aware & join-safe).");
-      PutModule("Version: 1.6.7");
+      PutModule("Version: 1.6.8");
       PutModule("Current state:");
       PutModule("  Status: " + CString(Enabled ? "ENABLED" : "DISABLED"));
       PutModule("  Primary: " + Primary + "   |   Current: " + cur);
@@ -631,6 +697,6 @@ void CRearmTimer::RunJob() {
 
 template<> void TModInfo<CKeepNickInstant>(CModInfo& Info) {
   Info.SetHasArgs(true);
-  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/303/421 swallow, timer cleanup, ISON counter)");
+  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/303/421 swallow, timer cleanup, ISON counter, nick validation, match-gated MONITOR state)");
 }
-NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.7")
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.8")
