@@ -20,9 +20,25 @@
 // - If you attach before enough trailing lines arrive, the event is replayed as partial.
 // - If ZNC or the VPS dies mid-capture, the event is recovered from the durable journal
 //   and replayed as partial on the next attach if it wasn't fully completed.
-// - In auto mode, ignore_drop enforcement is armed only if ignore_drop was already loaded
-//   when highlightctx itself loaded. If ignore_drop appears later, reload highlightctx if you
-//   want the stricter ignore-aware ordering guarantee.
+// - In auto mode, ignore_drop enforcement is armed only if ignore_drop is positioned
+//   ahead of highlightctx in the network's module list, so its hooks fire before ours.
+//   The arming state is re-evaluated at these points:
+//     * at module OnLoad (original heuristic: is ignore_drop already in the list?)
+//     * at ZNC OnBoot (for modules loaded from znc.conf, re-checks actual hook order
+//       after all znc.conf modules have loaded — fixes the common /znc restart case
+//       where alphabetical ordering puts highlightctx before ignore_drop)
+//     * on demand via the Rearm command
+//   Runtime load or unload of ignore_drop does not automatically re-arm or disarm,
+//   because ZNC 1.9.x dispatches OnModuleLoading/OnModuleUnloading only to
+//   global-scope modules. Use Rearm after runtime changes if you want the armed
+//   state to reflect them for display purposes.
+//   Capture correctness is independently protected at runtime by a live
+//   HasIgnoreDropLoaded() check in ShouldCaptureNow(): when the strict requirement
+//   is effective but ignore_drop is absent, capture pauses until ignore_drop is
+//   available again, regardless of the cached armed flag.
+//   Armed semantics are deliberately sticky: once armed, the strict requirement
+//   stays effective even if ignore_drop is temporarily unloaded, so capture pauses
+//   rather than silently resuming without the protection the user asked for.
 
 #include <znc/znc.h>
 #include <znc/Modules.h>
@@ -55,7 +71,7 @@
 
 namespace {
 
-static const char* kModVersion = "highlightctx 0.6.0";
+static const char* kModVersion = "highlightctx 0.7.0";
 static const char* kJournalName = "highlightctx.journal";
 static const size_t kCompactThresholdLines = 512;
 
@@ -364,8 +380,11 @@ class CHighlightCtx : public CModule {
                    "List all currently excluded channels for this network instance of highlightctx.",
                    [this](const CString&) { CmdListExcludes(); });
         AddCommand("SetRequireIgnoreDrop", "<off|on|auto>",
-                   "Set ignore_drop integration mode. off = never require ignore_drop. on = require ignore_drop to be loaded now and keep capture paused whenever it is absent. auto = arm the same strict behavior only if ignore_drop was already loaded when highlightctx itself loaded; if ignore_drop appears later, reload highlightctx to arm the stricter ignore-aware ordering guarantee.",
+                   "Set ignore_drop integration mode. off = never require ignore_drop. on = require ignore_drop to be loaded now and keep capture paused whenever it is absent. auto = arm the same strict behavior only if ignore_drop is positioned ahead of highlightctx in the network's module list so its hooks fire before ours; see Rearm to re-check after a runtime change.",
                    [this](const CString& sLine) { CmdSetRequireIgnoreDrop(sLine); });
+        AddCommand("Rearm", "",
+                   "Re-check ignore_drop presence and hook-order position without reloading the module. Reports whether strict ignore-aware capture is now armed. Note: if ignore_drop is present but positioned after highlightctx in the module list, Rearm cannot fix hook order on its own; unload and reload highlightctx to move it to the end of the list, or reorder the LoadModule lines in znc.conf for the next restart.",
+                   [this](const CString&) { CmdRearm(); });
         AddCommand("Compact", "",
                    "Rewrite the durable on-disk journal to the minimum representation needed for currently open/pending events. This is usually automatic after replay/clear and when the journal grows large.",
                    [this](const CString&) { CmdCompact(); });
@@ -419,6 +438,36 @@ class CHighlightCtx : public CModule {
     void OnClientDetached() override {
         ClearVolatileState();
     }
+
+    bool OnBoot() override {
+        // Fires after all znc.conf modules have been loaded. At this point we
+        // can inspect actual module-list positions to determine whether
+        // ignore_drop's hooks will fire before ours. This fixes the common
+        // /znc restart case where alphabetical load order would put
+        // highlightctx ahead of ignore_drop — OnLoad's HasIgnoreDropLoaded()
+        // would return false at that point, leaving auto mode unarmed, even
+        // though both modules end up loaded. By re-checking here we can arm
+        // automatically as long as the config order is fixed up so
+        // ignore_drop appears before highlightctx in znc.conf.
+        RecheckIgnoreDropHookOrder();
+        return true;
+    }
+
+    // Note on OnModuleLoading / OnModuleUnloading: these hooks exist on
+    // CModule's virtual interface, but ZNC 1.9.x dispatches them only via
+    // GLOBALMODULECALL, so they fire on global-scope modules only. A network
+    // module that overrides them never receives the callback. Runtime load
+    // or unload of ignore_drop therefore does NOT update our armed flag
+    // automatically. Two mechanisms cover this:
+    //   1) ShouldCaptureNow() calls HasIgnoreDropLoaded() live on every
+    //      incoming message, so capture correctly pauses when ignore_drop
+    //      is absent regardless of the cached armed flag.
+    //   2) The Rearm command re-evaluates the flag on demand after any
+    //      runtime load/unload that the operator has performed.
+    // Armed semantics are deliberately sticky: once armed, the strict
+    // ignore_drop requirement stays effective even if ignore_drop is
+    // temporarily unloaded, so capture pauses rather than silently
+    // resuming without the protection the user asked for.
 
     EModRet OnChanTextMessage(CTextMessage& Message) override {
         HandleIncoming(Message, 'T');
@@ -589,6 +638,38 @@ class CHighlightCtx : public CModule {
     bool HasIgnoreDropLoaded() const {
         if (!GetNetwork()) return false;
         return (GetNetwork()->GetModules().FindModule("ignore_drop") != nullptr);
+    }
+
+    // Returns true iff ignore_drop is currently in the network module list AND
+    // its position is ahead of ours (i.e. its hooks will be dispatched before
+    // ours). Returns false if either module is missing from the iteration,
+    // or if ignore_drop is positioned at or after our own position.
+    bool IsIgnoreDropAheadOfUs() const {
+        if (!GetNetwork()) return false;
+        const CModules& mods = GetNetwork()->GetModules();
+        int my_pos = -1;
+        int their_pos = -1;
+        int i = 0;
+        for (CModule* pMod : mods) {
+            if (pMod) {
+                if (pMod == this) {
+                    my_pos = i;
+                } else if (pMod->GetModName().Equals("ignore_drop")) {
+                    their_pos = i;
+                }
+            }
+            ++i;
+        }
+        return (my_pos >= 0 && their_pos >= 0 && their_pos < my_pos);
+    }
+
+    // Unified hook-order re-check used by OnBoot and Rearm. Updates
+    // m_ignore_drop_present_on_module_load (which despite its legacy name is
+    // now semantically "ignore_drop was ahead of us in hook order at last
+    // check") and recomputes the auto-armed runtime state.
+    void RecheckIgnoreDropHookOrder() {
+        m_ignore_drop_present_on_module_load = IsIgnoreDropAheadOfUs();
+        RecomputeIgnoreDropRuntimeState();
     }
 
     void RecomputeIgnoreDropRuntimeState() {
@@ -1113,8 +1194,8 @@ class CHighlightCtx : public CModule {
         PutModule("Replay target: *highlightctx. When the current client supports IRCv3 server-time/time tags, replay is emitted as synthetic raw PRIVMSG lines with original @time values so the client can display historical timestamps natively. If the client does not support that, replay falls back to text prefixed with the original UTC timestamp.");
         PutModule("Events are sorted by channel name first, then by event time/id within each channel. A spacer line is added between events for readability.");
         PutModule("Persistence strategy: ordinary chatter stays only in RAM, while actual highlight events are durably journaled to disk as they happen. That keeps the hot path light but preserves active highlight captures across an unexpected VPS shutdown.");
-        PutModule("ignore_drop modes: off = never required. on = must already be loaded before highlightctx loads and capture pauses whenever it is absent. auto = the same strict behavior is armed only if ignore_drop was already present when highlightctx itself loaded; if ignore_drop appears later, reload highlightctx to arm the stricter ignore-aware ordering guarantee.");
-        PutModule("Primary commands: Status, SetBefore, SetAfter, SetMaxEvents, AddExclude, DelExclude, ListExcludes, SetRequireIgnoreDrop, Reset, ReplayNow, Compact, ClearPending.");
+        PutModule("ignore_drop modes: off = never required. on = must already be loaded before highlightctx loads and capture pauses whenever it is absent. auto = the same strict behavior is armed only if ignore_drop is positioned ahead of highlightctx in the network's module list so its hooks fire before ours. Arming is re-evaluated at OnLoad, at OnBoot for znc.conf-loaded modules, and on demand via Rearm. Runtime load or unload of ignore_drop does not automatically re-arm; ZNC dispatches those lifecycle hooks to global-scope modules only, so Rearm is the supported way to refresh the state after a runtime change. Runtime capture is always protected by an independent HasIgnoreDropLoaded() check inside ShouldCaptureNow(), so when the strict requirement is effective but ignore_drop is absent, capture pauses regardless of the armed flag. Armed state is sticky by design: once armed, it stays armed across ignore_drop unload/reload so capture does not silently resume without the protection the user asked for.");
+        PutModule("Primary commands: Status, SetBefore, SetAfter, SetMaxEvents, AddExclude, DelExclude, ListExcludes, SetRequireIgnoreDrop, Rearm, Reset, ReplayNow, Compact, ClearPending.");
     }
 
     void CmdStatus() {
@@ -1128,12 +1209,12 @@ class CHighlightCtx : public CModule {
         PutModule(CString("after cap: ") + CString(std::to_string(m_after_max)));
         PutModule(CString("max_events: ") + (m_max_events == 0 ? "disabled" : CString(std::to_string(m_max_events)).c_str()));
         PutModule(CString("require_ignore_drop mode: ") + IgnoreModeName());
-        PutModule(CString("ignore_drop was present when highlightctx loaded: ") + (m_ignore_drop_present_on_module_load ? "yes" : "no"));
+        PutModule(CString("ignore_drop ahead of highlightctx in hook order: ") + (m_ignore_drop_present_on_module_load ? "yes" : "no"));
         PutModule(CString("auto mode armed: ") + ((m_require_ignore_mode == ERequireIgnoreMode::Auto && m_auto_ignore_drop_armed) ? "yes" : "no"));
         PutModule(CString("effective ignore_drop requirement now: ") + (IsIgnoreDropRequirementEffective() ? "yes" : "no"));
         PutModule(CString("ignore_drop currently loaded: ") + (HasIgnoreDropLoaded() ? "yes" : "no"));
         if (m_require_ignore_mode == ERequireIgnoreMode::Auto && !m_auto_ignore_drop_armed && HasIgnoreDropLoaded()) {
-            PutModule("note: ignore_drop is loaded now, but auto mode is not armed because ignore_drop was not present when highlightctx loaded. Reload highlightctx after ignore_drop if you want strict ignore-aware ordering semantics.");
+            PutModule("note: ignore_drop is loaded now, but auto mode is not armed because ignore_drop is positioned at or after highlightctx in the network module list, so its hooks fire after ours. Try Rearm to re-check; if that still reports unarmed, unload and reload highlightctx so it ends up after ignore_drop in the list, or fix the LoadModule order in znc.conf for the next restart.");
         }
         if (GetClient()) {
             PutModule(CString("current client native server-time replay support: ") + (ClientSupportsNativeServerTime(GetClient()) ? "yes" : "no"));
@@ -1232,10 +1313,55 @@ class CHighlightCtx : public CModule {
             msg += (m_auto_ignore_drop_armed ? "yes" : "no");
             msg += ")";
             if (!m_auto_ignore_drop_armed && HasIgnoreDropLoaded()) {
-                msg += " | note: ignore_drop is loaded now but auto mode is unarmed because ignore_drop was not present when highlightctx loaded; reload highlightctx after ignore_drop if you want strict ignore-aware ordering semantics.";
+                msg += " | note: ignore_drop is loaded now but auto mode is unarmed because ignore_drop is positioned at or after highlightctx in the module list; try Rearm to re-check, or unload and reload highlightctx to move it after ignore_drop.";
             }
         }
         PutModule(msg);
+    }
+
+    void CmdRearm() {
+        // Re-check ignore_drop presence and hook-order position on demand.
+        // This updates the armed flag but CANNOT fix hook order by itself —
+        // hook dispatch order is a function of module-list position, which is
+        // fixed at the time each module was added to the list. The user-
+        // visible value here is (a) diagnosing the current state accurately
+        // without a module reload, and (b) clearing a stale "unarmed" state
+        // if something has changed (e.g. ignore_drop was unloaded and then
+        // re-loaded in the correct order at runtime via LoadMod).
+        if (!GetNetwork()) {
+            PutModule("Cannot rearm: no network context.");
+            return;
+        }
+
+        const bool was_armed = m_auto_ignore_drop_armed;
+        RecheckIgnoreDropHookOrder();
+
+        const bool now_loaded = HasIgnoreDropLoaded();
+        const bool now_ahead  = m_ignore_drop_present_on_module_load;
+
+        PutModule(CString("ignore_drop currently loaded: ") + (now_loaded ? "yes" : "no"));
+        PutModule(CString("ignore_drop ahead of highlightctx in hook order: ") + (now_ahead ? "yes" : "no"));
+        PutModule(CString("require_ignore_drop mode: ") + IgnoreModeName());
+        PutModule(CString("auto mode armed: ") + ((m_require_ignore_mode == ERequireIgnoreMode::Auto && m_auto_ignore_drop_armed) ? "yes" : "no"));
+        PutModule(CString("effective ignore_drop requirement now: ") + (IsIgnoreDropRequirementEffective() ? "yes" : "no"));
+
+        if (m_require_ignore_mode == ERequireIgnoreMode::Auto) {
+            if (!now_loaded) {
+                PutModule("Rearm result: not armed (ignore_drop is not loaded on this network).");
+            } else if (!now_ahead) {
+                PutModule("Rearm result: not armed. ignore_drop is loaded but positioned at or after highlightctx in the module list, so its hooks fire after ours. To fix hook order: UnloadMod highlightctx then LoadMod --type=network highlightctx, or reorder the LoadModule lines in znc.conf for the next restart.");
+            } else {
+                PutModule("Rearm result: armed. ignore_drop is ahead of highlightctx in hook order.");
+            }
+        } else {
+            PutModule("Note: require_ignore_drop mode is not 'auto'; Rearm updates the ahead-in-hook-order state for diagnostics but does not change behavior outside auto mode.");
+        }
+
+        if (was_armed && !m_auto_ignore_drop_armed) {
+            PutModule("Warning: auto mode transitioned from armed to unarmed as a result of this re-check.");
+        } else if (!was_armed && m_auto_ignore_drop_armed) {
+            PutModule("auto mode transitioned from unarmed to armed as a result of this re-check.");
+        }
     }
 
     void CmdSetMaxEvents(const CString& sLine) {
