@@ -1,14 +1,16 @@
 # highlightctx
 
-Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional `ignore_drop` integration.
+Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into [`*highlightctx`](./src/highlightctx.cpp), and optional [`ignore_drop`](../ignore_drop/README.md) integration.
 
 Current module version in source: **0.7.0**
+
+See [CHANGELOG.md](./CHANGELOG.md) for version history and release notes.
 
 ---
 
 ## What this module is for
 
-`highlightctx` is designed for a very specific gap in the usual ZNC workflow:
+[`highlightctx`](./src/highlightctx.cpp) is designed for a very specific gap in the usual ZNC workflow:
 
 when you are **detached** from a network, you may still want a clean, focused replay of the most important conversations that happened while you were away — not a full playback dump, and not a dependency on the normal channel buffer length.
 
