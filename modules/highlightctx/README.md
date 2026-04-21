@@ -1,16 +1,14 @@
 # highlightctx
 
-Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into [`*highlightctx`](./src/highlightctx.cpp), and optional [`ignore_drop`](../ignore_drop/README.md) integration.
+Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional `ignore_drop` integration.
 
 Current module version in source: **0.7.0**
-
-See [CHANGELOG.md](./CHANGELOG.md) for version history and release notes.
 
 ---
 
 ## What this module is for
 
-[`highlightctx`](./src/highlightctx.cpp) is designed for a very specific gap in the usual ZNC workflow:
+`highlightctx` is designed for a very specific gap in the usual ZNC workflow:
 
 when you are **detached** from a network, you may still want a clean, focused replay of the most important conversations that happened while you were away — not a full playback dump, and not a dependency on the normal channel buffer length.
 
@@ -230,6 +228,46 @@ Internal threshold in the source:
 ---
 
 ## `ignore_drop` integration
+
+### What `ignore_drop` detection does
+
+`highlightctx` captures channel messages while you are detached. If someone on your ignore list is spamming or harassing you, you do not want their messages appearing in your replay — you want them filtered out before `highlightctx` ever sees them.
+
+[`ignore_drop`](../ignore_drop/README.md) is a separate module whose job is to drop messages from users on your ignore list. When a message comes in from an ignored user, `ignore_drop` tells ZNC "halt this — do not pass it to any other module." That halt only works if `ignore_drop` runs *before* `highlightctx` in the chain of modules that process the message. If it runs after, the damage is done: `highlightctx` has already captured the ignored user's message.
+
+ZNC dispatches each incoming message to modules in the order they appear in the module list. So detection is really asking one question: **"is `ignore_drop` positioned ahead of `highlightctx` in the module list, so its filtering runs first?"**
+
+Three possible answers:
+
+- **`ignore_drop` is ahead of `highlightctx`** — filtering works, protection is active. "Armed."
+- **`ignore_drop` is loaded but positioned after `highlightctx`** — `highlightctx` sees messages before the filter gets a chance. Not armed.
+- **`ignore_drop` is not loaded at all** — nothing to filter with. Not armed.
+
+The three integration modes (`off`, `on`, `auto`) described below decide what `highlightctx` does with that answer.
+
+For `auto` mode specifically, detection runs at three moments: when `highlightctx` first loads, when ZNC finishes booting up from `znc.conf` (the important one for `/znc restart`), and whenever you run `Rearm` manually. The most recent result is stored in a flag called "armed," visible in `Status` output.
+
+Separately from detection, every incoming channel message goes through a live check: "is `ignore_drop` currently loaded right now?" If the answer is no and strict mode is effective, capture pauses for that message. The actual capture behavior is therefore always correct based on what is true when a message arrives, even if the armed flag from some earlier check is stale.
+
+In practical terms: if you have `ignore_drop` set up and correctly ordered (`ignore_drop` before `highlightctx` in `znc.conf`), you do not have to think about any of this. `highlightctx` detects the good setup at startup, goes into strict mode, and filters ignored users out of your replay automatically. If you do not have `ignore_drop`, `highlightctx` falls back to unprotected capture and you get everything that comes in.
+
+### What `Rearm` is for
+
+Runtime load or unload of [`ignore_drop`](../ignore_drop/README.md) is not automatically detected by `highlightctx`. ZNC 1.9.x dispatches the relevant lifecycle hooks only to global-scope modules, so a network-scope module like `highlightctx` gets no notification when other modules come and go. The armed flag in `Status` only refreshes at the three moments described above — so after a manual `loadmod ignore_drop` or `unloadmod ignore_drop`, the flag can go stale until something prompts a re-check.
+
+This does not affect capture correctness. The live `HasIgnoreDropLoaded()` check inside `ShouldCaptureNow()` runs on every incoming message and always gets an accurate answer from ZNC. Protection works in real time; only the *display* of whether protection is active can go stale.
+
+`Rearm` exists to bridge that gap. It does three things nothing else does:
+
+1. **Refresh the armed flag shown in `Status`.** After a runtime load or unload of `ignore_drop`, `Status` can show a stale value; `Rearm` re-checks the module list and updates it.
+
+2. **Explicitly disarm after sticky armed.** If `ignore_drop` was unloaded at runtime, the strict requirement stays in force and capture stays paused by design — so capture does not silently resume unprotected. To actively step out of that state and resume unprotected capture, `Rearm` does it cleanly. The alternative is `SetRequireIgnoreDrop off`.
+
+3. **Verify hook-order position after a reorder.** After an `UpdateMod highlightctx` or a manual `loadmod` / `unloadmod` sequence, `Rearm` inspects the new list and tells you whether things are now positioned correctly. Its output is more diagnostic than just re-reading `Status`: it explicitly says "armed" or "not armed because positioned at or after highlightctx," with remediation steps.
+
+If you set up `znc.conf` once with the correct order and do not touch module loading at runtime, you will almost never need `Rearm`. It is there for cases where runtime state has changed and you want the module's status display (or sticky-armed state) to reflect reality.
+
+---
 
 The module supports three integration modes for `ignore_drop`:
 
