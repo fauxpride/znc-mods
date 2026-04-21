@@ -17,6 +17,8 @@ This makes `ignore_drop` well suited to use cases such as:
 - centralizing ignore behavior in ZNC rather than reproducing it across multiple IRC clients
 - applying ignores on a **per-network** basis instead of globally
 
+Current version: **1.1.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes.
+
 ---
 
 ## What the module does
@@ -46,7 +48,7 @@ Wildcard matching is supported with:
 - `*` for any sequence of characters
 - `?` for a single character
 
-Matching is case-insensitive.
+Matching is case-insensitive, using **RFC 1459 case folding** (see below).
 
 ---
 
@@ -79,13 +81,14 @@ It is especially appropriate for users who:
 
 - network module, not a global/user module
 - per-network storage using ZNC NV
-- case-insensitive wildcard masks
+- case-insensitive wildcard masks with **RFC 1459 case folding**
 - separate semantics for **always** and **detached** rules
 - optional playback hiding for detached rules
 - supports both nick-only and full hostmask-style matching
 - includes a built-in `Test` command for checking whether a sender would be dropped
-- optimized around pre-lowered masks and separate internal buckets for faster matching paths
-- contains fallback playback-line hooks for older ZNC playback paths
+- `Version` command for identifying the running build
+- allocation-free iterative wildcard matcher
+- contains fallback playback-line hooks for older ZNC playback paths, with IRCv3 message-tag awareness
 
 ---
 
@@ -150,11 +153,23 @@ These are matched against the sender in the form:
 nick!ident@host
 ```
 
-### Case handling
+### Case handling and RFC 1459 folding
 
 All matching is case-insensitive.
 
-Internally, masks are normalized to lowercase when stored, and incoming sender samples are lowercased before comparison.
+Internally, masks are normalized with **RFC 1459 case folding** when stored, and incoming sender samples are folded before comparison. RFC 1459 case folding treats the following pairs as equivalent (one line = one equivalence class):
+
+```text
+A-Z <-> a-z
+[   <-> {
+]   <-> }
+\   <-> |
+~   <-> ^
+```
+
+This matters because most IRC daemons use the `rfc1459` casemapping, meaning the server considers `[bot]` and `{bot}` the same nickname. Before this was added, the module would treat those as different, and a user could defeat a mask like `[bot]*` by appearing as `{bot}something`. Since 1.1.0, both sides of the comparison are folded through the same table, and that bypass is closed.
+
+For ASCII-only nicks this is a no-op. Legacy ignore entries written by 1.0.0 — which used plain ASCII lowercasing — are re-folded on load, so no manual migration is needed.
 
 ### Wildcards
 
@@ -162,6 +177,18 @@ The module supports:
 
 - `*` = any sequence of characters, including empty
 - `?` = exactly one character
+
+Other characters (including `.`, `$`, `^`, etc.) are matched literally; there is no regex interpretation.
+
+### Mask validation
+
+Masks go through a small set of checks at `Add` time. A mask is **rejected** if:
+
+- it is empty
+- it contains an embedded CR (`\r`), LF (`\n`), or NUL (`\0`) byte — these would corrupt the newline-delimited NV storage format
+- it begins with the two bytes `A|` or `D|` (case-insensitive) — these sequences are reserved for the on-disk scope prefix
+
+If you genuinely need to match a nickname that starts with `A|` or `D|`, use a wildcard pattern such as `?|*` or `[AD]|*` to work around the restriction.
 
 ---
 
@@ -220,6 +247,8 @@ Examples:
 /msg *ignore_drop Add *!~bot@host.example always
 /msg *ignore_drop Add *!*@*.example.net d
 ```
+
+If the mask fails validation, the module prints a `Rejected: ...` line explaining why, and nothing is stored.
 
 ### List configured ignores
 
@@ -299,13 +328,13 @@ Example:
 /msg *ignore_drop Test trouble!~user@example.net
 ```
 
-Example output:
+### Print the running version
 
 ```text
-Live: DROP | Playback: pass
+/msg *ignore_drop Version
 ```
 
-This is useful when verifying mask behavior without waiting for real traffic.
+Replies with `ignore_drop version <x.y.z>`.
 
 ### Clear all ignores
 
@@ -313,52 +342,7 @@ This is useful when verifying mask behavior without waiting for real traffic.
 /msg *ignore_drop Clear
 ```
 
----
-
-## Typical workflows
-
-### 1. Permanent ignore for a known spam nick
-
-```text
-/msg *ignore_drop Add SpamNick always
-```
-
-Effect:
-
-- live traffic from `SpamNick` is dropped at all times
-- replayed buffer entries from `SpamNick` are also hidden
-
-### 2. Suppress a noisy bot only while detached
-
-```text
-/msg *ignore_drop Add *!bot@host.example detached
-```
-
-Effect:
-
-- when you are attached, traffic passes normally
-- when you are detached, matching live traffic is dropped
-- playback remains visible unless detached playback hiding is enabled
-
-### 3. Hide detached noise both live and in playback
-
-```text
-/msg *ignore_drop Add *!*@*.annoying.example detached
-/msg *ignore_drop SetDetachedPlayback on
-```
-
-Effect:
-
-- detached live traffic is dropped
-- playback entries matching detached rules are also hidden
-
-### 4. Verify behavior before relying on it
-
-```text
-/msg *ignore_drop Test badguy!~x@evil.example
-```
-
-Use this after adding or adjusting rules to confirm the current outcome.
+Removes all ignore entries for the current network. This does not affect the `SetDetachedPlayback` setting.
 
 ---
 
@@ -370,12 +354,13 @@ Use this after adding or adjusting rules to confirm the current outcome.
 Add <mask> [detached|always]
 ```
 
-Adds a new ignore entry.
+Adds an ignore entry for this network.
 
 Behavior details:
 
 - default scope is `always`
-- nick-only vs full-mask handling is determined automatically from the mask text
+- masks are normalized to RFC 1459-folded form before being stored
+- the mask must pass basic validation (no CR/LF/NUL, no reserved `A|`/`D|` prefix)
 - no de-duplication is performed; duplicate entries are currently possible
 
 ### `Del`
@@ -388,7 +373,7 @@ Deletes an entry by index or by exact mask.
 
 Behavior details:
 
-- deleting by mask is case-insensitive because the input is normalized before comparison
+- deleting by mask is case-insensitive because the input is folded before comparison
 - if duplicates exist, deleting by exact mask removes the first matching stored entry encountered internally
 
 ### `List`
@@ -439,6 +424,14 @@ Evaluates a sample sender against the current rule set and reports what would ha
 - live traffic
 - playback
 
+### `Version`
+
+```text
+Version
+```
+
+Prints `ignore_drop version <x.y.z>` for the running build.
+
 ---
 
 ## Implementation details
@@ -477,15 +470,15 @@ That helps keep the decision paths simple and avoids repeatedly reclassifying ma
 
 Each stored entry contains:
 
-- `mask_lc`: the lowercased mask
+- `mask_lc`: the RFC 1459-folded mask
 - `nick_only`: whether the mask lacks both `!` and `@`
 - `scope`: `ALWAYS` or `DETACHED`
 
 ### Normalization strategy
 
-Masks are lowercased when added or loaded from storage.
+Masks are RFC 1459-folded when added or loaded from storage.
 
-Incoming sender samples are also lowercased before matching. This gives case-insensitive behavior without repeatedly normalizing stored masks.
+Incoming sender samples are also folded before matching. This gives case-insensitive behavior (including for the `[]\~` equivalence class) without repeatedly normalizing stored masks.
 
 ### Live traffic path
 
@@ -493,8 +486,8 @@ The live hooks all funnel into `LiveMaybeDrop()`.
 
 That function:
 
-1. builds a lowercase nickname sample
-2. builds a lowercase full `nick!ident@host` sample
+1. builds a folded nickname sample
+2. builds a folded full `nick!ident@host` sample
 3. checks `always` rules first
 4. only if detached rules exist, computes whether the network is attached
 5. if the network is detached, checks detached rules
@@ -523,22 +516,19 @@ In addition to modern buffer-play message hooks, the source also contains fallba
 - `OnChanBufferPlayLine`
 - `OnPrivBufferPlayLine`
 
-These parse the line prefix into a temporary `CNick` and then reuse the same playback decision logic.
-
-That means the module is written with some compatibility awareness for older playback hook paths.
+These parse the line prefix into a temporary `CNick` and then reuse the same playback decision logic. As of 1.1.0, the line parser skips IRCv3 message tags (a leading `@tag=value;...` block up to the first space) before looking for the `:prefix`, so tagged playback lines are filtered correctly.
 
 ### Wildcard engine
 
-Mask matching is performed by `wildmatch_ci()`.
+Mask matching is performed by `wildmatch_folded()`, an iterative star-backtracking matcher.
 
 Notable characteristics:
 
 - supports `*` and `?`
-- case-insensitive character comparison
-- includes a fast path for exact equality before doing the heavier work
-- uses a dynamic-programming table to evaluate wildcard matches
-
-This is straightforward and correct, though it also means matching cost grows with mask length and input length. In normal ignore-list usage that is typically acceptable, especially because the surrounding code reduces unnecessary work in other places.
+- byte-level comparison after both sides are RFC 1459-folded
+- includes a fast path for exact equality before doing further work
+- allocation-free — no heap work per match
+- typical IRC masks run at O(P + T); adversarial patterns degrade to O(P·T), but the constant factor is small and there is no dynamic-programming table to allocate
 
 ### Storage format
 
@@ -567,6 +557,8 @@ D|spam*
 D|*!*@*.example.net
 ```
 
+On load, entries with an unrecognized first byte are skipped (and counted in a `[ignore_drop] Skipped N malformed mask entry/entries during load.` message) rather than silently treated as `always`. Entries with no prefix at all are treated as `always` for backwards compatibility with 1.0.0.
+
 #### `detached_playback`
 
 Stored as:
@@ -590,6 +582,7 @@ When the module loads:
 - `detached_playback` is read first
 - masks are loaded from NV
 - entries are split back into the four internal vectors
+- legacy entries are re-folded in memory; storage is re-normalized on the next `SaveMasks` (which happens on any `Add`, `Del`, `Clear`, or `SetScope`)
 
 ### Ordering and indexing behavior
 
@@ -613,13 +606,14 @@ If you change scope with `SetScope`, the entry is reinserted into the target buc
 
 The source comments explicitly aim for low overhead, and the implementation reflects that in several ways:
 
-- masks are lowercased once, not on every comparison
+- masks are folded once, not on every comparison
 - masks are split into scope/type buckets up front
 - `always` rules are checked before detached logic
 - attached-state lookup is deferred until it is actually needed
 - a direct equality fast path exists before full wildcard evaluation
+- the wildcard matcher is iterative and allocation-free
 
-For the intended use case—reasonable ignore lists on a ZNC network—this is a practical and efficient design.
+For the intended use case — reasonable ignore lists on a ZNC network — this is a practical and efficient design.
 
 ---
 
@@ -628,12 +622,19 @@ For the intended use case—reasonable ignore lists on a ZNC network—this is a
 A few details are worth knowing before you rely on the module heavily:
 
 - filtering is based only on the sender mask, not channel name or message content
-- masks are stored normalized to lowercase; original case is not preserved in storage/listing
+- masks are stored normalized to RFC 1459-folded form; original case is not preserved in storage/listing
 - duplicate rules are not automatically prevented
 - deleting by exact mask removes the first matching internal entry, not every duplicate
 - `detached` live behavior depends on whether the **network** is attached, not on per-channel attachment concepts
 - nick-only masks do **not** match ident/host; they only match nicknames
 - full masks are matched against `nick!ident@host`
+- masks cannot begin with `A|` or `D|` (reserved for storage); use a wildcard such as `?|*` if you need to match such a nick
+
+---
+
+## ZNC compatibility
+
+Built and tested against **ZNC 1.9.1**. The module-facing headers (`Modules.h`, `Nick.h`, `Message.h`, `IRCNetwork.h`, `User.h`, `Chan.h`, `znc.h`) are byte-identical between ZNC 1.9.0 and 1.9.1, so a `.so` produced with `znc-buildmod` from either release is interchangeable.
 
 ---
 
@@ -658,6 +659,7 @@ This README intentionally focuses on the module behavior visible from the curren
 /msg *ignore_drop SetDetachedPlayback on
 /msg *ignore_drop List
 /msg *ignore_drop Test badguy!~x@evil.example
+/msg *ignore_drop Version
 ```
 
 ---
@@ -675,6 +677,6 @@ Its main strengths are:
 - server-side enforcement inside ZNC
 - simple command-based management
 - predictable scope semantics
-- implementation choices that keep runtime work modest
+- implementation choices that keep runtime work modest, including RFC 1459-aware case folding and an allocation-free wildcard matcher
 
 For users who want more control than a client-side ignore, especially in always-on ZNC workflows, it is a clean and practical fit.
