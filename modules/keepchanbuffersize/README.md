@@ -2,6 +2,8 @@
 
 Preserve per-channel `BufferSize` across quick `PART`/`JOIN` cycles.
 
+**Current version:** 1.2.0 — see [`CHANGELOG.md`](./CHANGELOG.md).
+
 ## Overview
 
 [`keepchanbuffersize`](./src/keepchanbuffersize.cpp) is a ZNC network module for one specific pain point: when you have manually customized channel buffer sizes, those per-channel settings can be lost when a channel object is torn down and recreated during a fast part/rejoin sequence.
@@ -35,7 +37,7 @@ The module’s source expresses a few clear goals:
 
 ## How it works
 
-At a high level, the module keeps a small remembered mapping of channel name → desired buffer size in module NV storage.
+At a high level, the module keeps a small remembered mapping of channel name → desired buffer size in module NV storage. It is always active while loaded — there is no on/off toggle (see *Active while loaded* below).
 
 ### Remember phase
 
@@ -66,6 +68,10 @@ The module only persists values for channels that have an **explicit** buffer co
 
 This is a good design choice because it keeps the module focused on preserving intentional per-channel customization rather than inventing new policy.
 
+### Active while loaded
+
+In versions up to 1.1.x, the module had an on/off toggle (`Enable`/`Disable` commands and an `enabled=0|1` load argument) controlling whether remember/restore behavior ran. That toggle was removed in 1.2.0 because a loaded-but-disabled state was a subtle foot-gun: the module appeared present and its commands worked, but `/cycle` would silently not preserve the buffer. From 1.2.0 onward the rule is simpler — if the module is loaded, it is active; to stop it, use `UnloadMod keepchanbuffersize`. Stored per-channel values persist across unload/reload, so you do not lose state.
+
 ## Intended use cases
 
 Typical situations where this module is useful include:
@@ -90,8 +96,7 @@ The module exposes the following commands through the module window:
 
 ```text
 /msg *keepchanbuffersize Status
-/msg *keepchanbuffersize Enable
-/msg *keepchanbuffersize Disable
+/msg *keepchanbuffersize Version
 /msg *keepchanbuffersize List
 /msg *keepchanbuffersize Set <#chan> <lines>
 /msg *keepchanbuffersize Forget <#chan>
@@ -101,15 +106,11 @@ These commands are defined directly in the module source.
 
 ### `Status`
 
-Shows whether automatic remember/restore behavior is currently enabled and how many channels are remembered.
+Shows how many channels have a remembered buffer size in this network's module storage.
 
-### `Enable`
+### `Version`
 
-Enables automatic remember/restore behavior and immediately applies remembered values to any currently existing channel objects on that network. Stored data is preserved.
-
-### `Disable`
-
-Disables automatic remember/restore behavior. Stored remembered values are kept, but the module stops automatically capturing/restoring until re-enabled.
+Prints the module version (for example, `keepchanbuffersize version 1.2.0`). Useful for confirming which build is loaded.
 
 ### `List`
 
@@ -117,11 +118,11 @@ Lists remembered channels and the stored buffer size for each one. If nothing is
 
 ### `Set <#chan> <lines>`
 
-Manually stores a buffer size for a channel. If that channel already exists in the current network, the module also tries to apply the value immediately. If the apply fails — for example because of limits — it still keeps the stored value and tells you the immediate apply did not succeed.
+Manually stores a buffer size for a channel. The channel name must begin with a valid channel prefix (`#`, `&`, `+`, or `!`, or whatever the server advertises in `CHANTYPES`). The line count must be a positive integer and must not exceed ZNC's configured `MaxBufferSize`; invalid input is rejected without writing anything to storage. If the channel already exists in the current network, the module also tries to apply the value immediately.
 
 ### `Forget <#chan>`
 
-Removes the stored remembered buffer size for that channel.
+Removes the stored remembered buffer size for that channel. As with `Set`, the channel name must begin with a valid channel prefix.
 
 ## Usage examples
 
@@ -131,18 +132,26 @@ Removes the stored remembered buffer size for that channel.
 /znc LoadMod keepchanbuffersize
 ```
 
-### Load disabled
+The module is active from the moment it is loaded; there is no additional "enable" step to perform.
+
+### Stop the module
 
 ```text
-/znc LoadMod keepchanbuffersize enabled=0
+/znc UnloadMod keepchanbuffersize
 ```
 
-The module supports `enabled=0|1` style load arguments, and also accepts `off/on/false/true` equivalents. If no stored setting exists, it defaults to enabled.
+Unloading is the supported way to stop the module from acting. Per-channel values you have stored are preserved and will be picked up again the next time the module is loaded.
 
 ### Check status
 
 ```text
 /msg *keepchanbuffersize Status
+```
+
+### Check the loaded version
+
+```text
+/msg *keepchanbuffersize Version
 ```
 
 ### Store a channel explicitly
@@ -200,6 +209,15 @@ Copy the resulting module file into the appropriate per-user or site module dire
 /znc LoadMod keepchanbuffersize
 ```
 
+## Upgrading from 1.1.x or 1.0.x
+
+Upgrading to 1.2.0 is a drop-in replacement: install the new `.so`, `UnloadMod` the module, then `LoadMod` it again. Two things happen automatically on the first 1.2.0 load:
+
+- **The old `Enabled` NV key is deleted.** It controlled the toggle that no longer exists. No action required on your part.
+- **Channel keys whose stored form predates RFC 1459 casemap normalization are rewritten** (this was introduced in 1.1.0 and carries over unchanged). This is a no-op for channel names that use only ASCII characters.
+
+Per-channel remembered buffer values are preserved across the upgrade. The only behavior change you may notice is that passing `enabled=0` (or `enabled=1`, `enabled=off`, etc.) to `LoadMod` now prints a deprecation notice in the module window; the argument is otherwise ignored. Previously-removed `Enable` and `Disable` commands now return `Unknown command!`; use `UnloadMod` / `LoadMod` instead.
+
 ## Behavior details and implementation notes
 
 ### Network-scoped storage
@@ -210,11 +228,26 @@ The module uses NV storage with keys of the form:
 buf:#channel
 ```
 
-Channel names are normalized to lowercase before key generation so storage remains stable and lookup is consistent. The enabled/disabled state is also stored in NV using the `Enabled` key.
+Channel names are normalized using **RFC 1459 casemapping** before key generation so storage remains stable and lookup is consistent across sessions. RFC 1459 treats `[`, `]`, `\`, and `~` as the uppercase forms of `{`, `}`, `|`, and `^`, which is the historical IRC default and matches how most IRC servers compare identifiers. For channels whose names use only ASCII letters and digits this produces exactly the same result as plain lowercase conversion, so it is fully backward compatible with the common case.
+
+### Legacy key migration
+
+On module load, any previously stored key that was written under plain ASCII lowercasing is transparently rewritten to its RFC 1459 form. The migration preserves the stored buffer value, runs at most once per key, and skips any key whose RFC 1459 form already has a value to avoid clobbering live data. In practice, this migration is a no-op for ASCII-only channel names.
+
+### Input validation
+
+The `Set` command validates input before it writes anything to NV storage:
+
+- the channel argument must begin with a valid channel prefix (server-advertised `CHANTYPES` if available, otherwise `#`, `&`, `+`, `!`)
+- the line count must be digits only — a leading sign or any non-digit character is rejected
+- the line count must be greater than zero
+- the line count must not exceed ZNC's configured global `MaxBufferSize`
+
+The `Forget` command applies the same channel-prefix validation.
 
 ### Existing channels on load
 
-When the module loads and is enabled, it immediately iterates current channel objects and reapplies any remembered values that already exist in storage. This helps after reloads or reconnect-related situations where channels already exist at module load time.
+When the module loads, it immediately iterates current channel objects and reapplies any remembered values that already exist in storage. This helps after reloads or reconnect-related situations where channels already exist at module load time.
 
 ### Multiple-target support
 
@@ -225,9 +258,9 @@ The parser handles comma-separated channel targets for commands such as:
 
 It also handles `JOIN 0` as a special case by snapshotting all current channels before they may be removed.
 
-### Restore safety
+### Restore safety and forcing
 
-If a remembered value is empty or resolves to `0`, the module does nothing. If a channel already has the correct explicit buffer count, it also does nothing. If `SetBufferCount()` fails, it emits a warning rather than silently pretending success.
+If a remembered value is empty or resolves to `0`, the module does nothing. If a channel already has the correct explicit buffer count, it also does nothing. When applying a remembered value, the module passes `bForce = true` to `CChan::SetBufferCount()` — matching how webadmin and the config loader set per-channel buffers — so that values above `MaxBufferSize` (which are legally configurable through webadmin) are still restorable after a channel object is torn down. The up-front validation in `Set` ensures that any value the module persists has already cleared the `MaxBufferSize` check, so forcing on restore only ever re-applies values that were previously accepted by ZNC.
 
 ### “Explicit setting only” policy
 
@@ -258,11 +291,13 @@ The module implements:
 
 - early remember logic on user raw `PART`
 - structured user `PART`/`JOIN` hooks as extra protection
-- restore on server `JOIN`
+- restore on server `JOIN` with `bForce = true`, matching webadmin and config-loader semantics
 - fallback remember on server `PART` and `KICK`
 - `JOIN 0` snapshot support
-- command handlers for status, enable/disable, list, manual set, and forget
-- NV-backed per-channel remembered state keyed by normalized channel name
+- command handlers for status, version, list, manual set, and forget
+- NV-backed per-channel remembered state keyed by RFC 1459 casemap-normalized channel name, with one-time migration from the legacy ASCII-lowercase form
+- one-time cleanup of the legacy `Enabled` NV key on load (no-op for installs that never had it)
+- deprecation notice for the legacy `enabled=0|1` load argument
 
 ## License
 
