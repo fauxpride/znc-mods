@@ -1,7 +1,8 @@
 /*
  * keepchanbuffersize.cpp - Preserve per-channel BufferSize across PART/JOIN
  *
- * Target: ZNC 1.9.1 (network module)
+ * Version: 1.2.0
+ * Target:  ZNC 1.9.1 (network module)
  *
  * Design goals:
  *  - Preserve per-channel buffer (SetBuffer/BufferSize) across fast /cycle.
@@ -17,11 +18,15 @@
  *
  * Commands (message *keepchanbuffersize):
  *   Status
- *   Enable
- *   Disable
+ *   Version
  *   List
  *   Set    <#chan> <lines>
  *   Forget <#chan>
+ *
+ * Note: The Enable/Disable toggle was removed in 1.2.0. The module is always
+ * active when loaded; to stop it from acting, UnloadMod it. Previously stored
+ * buffer values and the `enabled=0|1` load argument are honored for backward
+ * compatibility but the argument now prints a deprecation notice.
  */
 
 #include <znc/Modules.h>
@@ -29,6 +34,12 @@
 #include <znc/Chan.h>
 #include <znc/Message.h>
 #include <znc/Utils.h>
+#include <znc/znc.h>
+
+#include <utility>
+#include <vector>
+
+#define KEEPCHANBUFFERSIZE_VERSION "1.2.0"
 
 class CKeepChanBufferSize : public CModule {
 public:
@@ -36,11 +47,9 @@ public:
         AddHelpCommand();
 
         AddCommand("Status", static_cast<CModCommand::ModCmdFunc>(&CKeepChanBufferSize::CmdStatus),
-                   "", "Show whether the module is enabled and how many channels are remembered.");
-        AddCommand("Enable", static_cast<CModCommand::ModCmdFunc>(&CKeepChanBufferSize::CmdEnable),
-                   "", "Enable automatic remember/restore behavior.");
-        AddCommand("Disable", static_cast<CModCommand::ModCmdFunc>(&CKeepChanBufferSize::CmdDisable),
-                   "", "Disable automatic remember/restore behavior (data is kept).");
+                   "", "Show how many channels have a remembered buffer size.");
+        AddCommand("Version", static_cast<CModCommand::ModCmdFunc>(&CKeepChanBufferSize::CmdVersion),
+                   "", "Show the module version.");
 
         AddCommand("List", static_cast<CModCommand::ModCmdFunc>(&CKeepChanBufferSize::CmdList),
                    "", "List remembered channels and their buffer sizes.");
@@ -53,39 +62,40 @@ public:
     }
 
     bool OnLoad(const CString& sArgs, CString& sErrorMsg) override {
-        // Default enabled unless explicitly disabled in NV.
-        CString sEnabled = GetNV("Enabled");
-        if (sEnabled.empty()) {
-            m_bEnabled = true;
-            SetNV("Enabled", "1");
-        } else {
-            m_bEnabled = !sEnabled.Equals("0");
+        // 1.2.0 migration: the Enable/Disable toggle was removed, so the
+        // "Enabled" NV key from 1.0.x - 1.1.x is dead state. Clean it up
+        // silently on load; this is idempotent (DelNV is a no-op on a missing
+        // key). Per-channel buf:* entries are untouched.
+        if (!GetNV("Enabled").empty()) {
+            DelNV("Enabled");
         }
 
-        // Optional: LoadMod keepchanbuffersize enabled=0|1
+        // Parse load arguments. The only argument this module ever accepted
+        // was enabled=0|1 (with off/on/false/true aliases). It no longer has
+        // any effect, but we recognize it specifically to print a deprecation
+        // notice rather than silently ignoring it and letting the user believe
+        // their intent was honored.
         if (!sArgs.empty()) {
             VCString vs;
             sArgs.Split(" ", vs, false);
             for (const CString& tok : vs) {
                 CString k = tok.Token(0, false, "=").AsLower();
-                CString v = tok.Token(1, true, "=").AsLower();
-
                 if (k == "enabled") {
-                    if (v == "0" || v == "off" || v == "false") {
-                        m_bEnabled = false;
-                        SetNV("Enabled", "0");
-                    } else if (v == "1" || v == "on" || v == "true") {
-                        m_bEnabled = true;
-                        SetNV("Enabled", "1");
-                    }
+                    PutModule("Note: the 'enabled=' load argument is deprecated in 1.2.0 "
+                              "and has no effect. The module is always active while loaded; "
+                              "use UnloadMod to stop it. Stored per-channel values are preserved.");
                 }
             }
         }
 
-        // If enabled, apply remembered values to any channels that already exist.
-        if (m_bEnabled) {
-            ApplyAllExistingChannels();
-        }
+        // One-time migration of legacy ASCII-lowercased keys to rfc1459-lowercased keys.
+        // This is a no-op for channels that are purely ASCII (the overwhelming common case).
+        MigrateLegacyKeys();
+
+        // Apply remembered values to any channels that already exist. Useful
+        // after module reloads or reconnect-related situations where channels
+        // already exist at module load time.
+        ApplyAllExistingChannels();
 
         return true;
     }
@@ -96,7 +106,7 @@ public:
 
     // Raw hook: great for ultra-fast /cycle (captures PART before core can drop the channel object).
     EModRet OnUserRawMessage(CMessage& Message) override {
-        if (!m_bEnabled || !GetNetwork())
+        if (!GetNetwork())
             return CONTINUE;
 
         const CString& cmd = Message.GetCommand();
@@ -114,7 +124,7 @@ public:
 
     // Structured PART hook: extra safety (keeps raw hook too).
     EModRet OnUserPartMessage(CPartMessage& Message) override {
-        if (!m_bEnabled || !GetNetwork())
+        if (!GetNetwork())
             return CONTINUE;
 
         RememberTargets(Message.GetTarget());
@@ -123,7 +133,7 @@ public:
 
     // Structured JOIN hook: early restore attempt (server JOIN still restores reliably).
     EModRet OnUserJoinMessage(CJoinMessage& Message) override {
-        if (!m_bEnabled || !GetNetwork())
+        if (!GetNetwork())
             return CONTINUE;
 
         HandleUserJoinTargets(Message.GetTarget());
@@ -136,7 +146,7 @@ public:
 
     // Restore when *we* join (channel exists for sure).
     void OnJoinMessage(CJoinMessage& Message) override {
-        if (!m_bEnabled || !GetNetwork())
+        if (!GetNetwork())
             return;
 
         if (!IsMe(Message.GetNick()))
@@ -156,7 +166,7 @@ public:
 
     // Remember on server PART fallback (covers non-client-initiated flows).
     void OnPartMessage(CPartMessage& Message) override {
-        if (!m_bEnabled || !GetNetwork())
+        if (!GetNetwork())
             return;
 
         if (!IsMe(Message.GetNick()))
@@ -174,9 +184,9 @@ public:
         RememberFromChan(*pChan);
     }
 
-    // Remember on KICK fallback (if we’re kicked and later rejoin).
+    // Remember on KICK fallback (if we're kicked and later rejoin).
     void OnKickMessage(CKickMessage& Message) override {
-        if (!m_bEnabled || !GetNetwork())
+        if (!GetNetwork())
             return;
 
         if (!IsMe(Message.GetKickedNick()))
@@ -195,15 +205,50 @@ public:
     }
 
 private:
-    bool m_bEnabled = true;
+    // RFC 1459 lowercasing for IRC identifier comparison.
+    // Treats '[', ']', '\\', '~' as the uppercase of '{', '}', '|', '^'.
+    // This is the historical IRC default casemap; we hardcode it rather than
+    // consulting the server's CASEMAPPING value because NV storage keys must be
+    // stable across sessions (CASEMAPPING is not known until ISUPPORT arrives,
+    // and can differ per network). For ASCII-only identifiers this produces the
+    // exact same result as plain AsLower(), so it is fully backward compatible
+    // with the most common case.
+    static CString IRCLower(const CString& s) {
+        CString r;
+        r.reserve(s.size());
+        for (char c : s) {
+            if (c >= 'A' && c <= 'Z')        r += static_cast<char>(c + 32);
+            else if (c == '[')               r += '{';
+            else if (c == ']')               r += '}';
+            else if (c == '\\')              r += '|';
+            else if (c == '~')               r += '^';
+            else                             r += c;
+        }
+        return r;
+    }
 
-    // Normalize channel for stable NV keys.
+    // Normalize channel for stable NV keys (rfc1459 casemap).
     static CString NormChan(const CString& sChan) {
-        return sChan.AsLower();
+        return IRCLower(sChan);
     }
 
     static CString KeyForChan(const CString& sChan) {
         return "buf:" + NormChan(sChan);
+    }
+
+    // Validate that a string looks like an IRC channel name. When connected,
+    // we use the server-advertised CHANTYPES via CIRCNetwork::IsChan(); before
+    // ISUPPORT arrives (or with no network), we fall back to the RFC defaults.
+    bool IsValidChannelName(const CString& sChan) const {
+        if (sChan.empty())
+            return false;
+
+        const CIRCNetwork* pNet = GetNetwork();
+        if (pNet && !pNet->GetChanPrefixes().empty())
+            return pNet->IsChan(sChan);
+
+        const char c = sChan[0];
+        return c == '#' || c == '&' || c == '+' || c == '!';
     }
 
     bool IsMe(const CNick& Nick) const {
@@ -212,10 +257,16 @@ private:
         return Nick.NickEquals(GetNetwork()->GetCurNick());
     }
 
+    // CString overload (used by OnKickMessage via CKickMessage::GetKickedNick()).
+    // Delegate to the CNick overload so NickEquals()'s IRC-casemap comparison is
+    // what actually runs. A plain CString::Equals() would do ASCII-only
+    // case-insensitive compare and silently mis-identify self on networks
+    // where your nick contains casemap-corner characters
+    // ([ ] \ ~ vs { } | ^).
     bool IsMe(const CString& sNick) const {
         if (!GetNetwork())
             return false;
-        return sNick.Equals(GetNetwork()->GetCurNick());
+        return IsMe(CNick(sNick));
     }
 
     static CString NormalizeTarget(CString s) {
@@ -306,9 +357,18 @@ private:
         if (Chan.HasBufferCountSet() && Chan.GetBufferCount() == uWanted)
             return;
 
-        if (!Chan.SetBufferCount(uWanted, false)) {
+        // Pass bForce=true: CChan::SetBufferCount() -> CBuffer::SetLineCount()
+        // enforces CZNC::GetMaxBufferSize() only when bForce is false, and
+        // silently returns false otherwise. Webadmin and the config loader set
+        // per-channel buffers with force=true, so a restored value only needs
+        // to honor that same ceiling. Without force=true, any channel whose
+        // explicit buffer exceeds MaxBufferSize (which is legal via webadmin)
+        // cannot be restored after teardown. We already validate against
+        // MaxBufferSize at Set time, and any value we're restoring here was
+        // previously accepted by ZNC, so forcing is safe.
+        if (!Chan.SetBufferCount(uWanted, true)) {
             PutModule("Warning: failed to restore buffer size for " + Chan.GetName() +
-                      " to " + sVal + " (may exceed limits).");
+                      " to " + sVal + ".");
         }
     }
 
@@ -320,6 +380,37 @@ private:
         for (CChan* pChan : vChans) {
             if (pChan)
                 ApplyRememberedToChan(*pChan);
+        }
+    }
+
+    // One-time migration: rewrite any buf:* key whose stored form differs from
+    // the rfc1459-lowered form. Intended to run once on load; re-running is a
+    // no-op. We collect the key list first so we do not mutate NV while iterating.
+    void MigrateLegacyKeys() {
+        std::vector<std::pair<CString, CString>> vPairs;
+        for (auto it = BeginNV(); it != EndNV(); ++it) {
+            if (it->first.StartsWith("buf:"))
+                vPairs.emplace_back(it->first, it->second);
+        }
+
+        for (const auto& kv : vPairs) {
+            const CString& sOldKey = kv.first;
+            const CString& sVal    = kv.second;
+            const CString sChan    = sOldKey.substr(4); // after "buf:"
+            const CString sNewKey  = "buf:" + IRCLower(sChan);
+
+            if (sOldKey == sNewKey)
+                continue;
+
+            // If a new-form key already holds a value, prefer the existing one
+            // rather than clobbering it, and drop the legacy duplicate.
+            if (!GetNV(sNewKey).empty()) {
+                DelNV(sOldKey);
+                continue;
+            }
+
+            SetNV(sNewKey, sVal);
+            DelNV(sOldKey);
         }
     }
 
@@ -338,21 +429,11 @@ private:
     // -------------------------------------------------------------------------
 
     void CmdStatus(const CString&) {
-        PutModule("keepchanbuffersize: " + CString(m_bEnabled ? "ENABLED" : "DISABLED"));
         PutModule("Remembered channels: " + CString(CountRemembered()));
     }
 
-    void CmdEnable(const CString&) {
-        m_bEnabled = true;
-        SetNV("Enabled", "1");
-        PutModule("Enabled. (Stored values kept; will restore on JOIN.)");
-        ApplyAllExistingChannels();
-    }
-
-    void CmdDisable(const CString&) {
-        m_bEnabled = false;
-        SetNV("Enabled", "0");
-        PutModule("Disabled. (Stored values kept; no automatic remember/restore.)");
+    void CmdVersion(const CString&) {
+        PutModule("keepchanbuffersize version " KEEPCHANBUFFERSIZE_VERSION);
     }
 
     void CmdList(const CString&) {
@@ -391,9 +472,34 @@ private:
             return;
         }
 
+        if (!IsValidChannelName(sChanArg)) {
+            PutModule("Invalid channel name: " + sChanArg +
+                      " (must begin with a channel prefix such as '#').");
+            return;
+        }
+
+        // Reject non-digit input (so '-1' can't wrap into UINT_MAX via ToUInt()).
+        if (sBufArg.find_first_not_of("0123456789") != CString::npos) {
+            PutModule("Invalid buffer size: " + sBufArg +
+                      " (must be a positive integer, digits only).");
+            return;
+        }
+
         const unsigned int uWanted = sBufArg.ToUInt();
         if (uWanted == 0) {
-            PutModule("Invalid buffer size (must be a positive integer).");
+            PutModule("Invalid buffer size (must be greater than zero).");
+            return;
+        }
+
+        // Enforce ZNC's global MaxBufferSize as the upper bound before
+        // persisting, so we can't stash a value we know will be rejected on
+        // every subsequent JOIN. A value of 0 for MaxBufferSize means
+        // "unlimited" in the ZNC config grammar, so only enforce when it is
+        // non-zero.
+        const unsigned int uMax = CZNC::Get().GetMaxBufferSize();
+        if (uMax > 0 && uWanted > uMax) {
+            PutModule("Invalid buffer size: " + CString(uWanted) +
+                      " exceeds ZNC's MaxBufferSize of " + CString(uMax) + ".");
             return;
         }
 
@@ -403,8 +509,11 @@ private:
         if (GetNetwork()) {
             CChan* pChan = GetNetwork()->FindChan(sChanArg);
             if (pChan) {
-                if (!pChan->SetBufferCount(uWanted, false)) {
-                    PutModule("Note: stored, but failed to apply immediately (may exceed limits).");
+                // Force: we have already validated uWanted against
+                // MaxBufferSize above, and webadmin/config use the same
+                // force=true path to set per-channel buffers.
+                if (!pChan->SetBufferCount(uWanted, true)) {
+                    PutModule("Note: stored, but failed to apply immediately.");
                 } else {
                     PutModule("Applied immediately to existing channel object.");
                 }
@@ -416,6 +525,12 @@ private:
         const CString sChanArg = sLine.Token(1);
         if (sChanArg.empty()) {
             PutModule("Usage: Forget <#chan>");
+            return;
+        }
+
+        if (!IsValidChannelName(sChanArg)) {
+            PutModule("Invalid channel name: " + sChanArg +
+                      " (must begin with a channel prefix such as '#').");
             return;
         }
 
@@ -432,4 +547,5 @@ private:
 
 // Network module (NOT global)
 NETWORKMODULEDEFS(CKeepChanBufferSize,
-                  "Preserve per-channel BufferSize across quick PART/JOIN (incl. /cycle).");
+                  "Preserve per-channel BufferSize across quick PART/JOIN (incl. /cycle). "
+                  "v" KEEPCHANBUFFERSIZE_VERSION);
