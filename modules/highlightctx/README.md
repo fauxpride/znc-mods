@@ -2,7 +2,7 @@
 
 Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional `ignore_drop` integration.
 
-Current module version in source: **0.7.0**
+Current module version in source: **0.7.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes.
 
 ---
 
