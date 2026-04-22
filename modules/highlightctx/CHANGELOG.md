@@ -47,13 +47,6 @@ This release fixes a long-standing usability footgun where `require_ignore_drop=
 * **Load-arg syntax unchanged.** `before`, `after`, `require_ignore_drop`, `max_events`, `excludes` are all parsed identically to 0.6.0.
 * **No operator action required** when upgrading a running 0.6.0 deployment. On the next load of 0.7.0, the armed flag is re-evaluated with the improved logic. If `znc.conf` currently has `LoadModule = highlightctx` before `LoadModule = ignore_drop`, auto mode will remain unarmed until the order is fixed or until the module is reloaded manually — the same remediation that already applied under 0.6.0, just now clearly surfaced by `Status` and `Rearm`.
 
-### Not added (honesty note)
-
-An earlier draft of 0.7.0 included `OnModuleLoading` and `OnModuleUnloading` overrides that were intended to track runtime load/unload of `ignore_drop` and emit user notices. End-to-end testing revealed that ZNC 1.9.x dispatches these two hooks only to global-scope modules (they are declared in the `// Global Modules` section of `CModules` in `/usr/include/znc/Modules.h` and invoked via `GLOBALMODULECALL`), so a network-scope module that overrides them never receives the callback. The overrides were removed before release because they were dead code that misrepresented the module's actual tracking behavior. Runtime load/unload of `ignore_drop` is instead covered by:
-
-- the independent live `HasIgnoreDropLoaded()` check inside `ShouldCaptureNow()`, which protects capture correctness on every incoming message, and
-- the `Rearm` command for refreshing the armed flag on demand after an operator-initiated runtime change.
-
 ### Testing
 
 An automated test harness was written for this release (not shipped with the module). It runs against ZNC 1.9.0 as a non-root user via `runuser` and a fake IRC server for the upstream connection. Coverage:
