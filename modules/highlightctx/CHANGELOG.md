@@ -6,6 +6,79 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.8.0] — 2026-04-23
+
+This release extends the exclusion system to cover nicknames and `nick!ident@host` masks in addition to channels. The main operational need: suppressing a specific noisy user as a trigger source, without losing their surrounding messages as context around real triggers from other users. This is the key semantic difference from a channel exclusion (which drops the channel entirely): a nick/mask exclusion only prevents that sender from *starting* a new event; their messages still appear in before/after context for other users' triggers, which matches how an operator usually thinks about "this person spams my highlights but I still want to see what they said around a legitimate mention." Syntax and case-folding rules mirror [`ignore_drop`](../ignore_drop/README.md) so both modules interpret masks consistently, and the feature is verified by an automated test harness (83/83 passing against ZNC 1.9.0).
+
+### Added
+
+* **Nick and hostmask exclusions via `AddExclude` / `DelExclude` / `ListExcludes`.** The existing commands now accept three kinds of tokens: channel names (starting with `#`, `&`, `+`, or `!`), bare nicknames, and full `nick!ident@host` masks. Classification is automatic: a token starting with a channel-prefix character is treated as a channel; a token containing `!` or `@` is treated as a full mask; anything else is treated as a nick-only mask.
+* **`*` and `?` wildcards in nick/mask exclusions.** Implemented via an allocation-free iterative star-backtracking matcher (`wildmatch_folded`). Patterns like `bot*`, `?roll`, or `*!*@evil.example` work as expected.
+* **RFC 1459 case folding for nick/mask exclusions.** Matches the folding used by [`ignore_drop`](../ignore_drop/README.md), so `[bot]`, `{bot}`, `[BOT]`, and `{BOT}` all fold to the same canonical form and cannot be used to defeat each other. ASCII nicks are unaffected (it is a strict superset of ASCII case folding).
+* **New NV storage key `excluded_nicks`.** Stored as newline-separated folded masks. Separate from the existing `excluded_channels` key so channel exclusions keep their on-disk format unchanged.
+* **`excluded_nicks` load-arg support on the existing `excludes=` list.** Mixed channels and nicks are allowed, e.g. `excludes=#noise,#bots,BadNick,*!*@evil.example`. Each token is classified the same way as interactive `AddExclude`.
+* **`excluded nicks/masks: N` line in the `Status` output** next to the existing `excluded channels: N`.
+* **Duplicate detection** for nick/mask exclusions (compared on folded form). Duplicates are reported rather than silently added.
+* **Mask validation at `AddExclude` time.** Empty masks are rejected, and masks containing embedded `\r`, `\n`, or `\0` bytes are rejected (protects the newline-delimited NV storage format). Rejection reason is included in the response.
+* **`DelExclude <index>` for numeric removal.** The index refers to the unified numbered listing from `ListExcludes` — channels first (alphabetically sorted), then nicks/masks in insertion order. Removes the corresponding entry from whichever bucket it belongs to.
+* **New test scenario `nick_exclude` in the test harness** with 28 assertions covering command surface, RFC 1459 folding (including the `[bot]` vs `{bot}` bypass case), duplicate detection, unified listing/indexing, the "excluded nick still appears as context but cannot trigger" behavior, and persistence across `UpdateMod`.
+
+### Changed
+
+* **`AddExclude` help and argument description** now read `<#channel|nick|mask>` and explain the classification and semantic difference. Similarly for `DelExclude` (`<#channel|nick|mask|index>`) and `ListExcludes`.
+* **`ListExcludes` output format** is now a single numbered list with each entry tagged `[channel]`, `[nick]`, or `[mask]`. The empty-state message changed from `"No excluded channels configured."` to `"No exclusions configured."` to reflect the broader scope.
+* **`OnLoad` summary message** reports exclusion counts as `excludes=<C>ch/<N>nick` instead of a single number.
+* **`CmdReset` clears both channel and nick/mask exclusions**, and the reset-confirmation message explicitly notes "all exclusions (channel and nick/mask) cleared."
+* **`Overview` command output** includes a paragraph describing the exclusion semantics (channels drop entirely, nick/masks only block triggering), the RFC 1459 folding, and the wildcard syntax.
+* **`TModInfo` description string** now mentions "channel and nick/hostmask exclusions."
+* **Version marker bumped** from `highlightctx 0.7.0` to `highlightctx 0.8.0`.
+* **Module-header comment block** gains a new "Exclusion semantics" section explicitly contrasting channel exclusions from nick/mask exclusions.
+
+### Fixed
+
+* No bug fixes in this release; functionality previously shipped continues to work as before (verified by 55/55 regression assertions from the 0.7.0 suite still passing).
+
+### Security
+
+* **No new attack surface.** The new matcher is allocation-free and operates on RFC 1459-folded strings of bounded length (folded output length equals input length). Mask validation at add-time rejects control characters that could corrupt the NV storage line format. Wildcard matching degenerates to O(P·T) on adversarial patterns like `*a*a*a...X`, but the constant factor is small, no heap is allocated, and masks are authenticated operator input, not attacker-controlled.
+* **The new feature is an exclusion, not an inclusion.** It only narrows what triggers an event; it does not expand capture scope. Excluded-nick messages are still preserved in context (the intentional semantic difference vs channel exclusion) but that is the same data that would have been captured anyway had the excluded nick not been listed.
+
+### Compatibility
+
+* **Storage format for channel exclusions is unchanged.** The `excluded_channels` NV key uses the same representation as 0.7.0 / 0.6.0. 0.7.0 and 0.6.0 datadirs load cleanly into 0.8.0 with no migration.
+* **Journal format (`B`/`A`/`F`/`D` records) unchanged.** The verified 0.6.0 → 0.7.0 upgrade path from the test harness continues to work; a 0.6.0 journal replays correctly under 0.8.0 as well.
+* **All 0.7.0 commands continue to work** with unchanged arguments and behavior. The three affected commands (`AddExclude`, `DelExclude`, `ListExcludes`) are supersets: all 0.7.0 usage (channel names as tokens) produces identical results.
+* **Load-arg syntax** is a superset of 0.7.0's. `excludes=#chan1,#chan2` still works; `excludes=#chan1,BadNick,*!*@evil.example` also works.
+* **ZNC compatibility.** Built and run against ZNC 1.9.0 with `znc-dev 1.9.0-2build3` in the development container. No new ZNC API is used; the feature is implemented entirely in the existing `OnChan*` hook paths and standard `CNick` accessors. Expected to build unchanged against ZNC 1.9.1 as with 0.7.0.
+
+### Testing
+
+Full automated test run on ZNC 1.9.0:
+
+- `smoke` — 8/8 (now includes the `excluded nicks/masks` status key check and a `0.8.0` version-marker check)
+- `load_order_both` — 5/5 (unchanged)
+- `load_order_bad` — 5/5 (unchanged)
+- `commands` — 11/11 (unchanged)
+- `rearm_after_load` — 5/5 (unchanged)
+- `unload_ignore` — 7/7 (unchanged)
+- `replay` — 8/8 (unchanged)
+- `upgrade` — 6/6 (unchanged; 0.6.0-format journal replays correctly under 0.8.0)
+- `nick_exclude` — 28/28 (new)
+
+Total: **83/83 passing**. Key new assertions include:
+
+- excluded nick cannot start an event, even when they mention the target nick directly
+- excluded nick's messages DO appear as before/after context around a triggering event started by a non-excluded user
+- excluded nick's message is never marked with the `>>>` trigger prefix
+- RFC 1459 folding correctly dedupes `[bot]` vs `{bot}`
+- bad masks (empty, CR/LF/NUL embedded) are rejected; good masks are accepted
+- channels, nick exclusions, and hostmask exclusions coexist and each is tagged correctly in `ListExcludes`
+- `DelExclude` by mask and by numeric index both work
+- `Reset` clears both kinds of exclusions
+- nick exclusions persist across `UpdateMod highlightctx` via the new `excluded_nicks` NV key
+
+---
+
 ## [0.7.0] — 2026-04-21
 
 This release fixes a long-standing usability footgun where `require_ignore_drop=auto` could stay unarmed after `/znc restart` even when `ignore_drop` was loaded, because the original arming logic only looked at `ignore_drop`'s presence at `OnLoad` time. If the ZNC config happened to load `highlightctx` first (e.g. alphabetical ordering), the armed flag was locked to `false` for the rest of the process's lifetime. The primary fix is a new `OnBoot` hook that re-checks `ignore_drop`'s actual position in the module list after all `znc.conf` modules have loaded, plus a manual `Rearm` command for runtime re-checks without reloading the module. Built against ZNC 1.9.0 headers in the development container and verified end-to-end through an automated test harness with fifty-five assertions covering module load, command surface, load-order scenarios, detached capture with replay, and 0.6.0→0.7.0 upgrade of on-disk state.
@@ -46,6 +119,13 @@ This release fixes a long-standing usability footgun where `require_ignore_drop=
 * **User-visible commands and command arguments unchanged** except for the addition of `Rearm`. All 0.6.0 commands take the same arguments and behave the same way.
 * **Load-arg syntax unchanged.** `before`, `after`, `require_ignore_drop`, `max_events`, `excludes` are all parsed identically to 0.6.0.
 * **No operator action required** when upgrading a running 0.6.0 deployment. On the next load of 0.7.0, the armed flag is re-evaluated with the improved logic. If `znc.conf` currently has `LoadModule = highlightctx` before `LoadModule = ignore_drop`, auto mode will remain unarmed until the order is fixed or until the module is reloaded manually — the same remediation that already applied under 0.6.0, just now clearly surfaced by `Status` and `Rearm`.
+
+### Not added (honesty note)
+
+An earlier draft of 0.7.0 included `OnModuleLoading` and `OnModuleUnloading` overrides that were intended to track runtime load/unload of `ignore_drop` and emit user notices. End-to-end testing revealed that ZNC 1.9.x dispatches these two hooks only to global-scope modules (they are declared in the `// Global Modules` section of `CModules` in `/usr/include/znc/Modules.h` and invoked via `GLOBALMODULECALL`), so a network-scope module that overrides them never receives the callback. The overrides were removed before release because they were dead code that misrepresented the module's actual tracking behavior. Runtime load/unload of `ignore_drop` is instead covered by:
+
+- the independent live `HasIgnoreDropLoaded()` check inside `ShouldCaptureNow()`, which protects capture correctness on every incoming message, and
+- the `Rearm` command for refreshing the armed flag on demand after an operator-initiated runtime change.
 
 ### Testing
 

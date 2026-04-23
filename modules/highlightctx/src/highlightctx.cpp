@@ -1,6 +1,6 @@
 // highlightctx.cpp — detached-only highlight context capture for ZNC
 // Build:  znc-buildmod highlightctx.cpp
-// Load:   /msg *status LoadMod --type=network highlightctx [before=8 after=8 require_ignore_drop=auto excludes=#chan1,#chan2]
+// Load:   /msg *status LoadMod --type=network highlightctx [before=8 after=8 require_ignore_drop=auto excludes=#chan1,#chan2,BadNick,*!*@evil.example]
 // Help:   /msg *highlightctx Help
 //
 // Design goals:
@@ -13,7 +13,20 @@
 // - Optional ignore_drop integration with three modes: off, on, auto.
 // - Replays into *highlightctx on attach, sorted by channel, then clears delivered events.
 // - Replays with native IRCv3 server-time semantics when the client supports the time tag/cap; else falls back to inline timestamp text.
-// - Channel exclusions, configurable before/after caps, verbose commands.
+// - Exclusions support channels AND nicks/hostmasks, configurable before/after caps, verbose commands.
+//
+// Exclusion semantics:
+// - Channel exclusions cause the channel to be ignored entirely: no triggers,
+//   no context collection, no ring buffering for that channel.
+// - Nick exclusions are narrower: messages from the excluded nick or hostmask
+//   STILL appear as context for other events (before/after), but CANNOT
+//   start a new highlight event. This lets you suppress a noisy user as a
+//   trigger source without losing context when they comment around a real
+//   trigger from someone else.
+// - Nick exclusion masks use RFC 1459 case folding and support `*` / `?`
+//   wildcards, matching the syntax used by the ignore_drop module. A mask
+//   with neither `!` nor `@` is matched against the sender's nickname only;
+//   a mask containing either is matched against the full `nick!ident@host`.
 //
 // Notes:
 // - The "before" and "after" values are maxima, not guarantees.
@@ -71,7 +84,7 @@
 
 namespace {
 
-static const char* kModVersion = "highlightctx 0.7.0";
+static const char* kModVersion = "highlightctx 0.8.0";
 static const char* kJournalName = "highlightctx.journal";
 static const size_t kCompactThresholdLines = 512;
 
@@ -200,6 +213,72 @@ static bool is_nick_char(char c) {
         default:
             return false;
     }
+}
+
+// RFC 1459 case folding. Adds [ <-> {, ] <-> }, \ <-> |, ~ <-> ^ to ASCII
+// A-Z <-> a-z. Matches the folding used by ignore_drop so that nick masks
+// compare consistently between the two modules (e.g. [bot] and {bot} fold
+// to the same sequence and cannot be used to defeat a mask). Returns the
+// folded form as a new string; input is not modified.
+static std::string rfc1459_fold(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char c : in) {
+        if (c >= 'A' && c <= 'Z') {
+            out.push_back(static_cast<char>(c - 'A' + 'a'));
+        } else if (c == '[') {
+            out.push_back('{');
+        } else if (c == ']') {
+            out.push_back('}');
+        } else if (c == '\\') {
+            out.push_back('|');
+        } else if (c == '~') {
+            out.push_back('^');
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
+static std::string rfc1459_fold(const CString& in) {
+    return rfc1459_fold(std::string(in.c_str()));
+}
+
+// Channel prefix detection. The common IRC channel prefix characters are
+// #, &, +, !. Some networks permit additional prefixes via the ISUPPORT
+// CHANTYPES token, but # covers the overwhelming majority of real channels
+// and &+! catch the rest of RFC 2811. Used to classify an exclusion token
+// as a channel name vs a nick mask at Add time.
+static bool is_channel_name(const CString& s) {
+    if (s.empty()) return false;
+    char c = s[0];
+    return (c == '#' || c == '&' || c == '+' || c == '!');
+}
+
+// Iterative * / ? glob matcher with star-backtracking. Inputs are already
+// RFC 1459-folded by the caller. Allocation-free. Accepts * for any
+// sequence (including empty) and ? for exactly one character. Any other
+// byte is matched literally.
+static bool wildmatch_folded(const std::string& pattern, const std::string& text) {
+    if (pattern == text) return true;
+    size_t p = 0, t = 0, star = std::string::npos, match = 0;
+    while (t < text.size()) {
+        if (p < pattern.size() && (pattern[p] == '?' || pattern[p] == text[t])) {
+            ++p;
+            ++t;
+        } else if (p < pattern.size() && pattern[p] == '*') {
+            star = p++;
+            match = t;
+        } else if (star != std::string::npos) {
+            p = star + 1;
+            t = ++match;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.size() && pattern[p] == '*') ++p;
+    return p == pattern.size();
 }
 
 static bool contains_nick_highlight(const CString& text, const CString& nick) {
@@ -368,16 +447,16 @@ class CHighlightCtx : public CModule {
                    "Set the maximum number of finalized pending events to keep at once. When the cap is reached the oldest event is silently dropped to make room. Use 0 or off to disable the cap entirely (the default).",
                    [this](const CString& sLine) { CmdSetMaxEvents(sLine); });
         AddCommand("Reset", "",
-                   "Reset all settings to compiled-in defaults: before=8, after=8, max_events=disabled, require_ignore_drop=auto, excludes cleared. Does not discard pending or open events.",
+                   "Reset all settings to compiled-in defaults: before=8, after=8, max_events=disabled, require_ignore_drop=auto, all exclusions (channel and nick/mask) cleared. Does not discard pending or open events.",
                    [this](const CString&) { CmdReset(); });
-        AddCommand("AddExclude", "<#channel>",
-                   "Exclude a channel from detached highlight capture entirely. Messages from excluded channels do not trigger or contribute context.",
+        AddCommand("AddExclude", "<#channel|nick|mask>",
+                   "Exclude a channel, nickname, or nick!ident@host mask from detached highlight capture. Channel exclusions drop the channel entirely (no triggers, no context). Nick/hostmask exclusions are narrower: messages from the excluded sender still appear as context around other triggers, but cannot start a new event. A token starting with a channel prefix character (#, &, +, !) is treated as a channel; anything else is treated as a nick mask. Masks use RFC 1459 case folding and support the * and ? wildcards. A mask with neither ! nor @ matches the sender's nickname only; a mask containing either matches the full nick!ident@host.",
                    [this](const CString& sLine) { CmdAddExclude(sLine); });
-        AddCommand("DelExclude", "<#channel>",
-                   "Remove a previously excluded channel so it becomes eligible for detached highlight capture again.",
+        AddCommand("DelExclude", "<#channel|nick|mask|index>",
+                   "Remove a previously added exclusion by channel name, nick mask, or by the numeric index shown in ListExcludes. Channel and nick/mask exclusions can both be removed with this command.",
                    [this](const CString& sLine) { CmdDelExclude(sLine); });
         AddCommand("ListExcludes", "",
-                   "List all currently excluded channels for this network instance of highlightctx.",
+                   "List all currently configured exclusions for this network instance of highlightctx. Shows both channel and nick/hostmask exclusions, each tagged with its kind, in a single numbered list usable by DelExclude.",
                    [this](const CString&) { CmdListExcludes(); });
         AddCommand("SetRequireIgnoreDrop", "<off|on|auto>",
                    "Set ignore_drop integration mode. off = never require ignore_drop. on = require ignore_drop to be loaded now and keep capture paused whenever it is absent. auto = arm the same strict behavior only if ignore_drop is positioned ahead of highlightctx in the network's module list so its hooks fire before ours; see Rearm to re-check after a runtime change.",
@@ -427,6 +506,9 @@ class CHighlightCtx : public CModule {
         sMessage += (m_max_events == 0 ? "disabled" : CString(std::to_string(m_max_events)).c_str());
         sMessage += " excludes=";
         sMessage += CString(std::to_string(m_excluded.size()));
+        sMessage += "ch/";
+        sMessage += CString(std::to_string(m_excluded_nicks.size()));
+        sMessage += "nick";
         return true;
     }
 
@@ -505,6 +587,11 @@ class CHighlightCtx : public CModule {
         bool partial{false};
     };
 
+    struct NickExclude {
+        std::string mask_folded;  // RFC 1459-folded mask, preserved wildcards
+        bool nick_only{true};     // true = match nick only; false = match full nick!ident@host
+    };
+
     unsigned int m_before_max{8};
     unsigned int m_after_max{8};
     unsigned int m_max_events{0};  // 0 = disabled (no cap on pending events)
@@ -512,7 +599,8 @@ class CHighlightCtx : public CModule {
     bool m_ignore_drop_present_on_module_load{false};
     bool m_auto_ignore_drop_armed{false};
 
-    std::set<std::string> m_excluded;
+    std::set<std::string> m_excluded;                 // channel exclusions, lowercased names
+    std::vector<NickExclude> m_excluded_nicks;        // nick/hostmask exclusions
     std::map<std::string, std::deque<CaptureLine>> m_ring_by_chan;
     std::map<std::string, std::vector<Event>> m_open_by_chan;
     std::vector<Event> m_pending;
@@ -548,6 +636,17 @@ class CHighlightCtx : public CModule {
         for (const auto& c : lines) {
             CString chan = c.Trim_n();
             if (!chan.empty()) m_excluded.insert(lc(chan));
+        }
+
+        m_excluded_nicks.clear();
+        VCString nlines;
+        GetNV("excluded_nicks").Split("\n", nlines, false);
+        for (const auto& raw : nlines) {
+            CString t = raw.Trim_n();
+            if (t.empty()) continue;
+            NickExclude ne;
+            if (!MakeNickExclude(t, ne)) continue;
+            m_excluded_nicks.push_back(std::move(ne));
         }
     }
 
@@ -608,13 +707,25 @@ class CHighlightCtx : public CModule {
                 SetNV("max_events", CString(std::to_string(m_max_events)));
             } else if (key == "excludes") {
                 m_excluded.clear();
-                VCString chans;
-                val.Split(",", chans, false);
-                for (const auto& c : chans) {
-                    CString chan = c.Trim_n();
-                    if (!chan.empty()) m_excluded.insert(lc(chan));
+                m_excluded_nicks.clear();
+                VCString items;
+                val.Split(",", items, false);
+                for (const auto& c : items) {
+                    CString item = c.Trim_n();
+                    if (item.empty()) continue;
+                    if (is_channel_name(item)) {
+                        m_excluded.insert(lc(item));
+                    } else {
+                        NickExclude ne;
+                        if (MakeNickExclude(item, ne)) {
+                            m_excluded_nicks.push_back(std::move(ne));
+                        }
+                        // Silently skip malformed mask tokens on load-args path;
+                        // the interactive AddExclude gives richer errors.
+                    }
                 }
                 SaveExcludes();
+                SaveExcludedNicks();
             } else {
                 sError = "Unknown load arg key: ";
                 sError += key;
@@ -633,6 +744,82 @@ class CHighlightCtx : public CModule {
             out += c.c_str();
         }
         SetNV("excluded_channels", out);
+    }
+
+    void SaveExcludedNicks() {
+        CString out;
+        bool first = true;
+        for (const auto& ne : m_excluded_nicks) {
+            if (!first) out += "\n";
+            first = false;
+            out += ne.mask_folded.c_str();
+        }
+        SetNV("excluded_nicks", out);
+    }
+
+    // Build a NickExclude from a user-supplied token. Applies the same
+    // validation rules as ignore_drop so behavior is predictable across the
+    // two modules: reject empty, reject embedded CR/LF/NUL (would corrupt
+    // the newline-delimited NV storage), and otherwise classify as nick-only
+    // vs full-mask based on presence of ! or @.
+    // Returns true on success and populates `out`; returns false otherwise.
+    // The optional `err` param receives a human-readable reason on failure.
+    static bool MakeNickExclude(const CString& in, NickExclude& out,
+                                CString* err = nullptr) {
+        CString t = in.Trim_n();
+        if (t.empty()) {
+            if (err) *err = "empty mask";
+            return false;
+        }
+        for (char c : std::string(t.c_str())) {
+            if (c == '\r' || c == '\n' || c == '\0') {
+                if (err) *err = "mask contains control character (CR/LF/NUL)";
+                return false;
+            }
+        }
+        const std::string raw(t.c_str());
+        const bool has_bang = raw.find('!') != std::string::npos;
+        const bool has_at   = raw.find('@') != std::string::npos;
+        out.nick_only = !(has_bang || has_at);
+        out.mask_folded = rfc1459_fold(raw);
+        return true;
+    }
+
+    // Does any configured nick exclusion match this sender?
+    // `nick_sample` is the sender's nickname; `full_sample` is nick!ident@host.
+    // Both are expected to be RFC 1459-folded by the caller.
+    bool IsNickExcluded_folded(const std::string& nick_sample,
+                               const std::string& full_sample) const {
+        for (const auto& ne : m_excluded_nicks) {
+            const std::string& sample = ne.nick_only ? nick_sample : full_sample;
+            if (wildmatch_folded(ne.mask_folded, sample)) return true;
+        }
+        return false;
+    }
+
+    // Convenience wrapper for the hot path: builds folded samples once from
+    // a CaptureLine's nick and the ZNC Message's full prefix (when available).
+    template <typename TMsg>
+    bool IsSenderExcluded(const TMsg& Message, const CString& nick_raw) const {
+        if (m_excluded_nicks.empty()) return false;
+        std::string nick_folded = rfc1459_fold(std::string(nick_raw.c_str()));
+        // Prefer the message's full nick!ident@host form; fall back to nick-only.
+        std::string full;
+        const CNick& n = Message.GetNick();
+        CString h = n.GetHost();
+        CString i = n.GetIdent();
+        if (!i.empty() || !h.empty()) {
+            full.reserve(nick_raw.size() + i.size() + h.size() + 2);
+            full += nick_raw.c_str();
+            full += '!';
+            full += i.c_str();
+            full += '@';
+            full += h.c_str();
+        } else {
+            full = nick_raw.c_str();
+        }
+        std::string full_folded = rfc1459_fold(full);
+        return IsNickExcluded_folded(nick_folded, full_folded);
     }
 
     bool HasIgnoreDropLoaded() const {
@@ -1120,14 +1307,26 @@ class CHighlightCtx : public CModule {
 
         CaptureLine line = MakeCaptureLine(Message, kind);
 
+        // Feed already-open events first: excluded-nick messages are STILL
+        // valid context for other events that were triggered by someone
+        // else. This is the intentional difference from channel exclusion,
+        // which drops the channel entirely.
         FeedOpenEvents(channel, line);
 
         CString mynick = CurrentNick();
         bool is_self = (lc(line.nick) == lc(mynick));
         if (!is_self && contains_nick_highlight(line.text, mynick)) {
-            StartEvent(channel, line);
+            // Nick-exclusion gate: an excluded sender cannot START a new
+            // event, but their earlier messages are still in this channel's
+            // ring buffer and are still being fed into any existing events.
+            if (!IsSenderExcluded(Message, line.nick)) {
+                StartEvent(channel, line);
+            }
         }
 
+        // The ring buffer always receives every eligible channel line,
+        // including from excluded senders, so their messages remain
+        // available as 'before' context for any future trigger.
         auto& dq = m_ring_by_chan[lc(channel)];
         dq.push_back(line);
         while (dq.size() > m_before_max) dq.pop_front();
@@ -1194,6 +1393,7 @@ class CHighlightCtx : public CModule {
         PutModule("Replay target: *highlightctx. When the current client supports IRCv3 server-time/time tags, replay is emitted as synthetic raw PRIVMSG lines with original @time values so the client can display historical timestamps natively. If the client does not support that, replay falls back to text prefixed with the original UTC timestamp.");
         PutModule("Events are sorted by channel name first, then by event time/id within each channel. A spacer line is added between events for readability.");
         PutModule("Persistence strategy: ordinary chatter stays only in RAM, while actual highlight events are durably journaled to disk as they happen. That keeps the hot path light but preserves active highlight captures across an unexpected VPS shutdown.");
+        PutModule("Exclusions: AddExclude accepts both channel names (starting with #, &, +, or !) and nick/hostmask patterns. Channel exclusions drop the channel entirely. Nick/mask exclusions are narrower: messages from the excluded sender still appear as before/after context for other events, but cannot start a new event themselves. Masks use RFC 1459 case folding and support * and ? wildcards, matching the syntax used by ignore_drop. A mask containing ! or @ is matched against the full nick!ident@host; otherwise it is matched against the nickname only.");
         PutModule("ignore_drop modes: off = never required. on = must already be loaded before highlightctx loads and capture pauses whenever it is absent. auto = the same strict behavior is armed only if ignore_drop is positioned ahead of highlightctx in the network's module list so its hooks fire before ours. Arming is re-evaluated at OnLoad, at OnBoot for znc.conf-loaded modules, and on demand via Rearm. Runtime load or unload of ignore_drop does not automatically re-arm; ZNC dispatches those lifecycle hooks to global-scope modules only, so Rearm is the supported way to refresh the state after a runtime change. Runtime capture is always protected by an independent HasIgnoreDropLoaded() check inside ShouldCaptureNow(), so when the strict requirement is effective but ignore_drop is absent, capture pauses regardless of the armed flag. Armed state is sticky by design: once armed, it stays armed across ignore_drop unload/reload so capture does not silently resume without the protection the user asked for.");
         PutModule("Primary commands: Status, SetBefore, SetAfter, SetMaxEvents, AddExclude, DelExclude, ListExcludes, SetRequireIgnoreDrop, Rearm, Reset, ReplayNow, Compact, ClearPending.");
     }
@@ -1220,6 +1420,7 @@ class CHighlightCtx : public CModule {
             PutModule(CString("current client native server-time replay support: ") + (ClientSupportsNativeServerTime(GetClient()) ? "yes" : "no"));
         }
         PutModule(CString("excluded channels: ") + CString(std::to_string(m_excluded.size())));
+        PutModule(CString("excluded nicks/masks: ") + CString(std::to_string(m_excluded_nicks.size())));
         PutModule(CString("open events: ") + CString(std::to_string(open_count)));
         PutModule(CString("pending finalized events: ") + CString(std::to_string(m_pending.size())));
         PutModule(CString("journal path: ") + m_journal_path.c_str());
@@ -1250,45 +1451,151 @@ class CHighlightCtx : public CModule {
     }
 
     void CmdAddExclude(const CString& sLine) {
-        CString chan = sLine.Token(1, true).Trim_n();
-        if (chan.empty()) {
-            PutModule("Usage: AddExclude <#channel>");
+        CString tok = sLine.Token(1, true).Trim_n();
+        if (tok.empty()) {
+            PutModule("Usage: AddExclude <#channel|nick|mask>");
             return;
         }
-        m_excluded.insert(lc(chan));
-        SaveExcludes();
-        CString msg = "Excluded channel: ";
-        msg += chan;
+        if (is_channel_name(tok)) {
+            // Channel path — unchanged from 0.7.0 semantics.
+            const std::string key = lc(tok);
+            auto ins = m_excluded.insert(key);
+            SaveExcludes();
+            CString msg = ins.second ? "Excluded channel: " : "Channel already excluded: ";
+            msg += tok;
+            PutModule(msg);
+            return;
+        }
+        // Nick-exclusion path.
+        NickExclude ne;
+        CString err;
+        if (!MakeNickExclude(tok, ne, &err)) {
+            CString msg = "Rejected nick/mask exclusion '";
+            msg += tok;
+            msg += "': ";
+            msg += err;
+            PutModule(msg);
+            return;
+        }
+        // Reject exact duplicates (folded mask comparison).
+        for (const auto& existing : m_excluded_nicks) {
+            if (existing.mask_folded == ne.mask_folded && existing.nick_only == ne.nick_only) {
+                CString msg = "Nick/mask already excluded: ";
+                msg += tok;
+                PutModule(msg);
+                return;
+            }
+        }
+        m_excluded_nicks.push_back(ne);
+        SaveExcludedNicks();
+        CString msg = "Excluded ";
+        msg += (ne.nick_only ? "nick: " : "mask: ");
+        msg += tok;
+        msg += " (stored as: ";
+        msg += ne.mask_folded.c_str();
+        msg += ")";
         PutModule(msg);
     }
 
     void CmdDelExclude(const CString& sLine) {
-        CString chan = sLine.Token(1, true).Trim_n();
-        if (chan.empty()) {
-            PutModule("Usage: DelExclude <#channel>");
+        CString tok = sLine.Token(1, true).Trim_n();
+        if (tok.empty()) {
+            PutModule("Usage: DelExclude <#channel|nick|mask|index>");
             return;
         }
-        auto it = m_excluded.find(lc(chan));
-        if (it == m_excluded.end()) {
-            PutModule("That channel is not currently excluded.");
+
+        // Numeric index path — index into the same numbered order that
+        // ListExcludes prints: channels first (sorted), then nicks (insertion order).
+        {
+            unsigned int idx = 0;
+            if (parse_uint_cstr(tok, idx) && idx > 0) {
+                // Reproduce the listing order from ListExcludes.
+                std::vector<CString> chans;
+                chans.reserve(m_excluded.size());
+                for (const auto& c : m_excluded) chans.push_back(c.c_str());
+                std::sort(chans.begin(), chans.end());
+
+                const size_t nchans = chans.size();
+                const size_t nnicks = m_excluded_nicks.size();
+                if (idx <= nchans) {
+                    CString removed = chans[idx - 1];
+                    m_excluded.erase(std::string(removed.c_str()));
+                    SaveExcludes();
+                    CString msg = "Removed channel exclusion: ";
+                    msg += removed;
+                    PutModule(msg);
+                    return;
+                }
+                size_t nick_idx = idx - nchans;
+                if (nick_idx >= 1 && nick_idx <= nnicks) {
+                    NickExclude gone = m_excluded_nicks[nick_idx - 1];
+                    m_excluded_nicks.erase(m_excluded_nicks.begin() + (nick_idx - 1));
+                    SaveExcludedNicks();
+                    CString msg = "Removed ";
+                    msg += (gone.nick_only ? "nick exclusion: " : "mask exclusion: ");
+                    msg += gone.mask_folded.c_str();
+                    PutModule(msg);
+                    return;
+                }
+                PutModule(CString("Index ") + tok + " is out of range.");
+                return;
+            }
+        }
+
+        // Channel-name path.
+        if (is_channel_name(tok)) {
+            auto it = m_excluded.find(lc(tok));
+            if (it == m_excluded.end()) {
+                PutModule("That channel is not currently excluded.");
+                return;
+            }
+            m_excluded.erase(it);
+            SaveExcludes();
+            CString msg = "Removed channel exclusion: ";
+            msg += tok;
+            PutModule(msg);
             return;
         }
-        m_excluded.erase(it);
-        SaveExcludes();
-        CString msg = "Removed exclusion for: ";
-        msg += chan;
-        PutModule(msg);
+
+        // Nick/mask path: match against the folded form.
+        const std::string target = rfc1459_fold(tok);
+        for (auto it = m_excluded_nicks.begin(); it != m_excluded_nicks.end(); ++it) {
+            if (it->mask_folded == target) {
+                NickExclude gone = *it;
+                m_excluded_nicks.erase(it);
+                SaveExcludedNicks();
+                CString msg = "Removed ";
+                msg += (gone.nick_only ? "nick exclusion: " : "mask exclusion: ");
+                msg += tok;
+                PutModule(msg);
+                return;
+            }
+        }
+        PutModule("That nick/mask is not currently excluded.");
     }
 
     void CmdListExcludes() {
-        if (m_excluded.empty()) {
-            PutModule("No excluded channels configured.");
+        if (m_excluded.empty() && m_excluded_nicks.empty()) {
+            PutModule("No exclusions configured.");
             return;
         }
         size_t i = 0;
-        for (const auto& chan : m_excluded) {
+        // Channels first (sorted). This matches the numbering used by
+        // DelExclude <index>.
+        std::vector<CString> chans;
+        chans.reserve(m_excluded.size());
+        for (const auto& c : m_excluded) chans.push_back(c.c_str());
+        std::sort(chans.begin(), chans.end());
+        for (const auto& c : chans) {
             ++i;
-            PutModule(CString(std::to_string(i)) + ") " + chan.c_str());
+            PutModule(CString(std::to_string(i)) + ") " + c + " [channel]");
+        }
+        // Nick/mask exclusions in insertion order.
+        for (const auto& ne : m_excluded_nicks) {
+            ++i;
+            CString line = CString(std::to_string(i)) + ") " + ne.mask_folded.c_str()
+                         + " [" + (ne.nick_only ? "nick" : "mask") + "]";
+            PutModule(line);
         }
     }
 
@@ -1407,6 +1714,7 @@ class CHighlightCtx : public CModule {
         m_max_events = 0;
         m_require_ignore_mode = ERequireIgnoreMode::Auto;
         m_excluded.clear();
+        m_excluded_nicks.clear();
         RecomputeIgnoreDropRuntimeState();
         TrimAllRings();
         SetNV("before_max", "8");
@@ -1414,7 +1722,8 @@ class CHighlightCtx : public CModule {
         SetNV("max_events", "0");
         SaveIgnoreMode();
         SaveExcludes();
-        PutModule("All settings reset to defaults: before=8, after=8, max_events=disabled, require_ignore_drop=auto, excludes cleared.");
+        SaveExcludedNicks();
+        PutModule("All settings reset to defaults: before=8, after=8, max_events=disabled, require_ignore_drop=auto, all exclusions (channel and nick/mask) cleared.");
         PutModule("Pending/open events were not affected. Use ClearPending to discard them.");
     }
 
@@ -1436,7 +1745,7 @@ template<> void TModInfo<CHighlightCtx>(CModInfo& Info) {
     Info.SetWikiPage("highlightctx");
     Info.SetHasArgs(true);
     Info.SetDescription(
-        "Detached-only highlight context capture with independent live history, durable active-event journaling, native timestamp replay into *highlightctx when supported, and ignore_drop integration modes off/on/auto."
+        "Detached-only highlight context capture with independent live history, durable active-event journaling, native timestamp replay into *highlightctx when supported, channel and nick/hostmask exclusions, and ignore_drop integration modes off/on/auto."
     );
     Info.AddType(CModInfo::NetworkModule);
 }

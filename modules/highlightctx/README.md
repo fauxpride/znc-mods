@@ -2,7 +2,7 @@
 
 Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional `ignore_drop` integration.
 
-Current module version in source: **0.7.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes.
+Current module version in source: **0.8.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes.
 
 ---
 
@@ -42,6 +42,7 @@ The source is explicit about the intended behavior:
 - **Sort replay by channel, then event time**
 - **Clear delivered events after replay**
 - **Use native IRCv3 time/server-time replay when supported by the client**, otherwise fall back to inline UTC timestamps
+- **Exclusions for channels, nicknames, and `nick!ident@host` hostmasks**, with different semantics per kind
 - **Optional `ignore_drop` integration** with `off`, `on`, and `auto` modes, where `auto` is position-aware (see below)
 
 ---
@@ -112,11 +113,72 @@ A highlight event starts when:
 
 - the network is detached
 - the channel is not excluded
+- the sender is not excluded by a nick or hostmask exclusion
 - capture is currently allowed under the `ignore_drop` mode rules
 - an incoming channel line contains your **current network nick**
 - the line is **not** from your own nick
 
 Nick matching is case-insensitive and uses nick-style boundary logic, so it tries to detect proper nick mentions rather than arbitrary substring matches embedded in larger nick-like tokens.
+
+---
+
+## Exclusions
+
+`highlightctx` supports three kinds of exclusion, all managed through the same `AddExclude` / `DelExclude` / `ListExcludes` commands.
+
+### Channel exclusions
+
+A channel exclusion drops the channel entirely. No triggers, no context, no ring buffering. Added as `AddExclude #channel` (any token starting with `#`, `&`, `+`, or `!` is classified as a channel).
+
+Use this when you never want a given channel to contribute to highlight capture — for example, a very noisy bot channel where mentions of your nick are likely to be bot-driven rather than human.
+
+### Nick exclusions
+
+A nick exclusion is narrower. Messages from the excluded nick **still appear** as before/after context for other users' triggers, but the excluded nick **cannot start a new event** of their own. Added as `AddExclude BadNick` (any token without a channel prefix and without `!` or `@` is classified as a nick).
+
+This is the right choice when someone is noisy enough to pollute your replay if they triggered on their own, but you still want their messages visible when someone else triggers around them.
+
+### Hostmask exclusions
+
+A hostmask exclusion works the same way as a nick exclusion, but matches against the full `nick!ident@host` of the sender instead of just the nickname. Added as `AddExclude *!*@evil.example` or `AddExclude *!~bot@host.example` (any token containing `!` or `@` is classified as a full mask).
+
+Use this when you need to suppress a whole group of senders (everyone from a known bridge host, a shared script bot, etc.) as a trigger source.
+
+### Mask syntax
+
+Nick and hostmask exclusions use:
+
+- `*` for any sequence of characters (including empty)
+- `?` for exactly one character
+- any other character matched literally
+- **RFC 1459 case folding** before comparison
+
+RFC 1459 folding matters because most IRC daemons treat the pairs `A-Z`/`a-z`, `[`/`{`, `]`/`}`, `\`/`|`, and `~`/`^` as equivalent. The folding used here matches the folding used by [`ignore_drop`](../ignore_drop/README.md), so `[bot]` and `{bot}` fold to the same stored form and cannot be used to defeat each other as exclusion masks.
+
+### Mask validation
+
+Masks are rejected at add-time if:
+
+- they are empty, or
+- they contain embedded CR, LF, or NUL bytes (these would corrupt the NV storage format)
+
+Duplicate entries (compared on folded form) are rejected with a message rather than silently added twice.
+
+### Listing and removal
+
+`ListExcludes` shows all exclusions in a single numbered list, channels first (alphabetically sorted), then nick and hostmask exclusions in insertion order. Each entry is tagged `[channel]`, `[nick]`, or `[mask]` to make its kind obvious.
+
+`DelExclude` accepts any of:
+
+- a channel name (`DelExclude #noise`)
+- an exact mask, compared after RFC 1459 folding (`DelExclude BadNick`, `DelExclude *!*@evil.example`)
+- a numeric index from the `ListExcludes` output (`DelExclude 3`)
+
+### Why the difference between channel and nick exclusions matters
+
+A channel exclusion is coarse: the channel contributes nothing. A nick exclusion is surgical: the sender's messages are still in your context, they just cannot be the reason an event starts.
+
+A useful way to think about it: channel exclusion is "I don't care what happens here," while nick exclusion is "this person's spam isn't worth a highlight on its own, but I still want to see their messages around real highlights from others."
 
 ---
 
@@ -333,7 +395,7 @@ znc-buildmod highlightctx.cpp
 Load example from the source:
 
 ```text
-/msg *status LoadMod --type=network highlightctx [before=8 after=8 require_ignore_drop=auto excludes=#chan1,#chan2]
+/msg *status LoadMod --type=network highlightctx [before=8 after=8 require_ignore_drop=auto excludes=#chan1,#chan2,BadNick,*!*@evil.example]
 ```
 
 ### Supported load arguments
@@ -360,9 +422,15 @@ Maximum number of finalized pending events to keep at once.
 - default is disabled
 - when the cap is reached, the oldest pending event is silently dropped to make room
 
-#### `excludes=#chan1,#chan2,...`
+#### `excludes=<list>`
 
-Comma-separated list of excluded channels.
+Comma-separated list of mixed exclusions. Each token is classified automatically:
+
+- tokens starting with `#`, `&`, `+`, or `!` are treated as channels
+- tokens containing `!` or `@` are treated as full `nick!ident@host` masks
+- everything else is treated as a bare nickname mask
+
+Wildcards `*` and `?` are supported in nick and hostmask tokens. RFC 1459 case folding is applied before storage and comparison.
 
 ### Example load commands
 
@@ -382,6 +450,12 @@ With channel exclusions:
 
 ```text
 /msg *status LoadMod --type=network highlightctx excludes=#ops,#noise,#bots
+```
+
+With mixed channel + nick + hostmask exclusions:
+
+```text
+/msg *status LoadMod --type=network highlightctx excludes=#noise,BadNick,*!*@evil.example
 ```
 
 With explicit `ignore_drop` requirement:
@@ -430,8 +504,8 @@ The module registers a fairly complete command set.
 ### Exclusion management
 
 ```text
-/msg *highlightctx AddExclude <#channel>
-/msg *highlightctx DelExclude <#channel>
+/msg *highlightctx AddExclude <#channel|nick|mask>
+/msg *highlightctx DelExclude <#channel|nick|mask|index>
 /msg *highlightctx ListExcludes
 ```
 
@@ -456,7 +530,7 @@ Resets settings to defaults, but **does not discard pending/open events**.
 
 ### `Overview`
 
-Prints a detailed built-in summary of how capture, replay, persistence, and `ignore_drop` behavior work.
+Prints a detailed built-in summary of how capture, replay, persistence, exclusions, and `ignore_drop` behavior work.
 
 ### `Version`
 
@@ -479,6 +553,7 @@ Shows current state, including:
 - whether `ignore_drop` is currently loaded
 - whether the current client supports native server-time replay
 - number of excluded channels
+- number of excluded nicks/masks
 - number of open events
 - number of pending finalized events
 - journal path
@@ -515,21 +590,27 @@ Resets settings to compiled defaults:
 - `after=8`
 - `max_events=disabled`
 - `require_ignore_drop=auto`
-- excludes cleared
+- all exclusions (channel and nick/mask) cleared
 
 Pending and open events remain intact.
 
-### `AddExclude <#channel>`
+### `AddExclude <#channel|nick|mask>`
 
-Excludes a channel completely from detached highlight capture.
+Adds an exclusion. The token is classified as a channel, a nickname, or a full `nick!ident@host` mask based on its first character and the presence of `!` or `@`. See [Exclusions](#exclusions) for semantic details on the three kinds.
 
-### `DelExclude <#channel>`
+Masks may contain `*` and `?` wildcards and are matched after RFC 1459 case folding. Duplicate entries (compared on folded form) are reported rather than silently added. Empty masks and masks with embedded CR/LF/NUL are rejected with a reason.
 
-Removes a channel exclusion.
+### `DelExclude <#channel|nick|mask|index>`
+
+Removes an exclusion. Accepts any of:
+
+- a channel name
+- an exact nick mask or hostmask (case-insensitive via RFC 1459 folding)
+- a numeric index from the `ListExcludes` output
 
 ### `ListExcludes`
 
-Lists all excluded channels.
+Lists all exclusions in a single numbered list. Channels appear first (alphabetically sorted), then nick and hostmask exclusions in insertion order. Each entry is tagged `[channel]`, `[nick]`, or `[mask]`. The numbering is the same one that `DelExclude <index>` uses.
 
 ### `SetRequireIgnoreDrop <off|on|auto>`
 
@@ -578,6 +659,7 @@ Compiled/runtime defaults in the source:
 - `max_events = 0` → disabled
 - `require_ignore_drop = auto`
 - excluded channels = empty
+- excluded nicks/masks = empty
 
 ---
 
@@ -595,14 +677,15 @@ Compiled/runtime defaults in the source:
 ### Example configuration
 
 ```text
-/msg *status LoadMod --type=network highlightctx before=6 after=12 excludes=#noise,#flood require_ignore_drop=auto
+/msg *status LoadMod --type=network highlightctx before=6 after=12 excludes=#noise,BadNick,*!*@bridge.example require_ignore_drop=auto
 ```
 
 This means:
 
 - keep up to 6 lines before the trigger
 - keep up to 12 lines after the trigger
-- ignore `#noise` and `#flood`
+- ignore `#noise` entirely
+- still show `BadNick`'s and the bridge host's messages around real triggers, but do not let them start a new event on their own
 - use strict `ignore_drop` integration when `ignore_drop` is ahead of `highlightctx` in hook order
 
 ### Recommended `znc.conf` ordering for `auto` mode
@@ -650,10 +733,10 @@ If native server-time replay is available, the client can show those lines with 
 Typical build command from the source header:
 
 ```text
-znc-buildmod highlightctx7.cpp
+znc-buildmod highlightctx8.cpp
 ```
 
-This should produce `highlightctx7.so` for ZNC module loading. If you prefer a shorter module name (`highlightctx` instead of `highlightctx7`), rename the source file to `highlightctx.cpp` before building.
+This should produce `highlightctx8.so` for ZNC module loading. If you prefer a shorter module name (`highlightctx` instead of `highlightctx8`), rename the source file to `highlightctx.cpp` before building.
 
 ### Install
 
@@ -732,6 +815,8 @@ The main internal structures are:
 - `m_ring_by_chan` → per-channel ring buffer for pre-trigger context
 - `m_open_by_chan` → open events still collecting trailing `after` lines
 - `m_pending` → finalized events waiting to be replayed
+- `m_excluded` → set of lowercased channel names with channel-level exclusion
+- `m_excluded_nicks` → vector of nick/mask exclusion rules with a folded mask and a `nick_only` flag
 
 Each captured line stores:
 
@@ -751,6 +836,16 @@ Each event stores:
 - captured `after` lines
 - finalized flag
 - partial flag
+
+### Exclusion logic
+
+The three exclusion kinds are checked at different points in the capture pipeline:
+
+1. **Channel exclusion** is checked first thing in `HandleIncoming`. An excluded channel returns immediately — no context, no ring, nothing.
+2. **Nick/mask exclusion** is checked only on the trigger path, *after* `FeedOpenEvents` has already fed the line into any already-open events on this channel, and *before* `StartEvent` is called. This is what produces the "excluded nick still contributes context but cannot start an event" semantic.
+3. The channel ring buffer always receives every eligible (non-channel-excluded) line, including from excluded senders, so their messages remain available as `before` context for any future trigger.
+
+Nick/mask matching uses an iterative star-backtracking wildcard engine (`wildmatch_folded`), operating on RFC 1459-folded strings. Both the stored masks and the per-message sender samples are folded once; subsequent comparisons are byte-level. Nick-only masks match the sender's nickname; masks containing `!` or `@` match the full `nick!ident@host`.
 
 ### Arming logic
 
@@ -774,7 +869,7 @@ If the ring exceeds `before`, the oldest line is dropped.
 
 ### Event start behavior
 
-When a non-self line highlights your nick:
+When a non-self line highlights your nick AND the sender is not on the nick/mask exclusion list:
 
 - a new event ID is allocated
 - channel metadata is stored
@@ -786,7 +881,7 @@ When a non-self line highlights your nick:
 
 ### Event feed behavior
 
-For every later eligible line in the same channel:
+For every later eligible line in the same channel (regardless of sender — excluded senders still feed existing open events):
 
 - each open event for that channel receives the line in its `after` vector
 - a durable journal `after` record is appended
@@ -871,10 +966,11 @@ The module stores persistent settings via module NV entries, including:
 - `max_events`
 - `require_ignore_drop_mode`
 - legacy compatibility key `require_ignore_drop`
-- `excluded_channels`
+- `excluded_channels` — newline-separated lowercased channel names
+- `excluded_nicks` — newline-separated RFC 1459-folded nick/host masks
 - `version_marker`
 
-Excluded channels are stored one per line internally.
+Excluded channels and excluded nicks are stored in separate NV keys so 0.7.0 / 0.6.0 datadirs continue to load unchanged — only the channel key is read by older versions, and the new nick key is simply absent.
 
 ---
 
@@ -884,6 +980,7 @@ Excluded channels are stored one per line internally.
 - If you attach quickly after a trigger, the event may replay as partial.
 - Capture does not happen while attached.
 - Excluded channels contribute neither triggers nor context.
+- Excluded nicks/masks can still contribute context but cannot start events. This is the intentional semantic difference from channel exclusion.
 - `SetAfter` affects only new events, not ones already open.
 - In `auto` mode, arming now follows hook-order position rather than load-time presence:
   - if `ignore_drop` is ahead of `highlightctx` in the module list, `auto` arms automatically at the next re-check point
@@ -895,6 +992,7 @@ Excluded channels are stored one per line internally.
 - `OnBoot` re-checks arming automatically for modules loaded from `znc.conf`. For modules loaded dynamically via `LoadMod`, `OnBoot` is not called by ZNC, so `Rearm` (or an explicit reload) is the path to reassert the armed state.
 - `ReplayNow` and attach both finalize open events as partial before replaying.
 - `ClearPending` is destructive for current event state and should be used intentionally.
+- `Reset` clears both channel and nick/mask exclusions, but leaves pending/open events intact.
 
 ---
 
@@ -910,6 +1008,6 @@ Its main strengths are:
 - replay into a dedicated module window
 - native timestamp replay when the client supports it
 - configurable `ignore_drop` integration with position-aware auto mode and on-demand re-check via `Rearm`
-- exclusion control per channel
+- exclusion control per channel, per nickname, and per `nick!ident@host` hostmask, with semantics matched to what each kind is actually for
 
 If your goal is to preserve the context around important missed mentions while staying detached, without turning the module into a general-purpose logger, this design is aimed exactly at that use case.
