@@ -1,5 +1,5 @@
 // keepnick_instant.cpp — auto-backend, idle-aware, join-safe nick reclaim for ZNC
-// Version: 1.6.8
+// Version: 1.6.9
 // Behavior:
 //   • Backend mode: Auto (default) uses MONITOR when advertised via 005, and can also live-probe MONITOR on hot-swapped already-connected sessions; otherwise falls back to ISON
 //   • Polls with ISON every Interval seconds (default 5s) ONLY when backend resolves to ISON and you don't own the Primary nick
@@ -67,7 +67,7 @@ class CKeepNickInstant : public CModule {
   bool     MonitorKnownFree        = false;        // In MONITOR mode, last known state for Primary is offline/free; local scheduler retries NICK without MONITOR S polling
   unsigned MonitorLimit            = 0;            // Optional MONITOR=<n> limit from ISUPPORT
   bool     HotReloadDetectPending   = false;        // Fire a one-time MONITOR probe on hot reload even when HavePrimary() is true
-  bool     NickAttemptPending        = false;        // Set when we fire NICK <Primary>; used to swallow the 433 response so client scripts don't see it
+  bool     NickAttemptPending        = false;        // Set when we fire NICK <Primary>; used to swallow the 433/437 response so client scripts don't see it
   int      ISONQueryPending          = 0;            // Counts outstanding module-sent ISONs; 303 is swallowed while > 0, supporting multiple in-flight responses correctly
   unsigned BackendTimerSerial      = 0;            // Unique backend timer label suffix
   CString  BackendTimerLabel;                      // Currently armed backend timer label
@@ -324,7 +324,7 @@ class CKeepNickInstant : public CModule {
     time_t now = std::time(nullptr);
     if (LastAttempt && now - LastAttempt < (time_t)MinGapSec) return; // dedupe
     LastAttempt = now;
-    NickAttemptPending = true;  // arm 433 swallow for this attempt
+    NickAttemptPending = true;  // arm 433/437 swallow for this attempt
     PutIRC("NICK " + Primary);
     if (!AddTimer(new CRearmTimer(this, MinGapSec))) {
       PutModule("Warning: failed to arm reclaim dedupe timer.");
@@ -412,11 +412,11 @@ class CKeepNickInstant : public CModule {
   EModRet OnRaw(CString& sLine) override {
     // Cheap pre-filter: extract only the command token before allocating a VCString.
     // OnRaw fires for every IRC line including PRIVMSG, NOTICE, JOIN, PART, MODE, etc.
-    // A full Split() on every line wastes CPU and heap when we only care about 8 types.
+    // A full Split() on every line wastes CPU and heap when we only care about 9 types.
     CString cmd = sLine.Token(1);
     if (cmd != "005" && cmd != "303" &&
         cmd != "730" && cmd != "731" && cmd != "734" && cmd != "421" &&
-        cmd != "433" &&
+        cmd != "433" && cmd != "437" &&
         !cmd.Equals("NICK", false) && !cmd.Equals("QUIT", false))
       return CONTINUE;
 
@@ -538,6 +538,26 @@ class CKeepNickInstant : public CModule {
       return CONTINUE;            // not ours — pass through to client
     }
 
+    // 437 ERR_UNAVAILRESOURCE — "Nick/channel is temporarily unavailable".
+    // Mirrors the 433 swallow. ratbox/charybdis/solanum (EFnet, etc.) place a recently-
+    // departed nick into a temporary lockout window after netsplits or quits to prevent
+    // collision races during split-heal. During that window, NICK <Primary> attempts are
+    // rejected with 437 instead of 433. Without swallowing, mIRC and other clients display
+    // "Nickname is temporarily unavailable" once per attempt for up to ~15 minutes until
+    // the delay expires and reclaim succeeds. Same conservative gate as 433: swallow only
+    // when NickAttemptPending is set AND v[3] matches Primary. This protects against
+    // accidentally swallowing channel-targeted 437s (juped channels) and 437s from
+    // user-typed /nick commands where NickAttemptPending is false.
+    // Format: :server 437 <currentnick> <attemptedtarget> :Nick/channel is temporarily unavailable
+    if (cmd == "437") {
+      if (NickAttemptPending && v.size() >= 4 && v[3].Equals(Primary, false)) {
+        NickAttemptPending = false;
+        return HALT; // swallow — client does not see this 437
+      }
+      NickAttemptPending = false; // clear stale flag on any 437 regardless
+      return CONTINUE;            // not ours (channel target, manual /nick, etc.) — pass through
+    }
+
     // Visible events: :old!u@h NICK :new   /   :nick!u@h QUIT :msg
     if (v[0].StartsWith(":")) {
       if (cmd.Equals("NICK", false)) {
@@ -639,7 +659,7 @@ class CKeepNickInstant : public CModule {
     else if (cmd == "show" || cmd.empty() || cmd == "help") {
       CString cur = GetNetwork() ? GetNetwork()->GetIRCNick().GetNick() : "<none>";
       PutModule("keepnick_instant — auto-backend nick reclaim (MONITOR when available, otherwise ISON; idle-aware & join-safe).");
-      PutModule("Version: 1.6.8");
+      PutModule("Version: 1.6.9");
       PutModule("Current state:");
       PutModule("  Status: " + CString(Enabled ? "ENABLED" : "DISABLED"));
       PutModule("  Primary: " + Primary + "   |   Current: " + cur);
@@ -697,6 +717,6 @@ void CRearmTimer::RunJob() {
 
 template<> void TModInfo<CKeepNickInstant>(CModInfo& Info) {
   Info.SetHasArgs(true);
-  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/303/421 swallow, timer cleanup, ISON counter, nick validation, match-gated MONITOR state)");
+  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/437/303/421 swallow, timer cleanup, ISON counter, nick validation, match-gated MONITOR state)");
 }
-NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.8")
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.9")
