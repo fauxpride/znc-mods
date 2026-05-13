@@ -994,6 +994,21 @@ Excluded channels and excluded nicks are stored in separate NV keys so 0.7.0 / 0
 - `ClearPending` is destructive for current event state and should be used intentionally.
 - `Reset` clears both channel and nick/mask exclusions, but leaves pending/open events intact.
 
+### Known limitation: highlights at the moment of disconnect
+
+There is a narrow timing window in which a highlight can arrive at ZNC effectively at the same moment your client disconnects. In that window, `highlightctx` may not capture the highlight even though you experienced it as having arrived "while I was detached." The most visible symptom is exactly what you'd expect: on reconnect, the highlight is sitting at the top of the channel's normal buffer playback, but no corresponding entry was ever created in `*highlightctx`.
+
+The cause is a property of ZNC's event-handling, not of the module. `ShouldCaptureNow()` gates capture on `IsUserAttached()`, which is a snapshot of "is your client currently in the network's client list?" When a client disconnects, ZNC has to process the socket-close event before it removes the client from that list. If an IRC message from the server arrives during the brief interval between the socket actually closing and ZNC processing the close, `IsUserAttached()` still returns `true`, so `highlightctx` treats the message as having arrived while you were attached and skips it. The message still flows through ZNC's normal channel-buffer storage, which is why you still see it on reconnect.
+
+The window is:
+
+- typically very short (milliseconds to a few hundred milliseconds) for a clean client disconnect that delivers a TCP FIN/RST to ZNC
+- potentially much longer (until TCP keepalives time out, which can be minutes) for a half-open connection caused by a hard process kill, a sudden network drop, or anything else that doesn't deliver a clean close to ZNC
+
+In both cases the information is not lost. The highlight remains in ZNC's regular channel buffer and is visible to you as part of the usual buffer playback the next time you reattach. What is missing is only the focused replay entry that would otherwise appear in the `*highlightctx` window.
+
+This is treated as an accepted limitation rather than a bug to be fixed. A fix would require `highlightctx` to read from ZNC's normal channel buffer at the detach transition and retroactively synthesize events for recent highlights — feasible, but a meaningful departure from the module's "do not inspect ZNC's normal buffer" design principle for what is, in practice, a fairly narrow operational window.
+
 ---
 
 ## Summary

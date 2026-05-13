@@ -77,6 +77,12 @@ Total: **83/83 passing**. Key new assertions include:
 - `Reset` clears both kinds of exclusions
 - nick exclusions persist across `UpdateMod highlightctx` via the new `excluded_nicks` NV key
 
+### Known limitations (documented post-release)
+
+The following section was added to the documentation after 0.8.0 was released. No code changed; this is documentation of pre-existing behavior that an operator can usefully be aware of.
+
+* **Highlights at the moment of disconnect.** A highlight that arrives during the brief window between your client's socket closing and ZNC processing the close may not produce a `highlightctx` event. ZNC's `IsUserAttached()` still returns `true` during that window because the client object has not yet been removed from the network's client list, so `ShouldCaptureNow()` treats the message as having arrived while you were attached and skips capture. This is a property of how ZNC processes events, not a `highlightctx` bug — the same race exists for any module that gates on `IsUserAttached()`. The information itself is not lost: the highlight is still stored in ZNC's normal channel buffer and is replayed there on next attach. Only the focused `*highlightctx` replay event is missing. The window is short for clean disconnects (typically milliseconds to a few hundred milliseconds) and can be substantially longer for half-open TCP connections — process hard-kill, sudden network drop, or any case where TCP keepalives have not yet timed out. See the README's "Known limitation: highlights at the moment of disconnect" section in *Operational notes and caveats* for a fuller explanation.
+
 ---
 
 ## [0.7.0] — 2026-04-21
