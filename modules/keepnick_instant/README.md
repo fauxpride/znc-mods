@@ -23,7 +23,7 @@ This is especially useful on networks such as **Undernet**, which remains the pr
 
 In other words: this module exists for the classic IRC case where your preferred nick may be temporarily occupied, you connect under an alternate nick, and you want ZNC to quietly and safely switch back the moment the preferred nick becomes available.
 
-Compared with ZNC's built-in `keepnick` module, `keepnick_instant` is deliberately more cautious and more explicit about *when* it will try to reclaim. Stock `keepnick` periodically attempts a direct `NICK` back to the network's configured nick and also reacts to visible `NICK`/`QUIT` events for that nick, while `keepnick_instant` adds backend-aware availability checks, post-connect delay, idle-awareness, optional jitter, and deduped reclaim spacing. That makes the stock module a fine generic default, but makes `keepnick_instant` a better fit for Undernet-style networks where you want quick reclaim once the nick is truly free without adding unnecessary nick-change traffic.
+Compared with ZNC's built-in `keepnick` module, `keepnick_instant` is deliberately more cautious and more explicit about *when* it will try to reclaim, but also — when configured appropriately — meaningfully *faster* and more intelligent about *how* it decides to do so. Stock `keepnick` periodically attempts a direct `NICK` back to the network's configured nick and also reacts to visible `NICK`/`QUIT` events for that nick, with no built-in awareness of whether the target is currently online. `keepnick_instant` adds backend-aware availability checks (`MONITOR` push notifications when supported, `ISON` polling otherwise), post-connect delay, idle-awareness, optional jitter, and deduped reclaim spacing. On a `MONITOR`-capable network, that means reclaim fires within roughly one server roundtrip of the target nick going offline rather than waiting for the next scheduled retry; on an `ISON`-only network, a short `IntervalSec` produces reclaim well under stock `keepnick`'s typical cadence while still respecting `MinGap` to avoid burst spam. That makes the stock module a fine generic default, but makes `keepnick_instant` a better fit for Undernet-style networks where you want quick, server-aware reclaim once the nick is truly free without adding unnecessary nick-change traffic.
 
 ---
 
@@ -63,7 +63,7 @@ It is **not primarily aimed at** networks where nickname ownership is enforced b
 
 ## How this differs from ZNC's built-in `keepnick`
 
-ZNC already ships with a core module called `keepnick`, so it is reasonable to ask why this module exists at all. The short version is: `keepnick_instant` is not trying to reinvent the goal, but to change the *strategy* used to reach it.
+ZNC already ships with a core module called `keepnick`, so it is reasonable to ask why this module exists at all. The short version is: `keepnick_instant` is not trying to reinvent the goal, but to change the *strategy* used to reach it. With sensible configuration, that strategy change makes it both faster than stock `keepnick` at noticing the target nick is available and more intelligent about deciding when an attempt is actually worth making — see the two subsections below for the specifics of what each module does and how the strategies differ.
 
 ### What stock `keepnick` does
 
@@ -88,7 +88,7 @@ That behavior is straightforward and useful, and it is one reason `keepnick` has
 - it dedupes actual reclaim attempts with `MinGap`,
 - it can add per-tick jitter to avoid perfectly regular timing.
 
-In practice, that makes this module feel more deliberate, less spammy, and easier to tune for networks where being conservative matters.
+In practice, that makes this module feel more deliberate, less spammy, and easier to tune for networks where being conservative matters. It also makes reclaim *faster* in the cases that matter: on a `MONITOR`-capable network the server tells the module the moment the target nick goes offline, so reclaim fires within roughly one roundtrip rather than waiting up to a full `IntervalSec` for the next scheduled poll; on an `ISON`-only network a short `IntervalSec` (e.g. 15s) produces a tighter loop than stock `keepnick`'s default cadence, while `MinGap` and idle-awareness ensure that "faster" never collapses into "spammier." The same checks make the decision to *send* a `NICK` more intelligent than the stock module's timer-driven approach: `keepnick_instant` does not fire `NICK` until backend evidence says the target is actually available (`MONITOR` 731, empty `ISON` reply, or a visible `NICK`/`QUIT` away from the target), which avoids the round of redundant `433`/`437` rejections stock `keepnick` produces by periodically attempting a reclaim with no availability signal.
 
 ### Why they do not fundamentally conflict
 
