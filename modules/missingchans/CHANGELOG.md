@@ -7,6 +7,40 @@ This module uses sequential build revisions (`rN`) rather than [Semantic Version
 
 ---
 
+## r9 — 2026-05-21
+
+### Changed
+
+- **The module's own self-WHOIS round-trip is no longer surfaced to attached IRC clients.** Previously, every verification cycle caused a burst of `311` / `312` / `313` / `317` / `319` / `330` / `338` / `671` / `318` (or `401`) numerics for the bouncer's own nick to arrive in each attached client's IRC window, which is noisy and confusing because the user did not ask for that WHOIS. Under r9 those replies are intercepted before they reach any attached client. The module still processes them internally, so the verification table (expected / actual / verified / missing) is produced exactly as before — only the underlying WHOIS exchange is hidden.
+- **User-initiated `/whois` is unaffected.** WHOIS commands sent from an attached client (regardless of target — yourself, someone else, anyone) still propagate their reply numerics back to clients exactly as in r8 and earlier. The suppression applies only to the WHOIS that this module itself originates.
+- **Build marker updated** from `2026-05-21+r8 (... voiced-channel parser fix)` to `2026-05-21+r9 (... voiced-channel parser fix; hidden self-WHOIS)`.
+
+### Implementation notes
+
+- Distinguishing module-initiated from user-initiated WHOIS is done with a small FIFO queue (`m_whoisOrigins`) of request origins, since IRC servers serialize WHOIS replies in request order on a single connection. When the module sends WHOIS via `PutIRC`, it pushes `true` onto the queue; when an attached client sends WHOIS (caught via the new `OnUserRawMessage` hook), it pushes `false`. The front of the queue identifies whose replies are currently arriving; we pop on `318` or `401` (end of WHOIS). The queue is cleared on IRC disconnect to avoid stale state.
+- The intercept itself happens in `OnNumericMessage`, which returns `HALT` for WHOIS-related numerics whose origin at the front of the queue is `true` (ours), and `CONTINUE` otherwise. The set of intercepted numerics is `311`, `312`, `313`, `317`, `319`, `330`, `338`, `671`, `318`, `401` — the standard WHOIS reply repertoire.
+- No new ZNC API surface is used beyond `OnUserRawMessage` (available since ZNC 1.7.0) and the existing `OnNumericMessage` return-value semantics. Built and runtime-tested against ZNC 1.9.1 (built from source).
+
+### Compatibility
+
+- **NV storage format is unchanged.** Settings persisted under r8 are read back identically by r9; no migration is performed or required. Verified by setting non-default values for `delay`, `joinmissing`, `expectedmode`, `retries`, `retrystep`, and `retryperform`, unloading the module, replacing the `.so`, and reloading — all values reappear correctly.
+- **Command-line behavior is byte-identical to r8** — `HELP`, `VERSION`, `STATUS`, `SHOW`, `RUN`, every `SET` valid/invalid path, unknown commands, and HELP aliases (`h`, `?`) produce exactly the same output. Verified by 22 captured commands run under both r8 and r9 on the same ZNC 1.9.1 instance with NV state reset between runs.
+- **The r8 voiced-channel parser fix is preserved.** Voiced (`+#chan`), op (`@#chan`), admin (`&#chan`), and compound user-mode prefix tokens (`~&@#chan`, `~&@%+#chan`) in WHOIS `319` replies are still correctly stripped down to the underlying channel name. End-to-end test confirms that all 17 channels from the original bug report (including the two voiced ones) are correctly classified as joined.
+- **No new settings.** The suppression is unconditional; if you ever want to inspect the module's WHOIS exchange for debugging, you can do so via ZNC's traffic log rather than via an attached client.
+
+### Testing
+
+- Built cleanly against ZNC 1.9.1 with no compiler warnings.
+- **End-to-end test** with a Python mock IRC server, replicating the bug-fix scenario from r8 (17 expected channels, 2 of them voiced):
+  - **Test A1:** The client sees zero WHOIS reply numerics for the bouncer's nick when the module runs its verification. Previously (r8) the client would see five numerics (`311`, `312`, `317`, `319`, `318`) per cycle.
+  - **Test A2:** The module's table output (the `PRIVMSG` from `*missingchans` listing expected / actual / missing) is still delivered to the client — 40 module lines received during a `RUN`, confirming the module is processing the WHOIS internally even though the raw numerics are hidden.
+  - **Test A3:** The r8 voiced-channel parser fix continues to work — all 17 channels appear in `actual` (no `+#`-prefixed tokens), `missing` is empty.
+  - **Test B:** The user manually issuing `/WHOIS testuser` after the verification cycle receives all 5 reply numerics normally, confirming user-initiated WHOIS is unaffected.
+- **Command-level regression test against r8:** 22 representative commands captured under both versions on the same ZNC 1.9.1 instance, NV state reset between runs. All 22 produce byte-identical output.
+- **NV persistence test:** `delay`, `joinmissing`, `expectedmode`, `retries`, `retrystep` round-trip correctly across module unload/reload under r9.
+
+---
+
 ## r8 — 2026-05-21
 
 ### Fixed
