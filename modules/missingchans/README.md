@@ -1,5 +1,7 @@
 # missingchans
 
+See [CHANGELOG.md](./CHANGELOG.md) for version history and release notes.
+
 [`missingchans`](./src/missingchans.cpp) is a ZNC network module that verifies whether the channels you **expect** to be on are actually joined on the **IRC server**, and can optionally retry joins for anything that is still missing.
 
 It is designed for reconnect scenarios where your configured channel list and your real server-side membership can drift apart for a while after connect — especially on networks where joining certain community channels depends on first authenticating to a **non-service bot**, obtaining a **community-specific cloak**, or waiting for some other post-connect condition to complete.
