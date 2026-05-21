@@ -7,7 +7,7 @@ This module uses sequential build revisions (`rN`) rather than [Semantic Version
 
 ---
 
-## [r7] — 2026-05-21
+## r7 — 2026-05-21
 
 ### Changed
 
@@ -39,7 +39,7 @@ This module uses sequential build revisions (`rN`) rather than [Semantic Version
 
 ---
 
-## [r6] — 2026-02-11
+## r6 — 2026-02-11
 
 ### Changed
 
