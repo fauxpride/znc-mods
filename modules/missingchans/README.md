@@ -92,6 +92,7 @@ That combination is what makes the module suitable for “make sure everything g
 - Reuses channel keys from ZNC channel configuration when re-sending `JOIN`.
 - Case-insensitive channel comparison.
 - User-mode-aware WHOIS parsing: channels you are voiced (`+`), op (`@`), halfop (`%`), admin (`&`), or owner (`~`) in are correctly recognized as the same channel, not as separate prefixed entries.
+- The WHOIS exchange the module performs as part of its own verification is hidden from attached IRC clients (no noisy `311` / `312` / `319` / `318` numerics for the bouncer's own nick appear in client windows). User-initiated `/whois` is unaffected.
 - Extra fallback learning from numeric `443` (“already on channel”).
 - Persistent configuration via ZNC module NV storage.
 
@@ -100,8 +101,8 @@ That combination is what makes the module suitable for “make sure everything g
 ## Module identity
 
 - **Module name:** `missingchans`
-- **Source file:** `missingchansv8.cpp`
-- **Current build marker in source:** `2026-05-21+r8 (robust 319 + case-insensitive chans + 443 fallback; voiced-channel parser fix)`
+- **Source file:** `missingchansv9.cpp`
+- **Current build marker in source:** `2026-05-21+r9 (robust 319 + case-insensitive chans + 443 fallback; voiced-channel parser fix; hidden self-WHOIS)`
 
 The module advertises itself as:
 
@@ -114,7 +115,7 @@ The module advertises itself as:
 ### Build
 
 ```bash
-znc-buildmod missingchansv8.cpp
+znc-buildmod missingchansv9.cpp
 ```
 
 This should produce a module shared object suitable for your ZNC installation.
@@ -608,6 +609,14 @@ WHOIS `319` channel-list tokens often carry your user-mode prefix in each channe
 The module strips these user-mode prefixes from each token so that the underlying channel name is compared against the expected list. The tricky cases are `+` and `&`, because each of those characters can appear either as a user-mode prefix (voice / admin) *or* as a channel-type prefix (modeless channels / local channels).
 
 The parser disambiguates by looking at the character that follows: a leading `+` or `&` is treated as a user-mode prefix only when the next character is itself another prefix character or a clear channel-type prefix (`#`, `!`). Otherwise the `+` or `&` is treated as the channel-type prefix and parsing stops there. This correctly handles `+#chan` (voiced in `#chan`), `&#chan` (admin in `#chan`), `+chan` (modeless channel), `&local` (local channel), and combinations like `@+modeless` (op in a modeless channel).
+
+### Hiding the module's self-WHOIS from clients
+
+The verification cycle is driven by a `WHOIS` that the module sends against your own current nick. Without intervention, the server's reply numerics (`311`, `312`, `313`, `317`, `319`, `330`, `338`, `671`, `318`, and on failure `401`) propagate to every attached client, which is noisy because the user did not ask for that WHOIS. The module intercepts those replies and drops them before they reach any attached client. The internal parsing still runs, so the verification table (expected / actual / verified / missing) is produced exactly as before — only the underlying WHOIS exchange is hidden from clients.
+
+User-initiated `/whois` is unaffected. To distinguish module-initiated from user-initiated WHOIS, the module keeps a small FIFO queue of request origins: every time it sends WHOIS, it pushes "ours" onto the queue; every time an attached client sends WHOIS (caught via `OnUserRawMessage`), it pushes "user". The front of the queue identifies whose replies are currently arriving, and entries are popped on `318` or `401`. Because IRC servers serialize WHOIS replies in request order on a single connection, this ordering is reliable. The queue is cleared on IRC disconnect.
+
+The suppression is unconditional and has no `SET` option to toggle it. If you ever need to inspect the module's WHOIS exchange for debugging, use ZNC's traffic log rather than an attached client.
 
 ### Client-attach notice
 

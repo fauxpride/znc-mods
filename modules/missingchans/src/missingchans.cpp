@@ -1,6 +1,23 @@
 // missingchans.cpp — ZNC 1.9.1 compatible
 // Build: znc-buildmod missingchans.cpp
 //
+// Changes vs r8:
+// - The WHOIS round-trip that the module sends as part of its internal
+//   verification logic is no longer surfaced to attached IRC clients. The
+//   module's own WHOIS reply numerics (311/312/313/317/319/330/338/671/318/
+//   401 for the module's target) are intercepted and dropped before they
+//   reach the client.
+// - User-initiated /whois (issued from an attached client) is unaffected;
+//   those replies still reach clients exactly as before.
+// - Distinguishing module-vs-user WHOIS is done with a FIFO queue of request
+//   origins, since IRC servers serialize WHOIS replies in request order on
+//   a single connection. When the module sends WHOIS it pushes "ours" onto
+//   the queue; when a client sends WHOIS (caught via OnUserRawMessage) it
+//   pushes "user" onto the queue. The front of the queue identifies whose
+//   replies are currently arriving; we pop on 318/401 (end of WHOIS).
+// - The queue is cleared on IRC disconnect to avoid stale state.
+// - Bumps build marker to r9.
+//
 // Changes vs r7:
 // - Fixes a parser bug where 319 reply tokens like "+#chan" (voiced in #chan)
 //   or "&#chan" (admin in #chan on networks where '&' is a user-mode prefix)
@@ -38,9 +55,10 @@
 
 #include <set>
 #include <vector>
+#include <deque>
 #include <cctype>
 
-#define MISSINGCHANS_BUILD "2026-05-21+r8 (robust 319 + case-insensitive chans + 443 fallback; voiced-channel parser fix)"
+#define MISSINGCHANS_BUILD "2026-05-21+r9 (robust 319 + case-insensitive chans + 443 fallback; voiced-channel parser fix; hidden self-WHOIS)"
 
 // Case-insensitive ordering for CString (good enough for typical channel names)
 struct CStringCI {
@@ -177,6 +195,16 @@ public:
         PutModule("Unknown command. Try: HELP");
     }
 
+    EModRet OnUserRawMessage(CMessage& msg) override {
+        // Track user-initiated WHOIS so we don't accidentally suppress its
+        // replies. The actual decision is made in OnNumericMessage by looking
+        // at the front of m_whoisOrigins.
+        if (msg.GetCommand().Equals("WHOIS")) {
+            m_whoisOrigins.push_back(false);
+        }
+        return CONTINUE;
+    }
+
     EModRet OnNumericMessage(CNumericMessage& msg) override {
         const unsigned int code = msg.GetCode();
 
@@ -207,52 +235,73 @@ public:
             }
         }
 
-        // WHOIS parsing
-        if (!m_bWaitingWhois) return CONTINUE;
+        // WHOIS-related numerics. We need to decide two things here:
+        //   1) whether to do the module's own internal parsing (only for our
+        //      self-WHOIS, gated on m_bWaitingWhois + target match), and
+        //   2) whether to hide this numeric from attached clients (only for
+        //      replies that match our request at the front of the queue).
+        //
+        // The queue is FIFO: each WHOIS request — ours or a user's — pushes
+        // one entry, and 318/401 pops one entry. IRC servers serialize WHOIS
+        // replies in request order on a single connection, so the front of
+        // the queue identifies whose replies are currently arriving.
+        const bool isWhoisRelated =
+            (code == 311 || code == 312 || code == 313 || code == 317 ||
+             code == 319 || code == 330 || code == 338 || code == 671 ||
+             code == 318 || code == 401);
 
-        if (code != 319 && code != 318 && code != 401) return CONTINUE;
-        if (msg.GetParams().size() < 2) return CONTINUE;
-
-        const CString target = msg.GetParam(1).AsLower();
-        if (target != m_sWhoisTargetLower) return CONTINUE;
-
-        if (code == 401) {
-            m_bWaitingWhois = false;
-            PutModule("WHOIS failed (401). Cannot verify channel membership right now.");
+        if (!isWhoisRelated) {
             return CONTINUE;
         }
 
-        if (code == 319) {
-            // Robust: some parsers might split the channel list into multiple params.
-            // Join params[2..end] into a single string, then split by spaces.
-            const size_t n = msg.GetParams().size();
-            if (n >= 3) {
-                CString chans;
-                for (size_t i = 2; i < n; ++i) {
-                    CString p = msg.GetParam((unsigned int)i);
-                    if (!p.empty() && p[0] == ':') p.erase(0, 1);
-                    if (!chans.empty()) chans += " ";
-                    chans += p;
-                }
+        const bool isEndOfWhois = (code == 318 || code == 401);
+        const bool isOursAtFront =
+            !m_whoisOrigins.empty() && m_whoisOrigins.front();
 
-                VCString v;
-                chans.Split(" ", v, false);
-                for (CString tok : v) {
-                    if (!tok.empty() && tok[0] == ':') tok.erase(0, 1);
-                    CString c = StripPrefix(tok);
-                    if (!c.empty()) m_actual.insert(c);
+        // Module's internal parsing — only when this numeric corresponds to
+        // OUR request AND we're still waiting for the WHOIS to complete.
+        if (isOursAtFront && m_bWaitingWhois && msg.GetParams().size() >= 2) {
+            const CString target = msg.GetParam(1).AsLower();
+            if (target == m_sWhoisTargetLower) {
+                if (code == 319) {
+                    // Robust: some parsers might split the channel list into multiple params.
+                    // Join params[2..end] into a single string, then split by spaces.
+                    const size_t n = msg.GetParams().size();
+                    if (n >= 3) {
+                        CString chans;
+                        for (size_t i = 2; i < n; ++i) {
+                            CString p = msg.GetParam((unsigned int)i);
+                            if (!p.empty() && p[0] == ':') p.erase(0, 1);
+                            if (!chans.empty()) chans += " ";
+                            chans += p;
+                        }
+
+                        VCString v;
+                        chans.Split(" ", v, false);
+                        for (CString tok : v) {
+                            if (!tok.empty() && tok[0] == ':') tok.erase(0, 1);
+                            CString c = StripPrefix(tok);
+                            if (!c.empty()) m_actual.insert(c);
+                        }
+                    }
+                } else if (code == 318) {
+                    m_bWaitingWhois = false;
+                    FinishCheck();
+                } else if (code == 401) {
+                    m_bWaitingWhois = false;
+                    PutModule("WHOIS failed (401). Cannot verify channel membership right now.");
                 }
             }
-            return CONTINUE;
         }
 
-        if (code == 318) {
-            m_bWaitingWhois = false;
-            FinishCheck();
-            return CONTINUE;
+        // Pop the request marker on end-of-whois (regardless of whether it
+        // was ours or the user's).
+        if (isEndOfWhois && !m_whoisOrigins.empty()) {
+            m_whoisOrigins.pop_front();
         }
 
-        return CONTINUE;
+        // Suppress from attached clients only if this batch was ours.
+        return isOursAtFront ? HALT : CONTINUE;
     }
 
     void TimerStartCheck(unsigned long long gen, bool resetAttempts) {
@@ -280,6 +329,12 @@ private:
     CString m_sWhoisTarget;
     CString m_sWhoisTargetLower;
 
+    // FIFO queue of WHOIS request origins, used to decide whether each
+    // incoming WHOIS-related numeric should be suppressed from clients.
+    // true  = this WHOIS was sent by the module itself (suppress replies)
+    // false = this WHOIS was sent by an attached client (let replies through)
+    std::deque<bool> m_whoisOrigins;
+
     std::set<CString, CStringCI> m_expected;
     std::set<CString, CStringCI> m_actual;
     std::set<CString, CStringCI> m_verifiedJoined;
@@ -305,6 +360,7 @@ private:
         m_sWhoisTarget.clear();
         m_sWhoisTargetLower.clear();
         m_uAttempt = 0;
+        m_whoisOrigins.clear();
 
         m_lastAttemptMissing.clear();
         m_bHaveLastAttemptMissing = false;
@@ -462,6 +518,9 @@ private:
             PutModule(CString("Verifying channel membership on server via WHOIS ") + m_sWhoisTarget + ".");
         }
 
+        // Mark this WHOIS as originating from the module BEFORE sending, so the
+        // origin marker is in place by the time replies arrive.
+        m_whoisOrigins.push_back(true);
         PutIRC(CString("WHOIS ") + m_sWhoisTarget);
     }
 
