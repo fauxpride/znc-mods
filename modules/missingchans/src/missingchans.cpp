@@ -1,6 +1,11 @@
 // missingchans.cpp — ZNC 1.9.1 compatible
 // Build: znc-buildmod missingchans.cpp
 //
+// Changes vs r6:
+// - Cosmetic only: HELP command now lists every SET key with a short description,
+//   instead of showing a "key settings" subset. No behavior changes.
+// - Bumps build marker to r7.
+//
 // Changes vs r5:
 // - Fixes cases where self-WHOIS DOES include +s/+p channels but module still misses them:
 //   * Case-insensitive channel comparisons (avoids #Chan vs #chan false "missing")
@@ -18,7 +23,7 @@
 #include <vector>
 #include <cctype>
 
-#define MISSINGCHANS_BUILD "2026-02-11+r6 (robust 319 + case-insensitive chans + 443 fallback)"
+#define MISSINGCHANS_BUILD "2026-05-21+r7 (robust 319 + case-insensitive chans + 443 fallback; expanded HELP)"
 
 // Case-insensitive ordering for CString (good enough for typical channel names)
 struct CStringCI {
@@ -681,13 +686,32 @@ private:
         PutModule("  - This build compares channel names case-insensitively and parses WHOIS 319 robustly.");
         PutModule("  - 443 (already on channel) remains as a fallback verification signal.");
         PutModule(" ");
-        PutModule("Key settings:");
-        PutModule("  SET expectedmode <all|config|enabled>");
-        PutModule("  SET joinmissing <on|off>");
-        PutModule("  SET retryperform <on|off>         (uses perform Execute, unless suppressed)");
-        PutModule("  SET retries <N>");
-        PutModule("  SET retrystep <seconds>           (attempt i waits i*retrystep)");
-        PutModule("  SET stopperformon <#chan|off>     (sentinel: if joined, suppress perform Execute in later attempts)");
+        PutModule("Settings (configure via: SET <key> <value>):");
+        PutModule("  delay <seconds>");
+        PutModule("      Seconds to wait after IRC connect before the first verification cycle.");
+        PutModule("      Minimum 1. Default 300.");
+        PutModule("  joinmissing <on|off>");
+        PutModule("      Whether to actually JOIN missing channels after verification. If OFF,");
+        PutModule("      missing channels are only reported. Default OFF.");
+        PutModule("  expectedmode <all|config|enabled>");
+        PutModule("      Which channels count as 'expected':");
+        PutModule("        all     - every channel known to this network (default).");
+        PutModule("        config  - only channels present in znc.conf (InConfig=true).");
+        PutModule("        enabled - channels in znc.conf that are not disabled.");
+        PutModule("  retryperform <on|off>");
+        PutModule("      If ON, the 'perform' module's Execute command is invoked before each");
+        PutModule("      JOIN attempt (network-scope perform preferred over user-scope). Useful");
+        PutModule("      when joins require services auth. Default OFF.");
+        PutModule("  retries <N>");
+        PutModule("      Maximum number of JOIN attempts per verification cycle. Minimum 1.");
+        PutModule("      Default 3.");
+        PutModule("  retrystep <seconds>");
+        PutModule("      Backoff step between attempts. Attempt i waits (i * retrystep) seconds");
+        PutModule("      before firing. Default 20.");
+        PutModule("  stopperformon <#channel|off>");
+        PutModule("      Sentinel channel. If it appears joined (via WHOIS or 443), perform");
+        PutModule("      Execute is suppressed for the rest of this cycle. Use 'off' (or 'none',");
+        PutModule("      or '-') to clear. Default off.");
         PutModule(" ");
         PutModule("Commands:");
         PutModule("  RUN / SHOW / STATUS / VERSION / HELP");
