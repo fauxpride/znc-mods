@@ -1,6 +1,23 @@
 // missingchans.cpp — ZNC 1.9.1 compatible
 // Build: znc-buildmod missingchans.cpp
 //
+// Changes vs r7:
+// - Fixes a parser bug where 319 reply tokens like "+#chan" (voiced in #chan)
+//   or "&#chan" (admin in #chan on networks where '&' is a user-mode prefix)
+//   were treated as the channel name itself rather than having the user-mode
+//   prefix stripped. Symptom: when the user is voiced (or admin) in some of
+//   their channels, those channels show up as "missing" because m_actual
+//   ends up containing "+#chan" / "&#chan" instead of "#chan".
+//   Root cause: StripPrefix stopped at the first '+' or '&', which are valid
+//   channel-type prefixes on some networks but also valid user-mode prefixes.
+//   Fix: disambiguate by looking at the next character — if it's another
+//   prefix-like char, the leading '+' / '&' is a user-mode prefix and gets
+//   stripped; otherwise it's the channel-type prefix and we stop there.
+// - Also: StripPrefix now returns empty when the result doesn't start with a
+//   channel-type prefix, so 319 parsing can't silently insert garbage tokens
+//   into m_actual.
+// - Bumps build marker to r8.
+//
 // Changes vs r6:
 // - Cosmetic only: HELP command now lists every SET key with a short description,
 //   instead of showing a "key settings" subset. No behavior changes.
@@ -23,7 +40,7 @@
 #include <vector>
 #include <cctype>
 
-#define MISSINGCHANS_BUILD "2026-05-21+r7 (robust 319 + case-insensitive chans + 443 fallback; expanded HELP)"
+#define MISSINGCHANS_BUILD "2026-05-21+r8 (robust 319 + case-insensitive chans + 443 fallback; voiced-channel parser fix)"
 
 // Case-insensitive ordering for CString (good enough for typical channel names)
 struct CStringCI {
@@ -317,11 +334,56 @@ private:
         return "all";
     }
 
+    // Strip leading user-mode prefixes from a WHOIS-channel-list token, leaving
+    // the channel name. Handles the ambiguity that '+' and '&' can appear as
+    // EITHER a user-mode prefix OR a channel-type prefix:
+    //
+    //   "#chan"     -> "#chan"             (no user-mode prefix)
+    //   "+#chan"    -> "#chan"             (voiced in #chan)  <-- the r8 fix
+    //   "@#chan"    -> "#chan"             (op in #chan)
+    //   "~&@#chan"  -> "#chan"             (owner+admin+op in #chan)
+    //   "+chan"     -> "+chan"             (modeless channel)
+    //   "&chan"     -> "&chan"             (local channel)
+    //   "+&chan"    -> "&chan"             (voiced in local channel)
+    //
+    // Disambiguation rule: a leading '+' or '&' is treated as a user-mode prefix
+    // iff the next character is itself prefix-like ('~','@','%','+','&','#','!').
+    // Otherwise the '+' or '&' IS the channel-type prefix and we stop there.
+    //
+    // Returns the empty string if the result does not start with a recognized
+    // channel-type prefix character ('#','&','!','+'), so the caller cannot
+    // silently insert garbage tokens.
     static CString StripPrefix(CString s) {
-        while (!s.empty()) {
+        while (s.size() >= 2) {
             const char c = s[0];
-            if (c == '#' || c == '&' || c == '+' || c == '!') break;
-            s.erase(0, 1);
+            const char next = s[1];
+
+            // Unambiguous user-mode prefix characters.
+            if (c == '~' || c == '@' || c == '%') {
+                s.erase(0, 1);
+                continue;
+            }
+
+            // '+' and '&' are ambiguous: user-mode prefix OR channel-type prefix.
+            if (c == '+' || c == '&') {
+                const bool nextIsPrefixLike =
+                    (next == '~' || next == '@' || next == '%' ||
+                     next == '+' || next == '&' ||
+                     next == '#' || next == '!');
+                if (nextIsPrefixLike) {
+                    s.erase(0, 1);
+                    continue;
+                }
+            }
+
+            // Either c is a channel-type prefix (we stop) or c is junk (caller filters).
+            break;
+        }
+
+        // Final shape check: a real channel name must start with a channel-type
+        // prefix. If we ended up with anything else, refuse it.
+        if (s.empty() || (s[0] != '#' && s[0] != '&' && s[0] != '!' && s[0] != '+')) {
+            return CString();
         }
         return s;
     }

@@ -1,6 +1,6 @@
-# missingchans
-
 See [CHANGELOG.md](./CHANGELOG.md) for version history and release notes.
+
+# missingchans
 
 [`missingchans`](./src/missingchans.cpp) is a ZNC network module that verifies whether the channels you **expect** to be on are actually joined on the **IRC server**, and can optionally retry joins for anything that is still missing.
 
@@ -91,6 +91,7 @@ That combination is what makes the module suitable for “make sure everything g
 - Optional `StopPerformOn` sentinel channel to suppress further `perform` retries once a key channel is confirmed joined.
 - Reuses channel keys from ZNC channel configuration when re-sending `JOIN`.
 - Case-insensitive channel comparison.
+- User-mode-aware WHOIS parsing: channels you are voiced (`+`), op (`@`), halfop (`%`), admin (`&`), or owner (`~`) in are correctly recognized as the same channel, not as separate prefixed entries.
 - Extra fallback learning from numeric `443` (“already on channel”).
 - Persistent configuration via ZNC module NV storage.
 
@@ -99,8 +100,8 @@ That combination is what makes the module suitable for “make sure everything g
 ## Module identity
 
 - **Module name:** `missingchans`
-- **Source file:** `missingchans.cpp`
-- **Current build marker in source:** `2026-02-11+r6 (robust 319 + case-insensitive chans + 443 fallback)`
+- **Source file:** `missingchansv8.cpp`
+- **Current build marker in source:** `2026-05-21+r8 (robust 319 + case-insensitive chans + 443 fallback; voiced-channel parser fix)`
 
 The module advertises itself as:
 
@@ -113,7 +114,7 @@ The module advertises itself as:
 ### Build
 
 ```bash
-znc-buildmod missingchansv6.cpp
+znc-buildmod missingchansv8.cpp
 ```
 
 This should produce a module shared object suitable for your ZNC installation.
@@ -599,6 +600,14 @@ being treated as different entries during expected/actual comparison.
 ### Robust WHOIS 319 parsing
 
 The module concatenates WHOIS parameters from index 2 onward before splitting the channel list. This is more tolerant of parser/layout differences in the `319` reply.
+
+### User-mode prefix handling
+
+WHOIS `319` channel-list tokens often carry your user-mode prefix in each channel — for example, a token of `+#chan` means "voiced in `#chan`", `@#chan` means "op in `#chan`", and `~&@#chan` means "owner + admin + op in `#chan`".
+
+The module strips these user-mode prefixes from each token so that the underlying channel name is compared against the expected list. The tricky cases are `+` and `&`, because each of those characters can appear either as a user-mode prefix (voice / admin) *or* as a channel-type prefix (modeless channels / local channels).
+
+The parser disambiguates by looking at the character that follows: a leading `+` or `&` is treated as a user-mode prefix only when the next character is itself another prefix character or a clear channel-type prefix (`#`, `!`). Otherwise the `+` or `&` is treated as the channel-type prefix and parsing stops there. This correctly handles `+#chan` (voiced in `#chan`), `&#chan` (admin in `#chan`), `+chan` (modeless channel), `&local` (local channel), and combinations like `@+modeless` (op in a modeless channel).
 
 ### Client-attach notice
 
