@@ -1,7 +1,7 @@
 /*
  * delayedperform.cpp — ZNC module to run post-connect commands with delays.
  *
- * Version: 1.1.1  (see DELAYED_PERFORM_VERSION below; also queryable via
+ * Version: 1.1.3  (see DELAYED_PERFORM_VERSION below; also queryable via
  *                  the 'Version' command and shown in 'Help').
  *
  * Features:
@@ -42,7 +42,7 @@
 using std::vector;
 
 // --- Version string (queryable; see CmdVersion / TModInfo / MODULEDEFS) ---
-#define DELAYED_PERFORM_VERSION "1.1.1"
+#define DELAYED_PERFORM_VERSION "1.1.3"
 
 class CDelayedPerformModule;
 
@@ -69,9 +69,11 @@ class CCmdTimer final : public CTimer {
 class CDelayedPerformModule final : public CModule {
   public:
     MODCONSTRUCTOR(CDelayedPerformModule) {
-      AddHelpCommand();
+      // No AddHelpCommand(): it registers ZNC's generic "Help" first, which
+      // made the AddCommand("Help", ...) below fail and CmdHelp unreachable.
+      // CmdHelp delegates to HandleHelpCommand() when given a filter.
       AddCommand("Help",      static_cast<CModCommand::ModCmdFunc>(&CDelayedPerformModule::CmdHelp),
-                 "", "Show detailed help.");
+                 "[filter]", "Show detailed help, or list commands matching a filter.");
       AddCommand("Version",   static_cast<CModCommand::ModCmdFunc>(&CDelayedPerformModule::CmdVersion),
                  "", "Show the module version.");
       AddCommand("SetDelay",  static_cast<CModCommand::ModCmdFunc>(&CDelayedPerformModule::CmdSetDelay),
@@ -81,7 +83,7 @@ class CDelayedPerformModule final : public CModule {
                  "Add a command. Accepts raw IRC or common '/'-style shorthands.");
       AddCommand("AddSecret", static_cast<CModCommand::ModCmdFunc>(&CDelayedPerformModule::CmdAddSecret),
                  "[seconds] <irc-or-slash-command>",
-                 "Same as Add, but the command text is hidden in List and log output.");
+                 "Same as Add, but the command text is masked in module output. Not encryption; do not use for credentials.");
       AddCommand("List",      static_cast<CModCommand::ModCmdFunc>(&CDelayedPerformModule::CmdList),
                  "", "List configured commands with their effective delays.");
       AddCommand("Del",       static_cast<CModCommand::ModCmdFunc>(&CDelayedPerformModule::CmdDel),
@@ -130,14 +132,21 @@ class CDelayedPerformModule final : public CModule {
 
     // -------- User-visible commands --------
 
-    void CmdHelp(const CString& /*sLine*/) {
+    void CmdHelp(const CString& sLine) {
+      // With a filter (e.g. "Help add"), keep ZNC's standard filtered table.
+      if (!sLine.Token(1).empty()) {
+        HandleHelpCommand(sLine);
+        return;
+      }
+
       PutModule("delayedperform " DELAYED_PERFORM_VERSION
                 " — run post-connect IRC commands with delays.");
       PutModule("Usage:");
+      PutModule("  Help [filter]                — Show this help, or commands matching a filter.");
       PutModule("  Version                      — Show the module version.");
       PutModule("  SetDelay <seconds>           — Set global default delay.");
       PutModule("  Add [seconds] <command>      — Raw IRC or shorthands like /msg, /join.");
-      PutModule("  AddSecret [seconds] <cmd>    — Like Add, but command text is hidden in output.");
+      PutModule("  AddSecret [seconds] <cmd>    — Like Add, but command text is masked in module output.");
       PutModule("  List                         — Show index, per-cmd delay, and command.");
       PutModule("  Del <index|all>              — Delete by index or everything.");
       PutModule("  Clear                        — Same as Del all.");
@@ -145,7 +154,7 @@ class CDelayedPerformModule final : public CModule {
       PutModule("            /ctcp /me (/me needs a target) /whois /away /oper /raw /quote");
       PutModule("            /ns /cs /hs /ms /os /bs (service aliases).");
       PutModule("Vars: %nick% expands to your current IRC nick at send time (e.g., '*%nick%*').");
-      PutModule("Use AddSecret for entries that contain passwords (NickServ IDENTIFY, OPER, ...).");
+      PutModule("AddSecret masks output only; it is not encryption. Do not use this module for passwords or other credentials.");
     }
 
     void CmdVersion(const CString& /*sLine*/) {
@@ -531,7 +540,11 @@ class CDelayedPerformModule final : public CModule {
     // is left unmodified and the caller must not transmit it.
     bool ExpandVars(const CString& in, CString& out) {
       out = in;
-      if (out.Find("%nick%") < 0) return true;   // no substitution needed
+      // CString::Find returns size_t, so compare against npos (a "< 0" test
+      // is always false). Match case-sensitively, like Replace() below, so
+      // only commands that will actually be substituted are nick-validated.
+      if (out.Find("%nick%", CString::CaseSensitive) == CString::npos)
+        return true;                             // no substitution needed
       if (!GetNetwork()) return true;            // nothing we can substitute
 
       CString curr = GetNetwork()->GetIRCNick().GetNick();
@@ -675,7 +688,7 @@ class CDelayedPerformModule final : public CModule {
         CString b = s.Token(2);
         if (a.empty() && b.empty()) return false;
         if (!a.empty() && b.empty()) { out = "WHOIS " + a; return true; }
-        bool bLooksServer = (b.Find(".") >= 0) || (b.Find(":") >= 0);
+        bool bLooksServer = (b.Find(".") != CString::npos) || (b.Find(":") != CString::npos);
         if (bLooksServer) out = "WHOIS " + b + " " + a; else out = "WHOIS " + a + " " + b;
         return true;
       }

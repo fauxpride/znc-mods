@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.1.3] — 2026-09-11
+
+This release makes the module's own `Help` output reachable and fixes the argument order of two-argument `/whois` shorthands. Built with `-Wall -Wextra` without module warnings and runtime-tested against ZNC 1.9.1; also compiles with `znc-buildmod` against ZNC 1.9.0.
+
+### Changed
+- **`Help` output.** Without an argument, `Help` now shows the module's usage help: the version, a summary of each command, the supported slash shorthands, and the `%nick%` variable. With an argument, such as `Help add`, it shows ZNC's standard filtered command table, exactly as before. The `Help` command is now registered with a `[filter]` argument and the description "Show detailed help, or list commands matching a filter.", and the usage help includes a matching `Help [filter]` line.
+
+### Fixed
+- **The module's help text was unreachable.** The constructor called `AddHelpCommand()`, which registers ZNC's generic `Help` command, before registering the module's own `Help`. Because command names are matched case-insensitively, the second `AddCommand("Help", ...)` failed silently and `CmdHelp()` never ran; 1.1.1 and 1.1.2 showed only ZNC's generated command table. The `AddHelpCommand()` call is removed, and `CmdHelp()` passes filtered requests to `HandleHelpCommand()`.
+- **Two-argument `/whois` swapped its arguments.** The test for a server-like second argument, `(b.Find(".") >= 0) || (b.Find(":") >= 0)`, compared unsigned (`size_t`) results with zero and was always true, so every two-argument `/whois a b` was stored as `WHOIS b a`. For example, `/whois irc.server.net nick` became `WHOIS nick irc.server.net`, and `/whois nick1 nick2` became `WHOIS nick2 nick1`. The test now compares with `CString::npos`.
+- **Version-check documentation.** Because `Help` shows the version again, the README lists it alongside `Version` and `ListAvailMods`. The 1.1.0 entry below states that the version is visible from `ListMods`; in ZNC 1.9.x, `ListMods` shows only module names and arguments, and the version appears in the module description shown by `ListAvailMods`.
+
+### Compatibility
+- **Existing `/whois` entries are not corrected automatically.** Slash shorthands are converted to raw IRC when an entry is added, and only the raw line is stored. Entries added in 1.1.2 or earlier with a two-argument `/whois` whose second argument contains neither `.` nor `:` keep the swapped order; delete and re-add them.
+- **Help output.** Anything that parses the unfiltered `Help` output will now receive the module's usage help instead of ZNC's generated table. Filtered `Help <filter>` output is unchanged except for the row describing `Help` itself.
+- **Storage format is unchanged.** Entries in the 1.1 format and the 1.0.0 legacy format load as before.
+- **ZNC compatibility.** Runtime-tested against ZNC 1.9.1; compiles against ZNC 1.9.0. No ZNC API changes were required.
+
+---
+
+## [1.1.2] — 2026-09-11
+
+This release fixes the `%nick%` short-circuit that 1.1.1 described but never performed, and withdraws the guidance that recommended `AddSecret` for credentials. Built with `-Wall -Wextra` and runtime-tested against ZNC 1.9.1; also compiles with `znc-buildmod` against ZNC 1.9.0.
+
+### Changed
+- **`AddSecret` help text.** The `AddSecret` description shown by `Help` now reads "Same as Add, but the command text is masked in module output. Not encryption; do not use for credentials." The corresponding lines in `CmdHelp()` were updated with equivalent wording.
+- **README.** Added a *Credentials and secrets* section; removed examples that used `AddSecret` for `NickServ IDENTIFY` and `OPER`; documented that `%nick%` is case-sensitive and that commands without it are never subject to nick validation.
+
+### Fixed
+- **Nick validation blocked commands that do not use `%nick%`.** `ExpandVars()` was meant to return early when a command contains no `%nick%`, but the test `out.Find("%nick%") < 0` compared the unsigned (`size_t`) result with zero and was always false. Every command therefore fetched and validated the current nick, and when that nick failed `IsValidIRCNick()` (for example, a non-ASCII nick on a network that permits one), every entry was skipped with `Skipped (invalid nick for expansion)`, including entries with no `%nick%`. The test now compares with `CString::npos`. The 1.1.1 entry below states that non-`%nick%` commands no longer fetch or validate the nick; that behavior takes effect only as of this release.
+- **`%nick%` detection now matches substitution.** The presence check is case-sensitive, like `CString::Replace()`. A command containing only another casing, such as `%NICK%`, is still sent literally and is no longer subject to nick validation.
+- **README version-check instructions.** `Help` does not display the module version, and `ListMods` does not display module descriptions. The README now points to `Version` and `ListAvailMods`.
+
+### Security
+- **Credential guidance corrected.** `Help` and the README previously recommended `AddSecret` for `NickServ IDENTIFY` and `OPER`. They now state that `AddSecret` only masks the module's own output and advise against storing credentials in the module: the stored value is recoverable base64, the line typed to add an entry is shown and possibly logged by the IRC client and relayed by ZNC to other attached clients, and the command is sent as an ordinary message to a nickname after registration. This is a documentation and help-text change only; existing secret entries behave as before.
+
+### Compatibility
+- **Storage format is unchanged.** Entries in the 1.1 format (`<delay>|<flags>|<base64>`) and the 1.0.0 legacy format (`<delay>|<base64>`) load as before, and unknown flag characters are still preserved on rewrite.
+- **Runtime behavior.** With a nick that passes `IsValidIRCNick()`, behavior is identical to 1.1.1. When the current nick fails validation, commands without `%nick%` are now sent instead of skipped; commands with `%nick%` are still skipped.
+- **ZNC compatibility.** Runtime-tested against ZNC 1.9.1; compiles against ZNC 1.9.0. No ZNC API changes were required.
+
+---
+
 ## [1.1.1] — 2026-04-20
 
 This release properly addresses the `%nick%`-expansion hardening that was misidentified in 1.1.0, and reverts a behavior (delay caps) that had been introduced without being requested. Built and runtime-tested against ZNC 1.9.1.

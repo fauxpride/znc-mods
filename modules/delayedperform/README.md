@@ -6,7 +6,7 @@ It is designed for the cases where a normal `perform`-style burst is too aggress
 
 This makes it especially useful in situations where sending too many messages at once via `perform` can cause throttling, particularly when you need to rejoin many channels after reconnecting.
 
-Current version: **1.1.1** — see [`CHANGELOG.md`](./CHANGELOG.md).
+Current version: **1.1.3** — see [`CHANGELOG.md`](./CHANGELOG.md).
 
 ---
 
@@ -36,9 +36,34 @@ In other words, this is a **delayed, persistent, per-network perform queue**.
 - Override the delay **per command**
 - Accept both raw IRC commands and common slash-style commands
 - Expand `%nick%` at send time using the **current IRC nick**, with strict IRC nick-grammar validation before splicing
-- Mark individual entries as **secret** so their text is hidden in `List` and in the module's echo output (useful for `NickServ IDENTIFY`, `OPER`, etc.)
+- Mask individual entries with `AddSecret` so their text does not appear in `List` or in the module's own output (masking only; see [Credentials and secrets](#credentials-and-secrets))
 - Reject commands containing CR, LF, or NUL characters before storing them (and again before sending)
 - Clean up scheduled timers on disconnect so reconnects do not pile up stale jobs
+
+---
+
+## Credentials and secrets
+
+> [!WARNING]
+> Do not use `delayedperform` to log in to services or to send any command that contains a secret, such as a password, an oper credential, or a channel key. `AddSecret` is not encryption and does not make this safe.
+
+`AddSecret` masks a command's text only in output that the module itself produces: the `Added`, `List`, `Ran:`, and `Skipped` messages. It does not protect the secret anywhere else:
+
+- **The stored command is recoverable.** Every entry, secret or not, is stored base64-encoded in the network's ZNC module data. Base64 is an encoding, not encryption. Anyone who can read the ZNC data directory, or a backup of it, can decode the command in one step.
+- **The command is exposed when you add it.** The line you type, for example `AddSecret 4 /ns IDENTIFY <password>`, is an ordinary message to `*delayedperform`. Your IRC client displays it and may log it. Before the module receives it, ZNC also relays it to other attached clients that negotiated `znc.in/self-message`, and back to your own client if it negotiated `echo-message`.
+- **The command is sent to a nickname after you are online.** A login such as `/ns IDENTIFY` is delivered as a regular `PRIVMSG` to a service nickname after the connection has registered. If the service is unreachable, for example during a netsplit, and the network does not reserve that nickname, the message can reach whoever holds it. Until the command fires, you are on the network unauthenticated.
+- **The command appears in debug output.** When ZNC runs with `--debug`, it redacts only `PASS` lines, so the full command text is written to the debug log.
+
+### What to use instead
+
+Authenticate during connection registration instead of after it:
+
+- **SASL**, through ZNC's `sasl` module, where the network supports it. With the `EXTERNAL` mechanism and the `cert` module, no password is stored at all.
+- **Server-password login**, where the network offers it (for example, Undernet's Login on Connect), configured in the network's server entry.
+
+Both methods authenticate before you are visible on the network and deliver the credential to the server rather than to a nickname. Except for SASL `EXTERNAL`, they still store a password in ZNC's configuration, so protect the ZNC data directory and its backups accordingly.
+
+`AddSecret` remains useful for keeping non-credential text out of the module's output, such as the names of channels you prefer not to display on every attached client.
 
 ---
 
@@ -57,12 +82,13 @@ If you normally use `perform` to join a long list of channels, all those `JOIN`s
 
 ### Delaying service messages until a few seconds after connect
 
-Use `AddSecret` for lines that contain credentials so their text is not echoed back to any attached client or included in `List` output:
+Some service commands, such as requesting ops from ChanServ, work more reliably once the connection has settled and authentication has completed:
 
 ```text
-/msg *delayedperform AddSecret 4 /ns IDENTIFY hunter2
 /msg *delayedperform Add 6 /cs OP #channel mynick
 ```
+
+Authenticate with SASL or a server-password login rather than a delayed `IDENTIFY`. See [Credentials and secrets](#credentials-and-secrets).
 
 ### Sending commands that depend on the current nick
 
@@ -116,15 +142,15 @@ This is a **network module**, so its configuration is intended to be separate pe
 
 ### Checking the installed version
 
-Once loaded, the module's version is visible from three places:
+Once loaded, you can check the module's version from IRC in three ways:
 
 ```text
 /msg *delayedperform Version
 /msg *delayedperform Help
-/msg *status ListMods
+/msg *status ListAvailMods
 ```
 
-`Version` returns something like `delayedperform version 1.1.1`. `Help` shows the version in its header. `ListMods` shows the description, which ends in `v1.1.1`.
+`Version` returns a line such as `delayedperform version 1.1.3`. `Help` shows the version in its first line. `ListAvailMods` lists every available module with its description; the `delayedperform` description ends in `v1.1.3`. `ListMods` shows only module names and arguments, so it does not include the version.
 
 ---
 
@@ -133,7 +159,7 @@ Once loaded, the module's version is visible from three places:
 Interact with the module through its module window:
 
 ```text
-/msg *delayedperform Help
+/msg *delayedperform Help [filter]
 /msg *delayedperform Version
 /msg *delayedperform SetDelay <seconds>
 /msg *delayedperform Add [seconds] <irc-or-slash-command>
@@ -143,9 +169,16 @@ Interact with the module through its module window:
 /msg *delayedperform Clear
 ```
 
-### `Help`
+### `Help [filter]`
 
-Shows built-in usage help, including the current module version.
+Without an argument, shows the module's usage help: the module version, a summary of each command, the supported slash shorthands, and the `%nick%` variable.
+
+With an argument, lists only the commands whose names start with or match the filter, with their arguments and descriptions. The filter is case-insensitive and accepts `*` and `?` wildcards.
+
+```text
+/msg *delayedperform Help
+/msg *delayedperform Help add
+```
 
 ### `Version`
 
@@ -188,23 +221,23 @@ Added [2]: delay=5s, cmd=JOIN #znc
 
 ### `AddSecret [seconds] <irc-or-slash-command>`
 
-Like `Add`, but the entry is flagged as secret. The behavior is identical at fire time (the full decoded command is still sent to IRC), but the module hides the text everywhere else:
+Like `Add`, but the entry is flagged as secret. The command sent to IRC at fire time is unchanged; only the module's own output masks its text:
 
 - the confirmation when you add it shows `cmd=[hidden]` instead of the actual text
 - `List` shows `[hidden]` in the command column
 - the `Ran:` echo that fires when the timer runs says `Ran: [hidden]` instead of the full line
 - the `Skipped (not connected)` / `Skipped (contains control chars)` / `Skipped (invalid nick for expansion)` messages also say `[hidden]`
 
-Use this for any entry that contains credentials:
+Example:
 
 ```text
-/msg *delayedperform AddSecret 4 /ns IDENTIFY hunter2
-/msg *delayedperform AddSecret 6 /oper myname verystrongpassword
+/msg *delayedperform AddSecret 6 /join #private-channel
 ```
 
 The stored command is still subject to the same control-character rejection as `Add`.
 
-Note: the underlying storage is still base64 on disk; `AddSecret` is about keeping credentials out of the module's visible output and logs, not about encrypting them at rest. See [Operational notes](#important-operational-notes).
+> [!IMPORTANT]
+> `AddSecret` masks output. It does not encrypt the stored command, hide the line you typed to add it, or change how the command is sent. Do not use it for passwords or other credentials. See [Credentials and secrets](#credentials-and-secrets).
 
 ### `List`
 
@@ -255,7 +288,7 @@ Supported shorthands include:
 - `/invite`
 - `/ctcp`
 - `/me` *(requires an explicit target)*
-- `/whois`
+- `/whois` *(with two arguments, a second argument containing `.` or `:` is treated as a server and sent first; otherwise the arguments are sent in the order given)*
 - `/away`
 - `/oper`
 - `/raw`
@@ -294,6 +327,8 @@ The module supports:
 
 - `%nick%` — expands to the current IRC nick **at send time**, if and only if that nick conforms to IRC nick grammar
 
+The variable name is case-sensitive. Only the lowercase form `%nick%` is expanded; `%NICK%`, `%Nick%`, and other casings are sent literally.
+
 Expansion does **not** happen when the command is added. It happens right before the timer sends the line. That means the module uses your live nick at execution time, which is useful after reconnects or fallback-nick scenarios.
 
 Before substituting, the module validates the current IRC nick against IRC nick grammar (letters, digits, and the RFC 2812 "special" characters ``[ ] \ ` _ ^ { | }`` plus hyphen). If the nick contains anything outside that set — space, `:`, `,`, `@`, CR, LF, or anything else that could split the IRC line — the command is **not** sent, and the module logs:
@@ -301,6 +336,8 @@ Before substituting, the module validates the current IRC nick against IRC nick 
 ```text
 Skipped (invalid nick for expansion): <the stored command>
 ```
+
+The check applies only to commands that contain `%nick%`. Commands without it are sent regardless of the current nick.
 
 In practice your nick will almost always be fine; this check is defense in depth against malformed/hostile server input.
 
@@ -342,9 +379,9 @@ The module refuses to splice a non-conforming nick into a stored command. This c
 
 If the IRC connection drops before the delayed commands fire, the module removes any pending timers. On the next connection, it schedules a fresh set from stored configuration. When a timer does fire, the module also removes its internal reference to that timer so no stale pointers hang around between connect cycles.
 
-### `AddSecret` hides the text from the module window, not from disk
+### `AddSecret` masks output; it does not protect secrets
 
-The on-disk storage is still base64-encoded, which is obfuscation, not encryption. Anyone with filesystem access to your ZNC's data directory can recover the stored command text. `AddSecret` is aimed at the much more common exposure vector: the module's `PutModule()` output is broadcast to every IRC client currently attached to your ZNC user, and typical IRC clients log module-window text to disk by default. `AddSecret` keeps sensitive commands out of that channel.
+Command replies such as `Added` and `List` go to the client that sent the command, timer messages such as `Ran:` go to every client attached to the network, and many IRC clients log module windows. `AddSecret` keeps a command's text out of that output and nothing more. The stored value is still recoverable base64, the line you typed to add the entry is not masked, and the command is sent unchanged. Do not store credentials in this module. See [Credentials and secrets](#credentials-and-secrets).
 
 ### Duplicate behavior is your responsibility
 
@@ -386,9 +423,11 @@ you can configure:
 ### 2. Keep service commands slightly behind the initial connect burst
 
 ```text
-/msg *delayedperform AddSecret 3 /ns IDENTIFY hunter2
+/msg *delayedperform Add 3 /cs OP #channel mynick
 /msg *delayedperform Add 5 /msg ChanFix REQUEST #channel
 ```
+
+This assumes you authenticate during connection registration, for example with SASL, rather than with a delayed `IDENTIFY`.
 
 ### 3. Use a global default delay for convenience
 
@@ -446,7 +485,7 @@ Each command entry is stored in one of two formats:
 
 The `<flags>` segment is a short string of single-character flags. Currently defined flags:
 
-- `s` — entry is secret (its text is hidden in `List` and module output)
+- `s` — entry is secret (its text is masked in `List` and module output; the stored value is not encrypted)
 
 Unknown flag characters are preserved through rewrites but otherwise ignored, leaving room to add more flags in future versions without breaking older configurations.
 
@@ -459,7 +498,7 @@ cmd.1 = 7|s|UFJJVk1TRyBOaWNrU2VydiA6SURFTlRJRlkgaHVudGVyMg==
 cmd.2 = 9|Sk9JTiAjbGVnYWN5-cm9tZS12MQ==      # legacy v1.0 entry, no flags segment
 ```
 
-Commands are base64-encoded before storage so the module can safely persist raw IRC lines without having to worry about embedded spaces or formatting quirks in the NV value. Base64 is an encoding, not an encryption — see the note on `AddSecret` above.
+Commands are base64-encoded before storage so the module can safely persist raw IRC lines without having to worry about embedded spaces or formatting quirks in the NV value. Base64 is an encoding, not encryption, and the secret flag does not change how a value is stored: `cmd.1` above decodes directly to `PRIVMSG NickServ :IDENTIFY hunter2`. See [Credentials and secrets](#credentials-and-secrets).
 
 ### Entry ordering
 
@@ -487,6 +526,8 @@ At present, the implemented variable is:
 The value comes from `GetNetwork()->GetIRCNick().GetNick()`, so the module deliberately uses the current nick at execution time rather than a stale nick captured when the command was configured.
 
 If the stored command does not contain `%nick%`, the nick is never fetched and never validated — non-`%nick%` commands pay no overhead and can never be blocked by nick validation. If the command does contain `%nick%`, the current nick must conform to IRC nick grammar (letters, digits, and ``[ ] \ ` _ ^ { | }`` plus hyphen); otherwise the module skips the send.
+
+The presence check uses `CString::Find(..., CString::CaseSensitive)` and compares the result with `CString::npos`, so it matches exactly what `CString::Replace()` substitutes. In 1.1.1 this check compared the unsigned result with zero, which never matched, so every command was validated; see [`CHANGELOG.md`](./CHANGELOG.md).
 
 ### Actual send path
 
@@ -546,7 +587,7 @@ A common split is:
 - The module does not inspect server feedback to dynamically slow itself down.
 - It does not automatically retry failed commands.
 - It is a scheduler, not a full queue manager with rate adaptation.
-- On-disk storage is base64-encoded, not encrypted.
+- On-disk storage is base64-encoded, not encrypted, and `AddSecret` masks output only. The module is not suitable for credentials.
 
 So the pacing is explicit and manual: you decide which commands run when.
 
@@ -556,7 +597,7 @@ So the pacing is explicit and manual: you decide which commands run when.
 
 - Use small staggered delays instead of one large pile at the same second.
 - Group the most important commands first.
-- Use `AddSecret` for anything containing a password or token, so the text does not appear in `List` or in any attached client's module window.
+- Keep passwords, tokens, and other credentials out of this module. Authenticate with SASL or a server-password login instead; see [Credentials and secrets](#credentials-and-secrets).
 - Prefer service aliases or slash shorthands when that makes maintenance easier.
 - Revisit your timings if the network changes its flood policy or your channel count grows.
 
