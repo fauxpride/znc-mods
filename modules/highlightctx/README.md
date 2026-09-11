@@ -2,7 +2,7 @@
 
 Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional `ignore_drop` integration.
 
-Current module version in source: **0.8.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes.
+Current module version in source: **0.9.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes.
 
 ---
 
@@ -57,7 +57,7 @@ At a high level, the module behaves like this:
 4. If a line contains your current nick as a proper nick-like highlight boundary match, the module starts a highlight event.
 5. It snapshots up to `before` earlier lines from that channel’s private ring.
 6. It stores the trigger line.
-7. It collects up to `after` later lines from that same channel.
+7. It collects up to `after` later lines from that same channel. If another qualifying highlight arrives in that channel during this step, it does **not** start a second, overlapping event: it is marked as an additional trigger inside the open event and extends the collection window (see [Overlapping highlights (extension)](#overlapping-highlights-extension)).
 8. When complete — or when interrupted by an attach/replay — the event is finalized.
 9. On attach, finalized events are replayed into `*highlightctx` and then cleared.
 
@@ -237,7 +237,7 @@ This behavior is one of the main implementation features of the module.
 
 ## Partial vs complete events
 
-An event is **complete** when the module successfully gathers the full configured number of trailing `after` lines.
+An event is **complete** when the module successfully gathers the full number of trailing `after` lines. For an event that was extended by a later highlight, that number is the extended target (a full `after` window past the latest trigger), not the original cap.
 
 An event is **partial** when replay occurs before enough trailing lines arrived, or when the module finalizes open events during attach/replay recovery.
 
@@ -574,7 +574,7 @@ This also trims existing in-memory rings to the new size.
 
 Sets the post-trigger context cap for **new events**.
 
-Already-open events keep the cap they started with.
+Already-open events keep the cap they started with. This also applies to extensions: when a later highlight extends an open event, the extra window uses the cap that event started with, not the current `SetAfter` value.
 
 ### `SetMaxEvents <count|0|off>`
 
@@ -708,7 +708,7 @@ A replayed event contains:
 1. an event header line
 2. the captured `before` lines
 3. the trigger line marked with `>>>`
-4. the captured `after` lines
+4. the captured `after` lines, where any additional trigger that extended the event is also marked with `>>>`
 5. a separator line between events
 
 Conceptually it looks like this:
@@ -717,9 +717,25 @@ Conceptually it looks like this:
 [#channel] highlight event #42 (complete, before=3, after=4/4)
 [#channel] <nick1> previous context
 [#channel] <nick2> more context
-[#channel] >>> <nick3> Tim: are you around?
+[#channel] >>> <nick3> fauxpride: are you around?
 [#channel] <nick4> follow-up line 1
 [#channel] <nick5> follow-up line 2
+```
+
+The header's `after=<collected>/<target>` shows how many trailing lines were collected against how many the event needed. For an event with a single trigger the target is the `after` cap, and the header is unchanged from earlier versions.
+
+An event that was extended by later highlights adds a `triggers=<n>` field, and every trigger line is marked. With `before=2 after=3`, a second highlight arriving as the second trailing line looks like this:
+
+```text
+[#channel] highlight event #43 (complete, before=2, after=5/5, triggers=2)
+[#channel] <nick1> previous context
+[#channel] <nick2> more context
+[#channel] >>> <nick3> fauxpride: are you around?
+[#channel] <nick4> follow-up line 1
+[#channel] >>> <nick5> fauxpride, also this
+[#channel] <nick6> follow-up line 3
+[#channel] <nick7> follow-up line 4
+[#channel] <nick8> follow-up line 5
 ```
 
 If native server-time replay is available, the client can show those lines with their original timestamps. Otherwise the module prefixes UTC timestamps inline.
@@ -824,6 +840,7 @@ Each captured line stores:
 - kind (`T`, `N`, `A`)
 - nick
 - text
+- an `extends_event` flag, set only on the copy stored in an event's `after` list when that line extended the event
 
 Each event stores:
 
@@ -831,6 +848,7 @@ Each event stores:
 - channel and lowercase channel key
 - start timestamp
 - `after` cap for that event
+- `after` target (starts at the cap; grows when a later trigger extends the event)
 - captured `before` lines
 - trigger line
 - captured `after` lines
@@ -842,7 +860,7 @@ Each event stores:
 The three exclusion kinds are checked at different points in the capture pipeline:
 
 1. **Channel exclusion** is checked first thing in `HandleIncoming`. An excluded channel returns immediately — no context, no ring, nothing.
-2. **Nick/mask exclusion** is checked only on the trigger path, *after* `FeedOpenEvents` has already fed the line into any already-open events on this channel, and *before* `StartEvent` is called. This is what produces the "excluded nick still contributes context but cannot start an event" semantic.
+2. **Nick/mask exclusion** is checked only on the trigger path, when classifying a line that highlights your nick. That classification happens *before* `FeedOpenEvents`, because a qualifying trigger extends an open event instead of starting a new one. An excluded sender's line is classified as ordinary context: it is still fed into any already-open events on this channel, but it can neither extend an open event nor reach `StartEvent`. This is what produces the "excluded nick still contributes context but cannot start an event" semantic.
 3. The channel ring buffer always receives every eligible (non-channel-excluded) line, including from excluded senders, so their messages remain available as `before` context for any future trigger.
 
 Nick/mask matching uses an iterative star-backtracking wildcard engine (`wildmatch_folded`), operating on RFC 1459-folded strings. Both the stored masks and the per-message sender samples are folded once; subsequent comparisons are byte-level. Nick-only masks match the sender's nickname; masks containing `!` or `@` match the full `nick!ident@host`.
@@ -867,9 +885,44 @@ Every incoming eligible channel line is appended to the channel ring after open-
 
 If the ring exceeds `before`, the oldest line is dropped.
 
+### Overlapping highlights (extension)
+
+Since 0.9.0, a highlight that lands inside an event that is still collecting its `after` lines extends that event rather than starting a second one.
+
+Before 0.9.0, every qualifying highlight started its own event. When a second highlight arrived inside the first event's `after` window, both events stayed open side by side, and every line inside both windows was replayed twice. With `before=8 after=8` and a second highlight four lines after the first, that meant two events sharing 13 lines. A burst of highlights produced one overlapping event per highlight.
+
+The current behavior, for each incoming eligible line in a channel:
+
+1. The line is classified as a **trigger** if it highlights your current nick, is not from your own nick, and the sender is not on the nick/mask exclusion list. These are exactly the lines that could start an event.
+2. The line is fed into every open event on that channel as an `after` line, as before.
+3. If the line is a trigger and the channel has an open event, the most recently started open event is **extended**:
+   - the line is marked as an additional trigger, so it replays with `>>>`
+   - the event's target becomes the trigger's position in `after` plus a full `after` window, using the cap the event started with
+   - a durable `X` journal record is appended
+4. Each open event whose `after` list has reached its target is finalized as complete.
+5. If the line is a trigger and no open event was extended, a new event starts as described under [Event start behavior](#event-start-behavior).
+
+Worked example with `before=8 after=8`, trigger `L0`, and a second trigger `L4`, the fourth line after it:
+
+- `L0` starts the event with `before` = the 8 ring lines and a target of 8.
+- `L4` is `after` line 4, so the target becomes 4 + 8 = 12.
+- The event completes at `L12` as `after=12/12, triggers=2`, with no duplicated lines.
+
+A third trigger at `L10` would push the target to 10 + 8 = 18.
+
+Details worth knowing:
+
+- **Extension is evaluated before the completion check.** A trigger arriving as the very last line of the window (for example the 8th `after` line with `after=8`) still extends the event instead of letting it finish and starting an overlapping one.
+- **A highlight after completion starts a new event.** It takes a normal `before` snapshot, which can include lines from the event that just finished.
+- **Excluded and self lines never extend.** Self lines and lines from nick/mask-excluded senders are ordinary context, just as they cannot start an event. Messages dropped by [`ignore_drop`](../ignore_drop/README.md) never reach `highlightctx` at all.
+- **Channels are independent.** A highlight in one channel never extends an event in another.
+- **`after=0` is unchanged.** Events finalize immediately and are never open, so each highlight is its own event.
+- **Extensions have no upper bound.** A channel that keeps highlighting you every few lines keeps one event open and growing until the highlights stop or you attach. This replaces the one-event-per-highlight growth of earlier versions and stores and replays fewer lines for the same traffic. A single extended event counts as one event towards `max_events`.
+- **Legacy journals converge to one event.** A journal written by 0.8.0 or earlier can contain several overlapping open events on the same channel. After upgrading, only the newest of them is extended by later triggers, and the older ones finish their original windows.
+
 ### Event start behavior
 
-When a non-self line highlights your nick AND the sender is not on the nick/mask exclusion list:
+When a non-self line highlights your nick, the sender is not on the nick/mask exclusion list, AND the line did not extend an already-open event on that channel:
 
 - a new event ID is allocated
 - channel metadata is stored
@@ -885,7 +938,8 @@ For every later eligible line in the same channel (regardless of sender — excl
 
 - each open event for that channel receives the line in its `after` vector
 - a durable journal `after` record is appended
-- once `after.size() >= after_cap`, the event is finalized
+- if the line is a qualifying trigger, the newest open event is extended and a durable journal `X` record is appended (see [Overlapping highlights (extension)](#overlapping-highlights-extension))
+- once `after.size() >= after_target`, the event is finalized
 
 ### Finalization behavior
 
@@ -934,8 +988,16 @@ The journal format uses a compact line-oriented record model with operations inc
 
 - `B` → begin event
 - `A` → append after-line
+- `X` → extend event: the `after` line at a given zero-based index was an additional trigger (added in 0.9.0)
 - `F` → finalize event
 - `D` → delivered event
+
+An `X` record is always written immediately after the `A` record it refers to, and compaction preserves that order. It stores only the event ID and the index; the extended target is recomputed on load as index + 1 + the event's `after` cap from its `B` record. `X` records whose event is unknown, whose index does not refer to an already-loaded `after` line, or that are malformed are ignored.
+
+Compatibility:
+
+- Journals written by 0.8.0 and earlier contain no `X` records and load unchanged.
+- 0.8.0 ignores unknown record types, so a 0.9.0 journal still loads after a downgrade. The extension marks and extended targets are lost, and open events finish at their original cap.
 
 Nick/text and some fields are hex-encoded so the journal can safely represent arbitrary IRC text without relying on raw delimiters being absent.
 
@@ -981,7 +1043,8 @@ Excluded channels and excluded nicks are stored in separate NV keys so 0.7.0 / 0
 - Capture does not happen while attached.
 - Excluded channels contribute neither triggers nor context.
 - Excluded nicks/masks can still contribute context but cannot start events. This is the intentional semantic difference from channel exclusion.
-- `SetAfter` affects only new events, not ones already open.
+- `SetAfter` affects only new events, not ones already open. Extensions of an open event also use the cap that event started with.
+- A highlight inside an open event's `after` window extends that event instead of starting an overlapping one; see [Overlapping highlights (extension)](#overlapping-highlights-extension).
 - In `auto` mode, arming now follows hook-order position rather than load-time presence:
   - if `ignore_drop` is ahead of `highlightctx` in the module list, `auto` arms automatically at the next re-check point
   - if `ignore_drop` is at or after `highlightctx` in the module list, `auto` does not arm

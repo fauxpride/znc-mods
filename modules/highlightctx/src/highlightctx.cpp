@@ -28,6 +28,22 @@
 //   with neither `!` nor `@` is matched against the sender's nickname only;
 //   a mask containing either is matched against the full `nick!ident@host`.
 //
+// Overlapping highlights (extension semantics, since 0.9.0):
+// - A qualifying trigger that arrives while an event on the same channel is
+//   still collecting its trailing lines does NOT start a second event.
+//   Instead it extends the open event: the line is recorded in that event's
+//   `after` list, marked as an additional trigger (shown with >>> on replay),
+//   and the event's trailing-line target is pushed out so that a full
+//   `after` window (using the cap the event started with) follows the new
+//   trigger. Repeated triggers keep extending the same event.
+// - This removes the duplicated context that overlapping events produced in
+//   0.8.0 and earlier, where every line inside both windows was replayed twice.
+// - Only a line that could have started an event can extend one: self lines
+//   and lines from nick/mask-excluded senders are context only.
+// - A trigger that arrives after the open event has already finalized starts
+//   a new event as before (with a normal `before` snapshot).
+// - Extensions are journaled as `X` records so they survive a restart.
+//
 // Notes:
 // - The "before" and "after" values are maxima, not guarantees.
 // - If you attach before enough trailing lines arrive, the event is replayed as partial.
@@ -84,7 +100,7 @@
 
 namespace {
 
-static const char* kModVersion = "highlightctx 0.8.0";
+static const char* kModVersion = "highlightctx 0.9.0";
 static const char* kJournalName = "highlightctx.journal";
 static const size_t kCompactThresholdLines = 512;
 
@@ -441,7 +457,7 @@ class CHighlightCtx : public CModule {
                    "Set the maximum number of messages to snapshot before a highlight trigger. This is a cap, not a guarantee; fewer lines may exist if the detached-only ring has less history.",
                    [this](const CString& sLine) { CmdSetBefore(sLine); });
         AddCommand("SetAfter", "<count>",
-                   "Set the maximum number of messages to collect after a highlight trigger. This is a cap, not a guarantee; if you attach before enough later traffic arrives, the event is replayed as partial.",
+                   "Set the maximum number of messages to collect after a highlight trigger. This is a cap, not a guarantee; if you attach before enough later traffic arrives, the event is replayed as partial. A further highlight inside an open event's after window extends that event by a fresh window of the cap the event started with, instead of starting an overlapping event.",
                    [this](const CString& sLine) { CmdSetAfter(sLine); });
         AddCommand("SetMaxEvents", "<count|0|off>",
                    "Set the maximum number of finalized pending events to keep at once. When the cap is reached the oldest event is silently dropped to make room. Use 0 or off to disable the cap entirely (the default).",
@@ -572,6 +588,11 @@ class CHighlightCtx : public CModule {
         char kind{'T'};
         CString nick;
         CString text;
+        // Set only on a copy stored in an event's `after` list, when that
+        // line was a qualifying highlight that extended the event. Never set
+        // on ring-buffer lines or on the primary trigger. Not part of the
+        // serialized line format; journaled separately as an `X` record.
+        bool extends_event{false};
     };
 
     struct Event {
@@ -580,6 +601,11 @@ class CHighlightCtx : public CModule {
         std::string channel_lc;
         long long started_ts{0};
         unsigned int after_cap{0};
+        // Number of trailing lines this event must collect before it is
+        // complete. Starts at after_cap and grows each time a later trigger
+        // extends the event: target = (index of that trigger in `after`) + 1
+        // + after_cap. Derived state; rebuilt from B/A/X records on load.
+        size_t after_target{0};
         std::vector<CaptureLine> before;
         CaptureLine trigger;
         std::vector<CaptureLine> after;
@@ -945,6 +971,29 @@ class CHighlightCtx : public CModule {
         return std::string("A\t") + std::to_string(id) + "\t" + SerializeLine(line);
     }
 
+    // X record: the after-line at zero-based `after_index` of event `id` is a
+    // trigger that extended the event. The new target is not stored; it is
+    // derived as after_index + 1 + after_cap from the event's B record.
+    static std::string SerializeExtend(unsigned long long id, size_t after_index) {
+        return std::string("X\t") + std::to_string(id) + "\t" + std::to_string(after_index);
+    }
+
+    // Apply an extension at `after_index` to `ev`. Shared by the live feed
+    // path and journal recovery so both compute the target identically.
+    static void ApplyExtension(Event& ev, size_t after_index) {
+        ev.after[after_index].extends_event = true;
+        const size_t new_target = after_index + 1 + static_cast<size_t>(ev.after_cap);
+        if (new_target > ev.after_target) ev.after_target = new_target;
+    }
+
+    static size_t CountExtensions(const Event& ev) {
+        size_t n = 0;
+        for (const auto& line : ev.after) {
+            if (line.extends_event) ++n;
+        }
+        return n;
+    }
+
     static std::string SerializeFinalize(unsigned long long id, bool partial) {
         return std::string("F\t") + std::to_string(id) + "\t" + (partial ? "1" : "0");
     }
@@ -996,6 +1045,7 @@ class CHighlightCtx : public CModule {
                 ev.channel_lc = lc(ev.channel);
                 ev.started_ts = started;
                 ev.after_cap = static_cast<unsigned int>(after_cap_ul);
+                ev.after_target = ev.after_cap;
 
                 if (!parts[5].empty()) {
                     std::vector<std::string> before_hex = split_char(parts[5], ',');
@@ -1020,6 +1070,22 @@ class CHighlightCtx : public CModule {
                 CaptureLine cl;
                 if (!DeserializeLine(parts[2], cl)) continue;
                 it->second.after.push_back(cl);
+                if (id > max_id) max_id = id;
+            } else if (op == "X") {
+                if (parts.size() != 3) continue;
+                char* endp1 = nullptr;
+                char* endp2 = nullptr;
+                unsigned long long id = std::strtoull(parts[1].c_str(), &endp1, 10);
+                unsigned long long idx = std::strtoull(parts[2].c_str(), &endp2, 10);
+                if (!endp1 || *endp1 != '\0' || !endp2 || *endp2 != '\0') continue;
+                if (parts[1].empty() || parts[2].empty()) continue;
+                auto it = all.find(id);
+                if (it == all.end()) continue;
+                // The X record is always written after the A record it refers
+                // to, so a valid index is already present. Ignore anything
+                // else (e.g. a torn write that lost the A record).
+                if (idx >= it->second.after.size()) continue;
+                ApplyExtension(it->second, static_cast<size_t>(idx));
                 if (id > max_id) max_id = id;
             } else if (op == "F") {
                 if (parts.size() != 3) continue;
@@ -1073,18 +1139,26 @@ class CHighlightCtx : public CModule {
             for (const auto& ev : by_chan.second) {
                 append_line(SerializeBegin(ev));
                 ++lines_written;
-                for (const auto& line : ev.after) {
-                    append_line(SerializeAfter(ev.id, line));
+                for (size_t i = 0; i < ev.after.size(); ++i) {
+                    append_line(SerializeAfter(ev.id, ev.after[i]));
                     ++lines_written;
+                    if (ev.after[i].extends_event) {
+                        append_line(SerializeExtend(ev.id, i));
+                        ++lines_written;
+                    }
                 }
             }
         }
         for (const auto& ev : m_pending) {
             append_line(SerializeBegin(ev));
             ++lines_written;
-            for (const auto& line : ev.after) {
-                append_line(SerializeAfter(ev.id, line));
+            for (size_t i = 0; i < ev.after.size(); ++i) {
+                append_line(SerializeAfter(ev.id, ev.after[i]));
                 ++lines_written;
+                if (ev.after[i].extends_event) {
+                    append_line(SerializeExtend(ev.id, i));
+                    ++lines_written;
+                }
             }
             append_line(SerializeFinalize(ev.id, ev.partial));
             ++lines_written;
@@ -1253,6 +1327,7 @@ class CHighlightCtx : public CModule {
         ev.channel_lc = lc(channel);
         ev.started_ts = trigger_line.ts_sec;
         ev.after_cap = m_after_max;
+        ev.after_target = ev.after_cap;
         ev.trigger = trigger_line;
 
         auto rit = m_ring_by_chan.find(ev.channel_lc);
@@ -1271,18 +1346,50 @@ class CHighlightCtx : public CModule {
         }
     }
 
-    void FeedOpenEvents(const CString& channel, const CaptureLine& line) {
+    // Feed a line into every open event on this channel.
+    //
+    // If `is_trigger` is true (the line is a qualifying highlight that would
+    // otherwise start a new event), the most recently started open event on
+    // the channel is extended instead: the line is marked as an additional
+    // trigger and that event's trailing-line target is pushed out to a full
+    // after_cap window past this line. The extension is applied BEFORE the
+    // completion check, so a trigger that lands on the last line of the
+    // window still extends the event rather than letting it finalize and
+    // starting an overlapping one.
+    //
+    // Only the newest open event is extended. With 0.9.0+ there is normally
+    // at most one open event per channel; more can exist only after loading
+    // a journal written by 0.8.0 or earlier, and extending just the newest
+    // lets the older overlapping ones run out and converge to one.
+    //
+    // Returns true if the line extended an open event (the caller must then
+    // NOT start a new event for it).
+    bool FeedOpenEvents(const CString& channel, const CaptureLine& line, bool is_trigger) {
         const std::string chan_l = lc(channel);
         auto it = m_open_by_chan.find(chan_l);
-        if (it == m_open_by_chan.end()) return;
+        if (it == m_open_by_chan.end()) return false;
+        if (it->second.empty()) {
+            m_open_by_chan.erase(it);
+            return false;
+        }
+
+        const size_t extend_idx = it->second.size() - 1;
+        bool extended = false;
 
         std::vector<Event> survivors;
         survivors.reserve(it->second.size());
 
-        for (auto& ev : it->second) {
+        for (size_t i = 0; i < it->second.size(); ++i) {
+            Event& ev = it->second[i];
             ev.after.push_back(line);
             AppendJournal(SerializeAfter(ev.id, line));
-            if (ev.after.size() >= ev.after_cap) {
+            if (is_trigger && i == extend_idx) {
+                const size_t idx = ev.after.size() - 1;
+                ApplyExtension(ev, idx);
+                AppendJournal(SerializeExtend(ev.id, idx));
+                extended = true;
+            }
+            if (ev.after.size() >= ev.after_target) {
                 FinalizeEvent(ev, false);
             } else {
                 survivors.push_back(ev);
@@ -1294,6 +1401,7 @@ class CHighlightCtx : public CModule {
         } else {
             it->second.swap(survivors);
         }
+        return extended;
     }
 
     template <typename TMsg>
@@ -1307,21 +1415,24 @@ class CHighlightCtx : public CModule {
 
         CaptureLine line = MakeCaptureLine(Message, kind);
 
-        // Feed already-open events first: excluded-nick messages are STILL
-        // valid context for other events that were triggered by someone
-        // else. This is the intentional difference from channel exclusion,
-        // which drops the channel entirely.
-        FeedOpenEvents(channel, line);
-
+        // Classify the line before feeding open events, because a qualifying
+        // trigger extends an open event instead of starting a second one.
+        // Nick-exclusion gate: an excluded sender cannot start (or extend)
+        // an event, but their messages are still fed into open events and
+        // the ring buffer as ordinary context.
         CString mynick = CurrentNick();
         bool is_self = (lc(line.nick) == lc(mynick));
-        if (!is_self && contains_nick_highlight(line.text, mynick)) {
-            // Nick-exclusion gate: an excluded sender cannot START a new
-            // event, but their earlier messages are still in this channel's
-            // ring buffer and are still being fed into any existing events.
-            if (!IsSenderExcluded(Message, line.nick)) {
-                StartEvent(channel, line);
-            }
+        bool is_trigger = !is_self && contains_nick_highlight(line.text, mynick) &&
+                          !IsSenderExcluded(Message, line.nick);
+
+        // Feed already-open events: excluded-nick messages are STILL valid
+        // context for other events that were triggered by someone else. This
+        // is the intentional difference from channel exclusion, which drops
+        // the channel entirely.
+        const bool extended = FeedOpenEvents(channel, line, is_trigger);
+
+        if (is_trigger && !extended) {
+            StartEvent(channel, line);
         }
 
         // The ring buffer always receives every eligible channel line,
@@ -1366,7 +1477,14 @@ class CHighlightCtx : public CModule {
             header += ", after=";
             header += CString(std::to_string(ev.after.size()));
             header += "/";
-            header += CString(std::to_string(ev.after_cap));
+            header += CString(std::to_string(ev.after_target));
+            // Only extended events get the extra field, so the header of an
+            // event with a single trigger is identical to 0.8.0.
+            const size_t extensions = CountExtensions(ev);
+            if (extensions > 0) {
+                header += ", triggers=";
+                header += CString(std::to_string(extensions + 1));
+            }
             header += ")";
             ReplayLineToClient(header, ev.started_ts);
 
@@ -1375,7 +1493,7 @@ class CHighlightCtx : public CModule {
             }
             ReplayLineToClient(FormatLineForReplay(ev.channel, ev.trigger, true, false), ev.trigger.ts_sec);
             for (const auto& line : ev.after) {
-                ReplayLineToClient(FormatLineForReplay(ev.channel, line, false, false), line.ts_sec);
+                ReplayLineToClient(FormatLineForReplay(ev.channel, line, line.extends_event, false), line.ts_sec);
             }
         }
 
@@ -1390,6 +1508,7 @@ class CHighlightCtx : public CModule {
         PutModule("It does not inspect the normal playback buffer, so it remains independent of normal channel buffer length and ordinary buffer replay settings.");
         PutModule("When a channel line mentions your current network nick while this network is detached, the module snapshots up to <before> earlier lines from its own per-channel RAM ring and then starts collecting up to <after> later lines.");
         PutModule("Both values are maximum caps, not guarantees. If you attach before enough later lines arrive, the event is replayed as partial with whatever was already recorded.");
+        PutModule("Overlapping highlights: if another qualifying highlight arrives in the same channel while an event is still collecting its after lines, no second event is started. The existing event is extended instead: that line is marked with >>> as an additional trigger, and the event keeps collecting until a full after window (using the after cap the event started with) has followed the latest trigger. The replay header then shows after=<collected>/<target> and triggers=<n>. Self lines and lines from nick/mask-excluded senders never extend an event. A highlight arriving after the event has already completed starts a new event as usual.");
         PutModule("Replay target: *highlightctx. When the current client supports IRCv3 server-time/time tags, replay is emitted as synthetic raw PRIVMSG lines with original @time values so the client can display historical timestamps natively. If the client does not support that, replay falls back to text prefixed with the original UTC timestamp.");
         PutModule("Events are sorted by channel name first, then by event time/id within each channel. A spacer line is added between events for readability.");
         PutModule("Persistence strategy: ordinary chatter stays only in RAM, while actual highlight events are durably journaled to disk as they happen. That keeps the hot path light but preserves active highlight captures across an unexpected VPS shutdown.");
