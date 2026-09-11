@@ -6,6 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.9.0] — 2026-09-11
+
+This release changes how overlapping highlights are captured.
+
+Until 0.8.0, every qualifying highlight started its own event, even when it arrived while an earlier event in the same channel was still collecting its trailing `after` lines. Both events then replayed every line inside both windows. With the defaults (`before=8 after=8`), a second highlight four lines after the first produced two events sharing 13 lines, and a burst of highlights produced one overlapping event per highlight.
+
+A highlight that lands inside an open event's `after` window now **extends** that event instead. The line is marked as an additional trigger, and the event keeps collecting until a full `after` window has followed the latest trigger. The same input now yields one event with no duplicated lines, and the on-disk journal stays backward compatible with 0.8.0 in both directions.
+
+Verified by a live-ZNC test harness on ZNC 1.9.0 and ZNC 1.9.1, including a full run under AddressSanitizer and UndefinedBehaviorSanitizer; see *Testing* below.
+
+### Added
+
+* **Extension of open events by later highlights.** When a line qualifies as a trigger and the channel already has an open event, that event is extended instead of a new one being started. The trigger line is recorded in the event's `after` list and marked as an additional trigger. The event's trailing-line target becomes that line's position in `after` plus the event's `after` cap. Repeated highlights keep extending the same event. See the README's *Overlapping highlights (extension)* section for the full rules and a worked example.
+* **New `X` journal record** (`X <event id> <after index>`), written immediately after the `A` record it refers to. It records that the given `after` line extended the event. The extended target is not stored; on load it is recomputed as index + 1 + the event's `after` cap from its `B` record. Compaction writes `X` records back in the same position, so extensions survive journal compaction, `/znc restart`, and crash recovery.
+* **`triggers=<n>` field in the replay header** for events that were extended, e.g. `(complete, before=8, after=12/12, triggers=2)`.
+* **`>>>` marker on additional triggers** inside the replayed `after` lines, in both native server-time replay and inline-timestamp fallback replay.
+* **`Overview` paragraph** describing overlapping-highlight handling.
+
+### Changed
+
+* **Trigger classification now happens before open events are fed.** `HandleIncoming` decides whether a line is a trigger (highlights your current nick, not from your own nick, sender not nick/mask-excluded) *before* calling `FeedOpenEvents`. This lets a trigger that arrives as the last line of an open event's window extend that event instead of letting it complete and starting an overlapping one. For lines that are not triggers, the processing order and results are unchanged.
+* **Completion check uses the event's target instead of its cap.** An event finalizes as complete once `after.size() >= after_target`. `after_target` starts equal to `after_cap` and only grows through extension, so unextended events complete exactly as before.
+* **Replay header `after=<collected>/<target>`** now shows the event's target. For unextended events the target equals the `after` cap, so their header text is byte-identical to 0.8.0. The `triggers=` field is appended only for extended events.
+* **`SetAfter` help text** notes that an extension adds a fresh window of the cap the event started with. As before, `SetAfter` affects only new events; extensions of an already-open event also use that event's original cap.
+* **Version marker bumped** from `highlightctx 0.8.0` to `highlightctx 0.9.0`.
+* **Module-header comment block** gains an "Overlapping highlights (extension semantics, since 0.9.0)" section.
+
+### Fixed
+
+* No bug fixes in this release. For traffic without overlapping highlights, capture, replay, and journal output are unchanged; this was verified by byte-for-byte comparison against 0.8.0 (see *Testing*).
+
+### Security
+
+* **No new externally reachable input.** The only new parser input is the `X` journal record, read from the module's own `0600` journal file. Both numeric fields must be non-empty and parse with `strtoull` to the end of the field. The index is then bounds-checked against the `after` lines already loaded for that event before it is used, which also rejects values such as `-1` that `strtoull` wraps to a huge number. Records for unknown events, out-of-range indices, and malformed or extra-field records are ignored. The extended target is computed in `size_t` from a 32-bit cap, so it cannot overflow on 64-bit builds.
+* **Lower resource cost under highlight spam.** Someone repeating your nick while you are detached previously created one event per message. Each later channel line was then fed into, and journaled (with `fsync`) for, every overlapping open event. Now the burst extends a single event, so each line is appended once, plus one small `X` record per extending highlight. In the live spam test, 30 consecutive highlights produced 300 journal appends and 510 replay lines on 0.8.0, versus 68 journal appends and 46 replay lines on 0.9.0.
+* **Extension is unbounded by design.** An event keeps growing for as long as highlights keep arriving inside its window. For any given traffic, the lines it stores and replays never exceed what 0.8.0 stored across its overlapping events.
+* **Exclusions and `ignore_drop` keep their protective meaning.** Lines from nick/mask-excluded senders cannot extend an event, just as they cannot start one. Lines dropped by [`ignore_drop`](../ignore_drop/README.md) never reach `highlightctx`.
+
+### Compatibility
+
+* **Upgrade from 0.8.0 (and earlier journal formats) requires no migration.** Existing `B`/`A`/`F`/`D` records load unchanged, and NV settings keys are unchanged.
+* **A 0.8.0 journal may contain several overlapping open events on the same channel.** After upgrading, later triggers extend only the newest of them; the older ones finish their original windows without being extended. The channel converges back to a single open event.
+* **Downgrade to 0.8.0 is safe but lossy for extensions.** 0.8.0 ignores unknown record types, so it loads a 0.9.0 journal without error. Extension marks and extended targets are lost, and open events finish at their original cap.
+* **Replay output for events with a single trigger is unchanged.** Anything that parses the replay header should tolerate the optional `, triggers=<n>` field before the closing parenthesis on extended events.
+* **Behavior change for overlapping highlights.** Where 0.8.0 replayed several overlapping events, 0.9.0 replays one extended event. No setting restores the old behavior.
+* **All commands and load arguments are unchanged.** The only command-surface differences are the `SetAfter` help description and the added `Overview` paragraph.
+* **ZNC compatibility.** No new ZNC API is used. Built with `znc-buildmod` and run against ZNC 1.9.0 (`znc-dev 1.9.0-2build3`) and ZNC 1.9.1 built from the upstream `znc-1.9.1` tag.
+
+---
+
 ## [0.8.0] — 2026-04-23
 
 This release extends the exclusion system to cover nicknames and `nick!ident@host` masks in addition to channels. The main operational need: suppressing a specific noisy user as a trigger source, without losing their surrounding messages as context around real triggers from other users. This is the key semantic difference from a channel exclusion (which drops the channel entirely): a nick/mask exclusion only prevents that sender from *starting* a new event; their messages still appear in before/after context for other users' triggers, which matches how an operator usually thinks about "this person spams my highlights but I still want to see what they said around a legitimate mention." Syntax and case-folding rules mirror [`ignore_drop`](../ignore_drop/README.md) so both modules interpret masks consistently, and the feature is verified by an automated test harness (83/83 passing against ZNC 1.9.0).
