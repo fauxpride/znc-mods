@@ -2,7 +2,7 @@
 
 Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional `ignore_drop` integration.
 
-Current module version in source: **0.9.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes.
+Current module version in source: **0.11.1**. See [CHANGELOG](./CHANGELOG.md) for per-release notes and [TESTING](./TESTING.md) for the test suite.
 
 ---
 
@@ -21,7 +21,7 @@ In practice, that means:
 - it only captures while the network has **no attached clients**
 - it keeps its own per-channel in-memory history for pre-highlight context
 - it does **not** inspect or depend on the normal ZNC channel/playback buffers
-- it journals real highlight events to disk as they happen, so active captures survive an unexpected ZNC/VPS interruption
+- it journals real highlight events to disk as they happen, so active captures survive an unexpected ZNC/VPS interruption — unless you turn journaling off with [`journal=off`](#journaloffon), in which case nothing is written to disk at all
 - it replays into `*highlightctx`, not into the channel windows
 - it clears delivered events after replay
 
@@ -261,6 +261,8 @@ Instead:
 
 This means the hot path stays lighter than a full detached log, while still protecting real highlight captures from being lost if ZNC or the VPS dies mid-capture.
 
+Journaling is on by default and can be turned off entirely with the [`journal=off`](#journaloffon) load argument.
+
 ### Journal file
 
 The module uses a journal file named:
@@ -280,12 +282,113 @@ The implementation uses append/replace patterns with `fsync()` and parent-direct
 The journal is compacted when needed, including:
 
 - after replay/clear
-- when it grows beyond the internal threshold
+- when it grows beyond the current trigger point
 - when `Compact` is called manually
 
-Internal threshold in the source:
+Internal constants in the source:
 
-- `kCompactThresholdLines = 512`
+- `kCompactThresholdLines = 512` — the floor for the trigger point
+- the trigger point itself is `max(512, 2 x lines written by the last compaction)`, recomputed after every successful compaction
+
+See [Compaction and large pending queues](#compaction-and-large-pending-queues) for why the trigger point is derived rather than fixed.
+
+### Disabling the journal
+
+Since 0.10.0, the load argument `journal=off` turns the durable journal off completely.
+
+With journaling disabled:
+
+- the journal file is **not read** at load, so nothing is recovered from a previous session
+- **nothing is written** to disk: no event records, no compaction, no temporary files
+- captured context — channel names, nicks, and message text — exists only in the module's memory until it is replayed to you
+
+The trade-off is durability. Open and pending events are lost on unload, restart, crash, or VPS shutdown, which is exactly the protection the journal exists to provide. Within a single session, capture and replay behave identically either way.
+
+Other properties worth knowing:
+
+- **The setting persists** in NV storage like the other settings, so reloading the module without arguments keeps it. Re-enable with `journal=on`.
+- **`Reset` never re-enables it.** Resetting settings to defaults deliberately leaves the journal setting alone, so it cannot silently resume writing highlight context to disk. `Reset` says which mode is in effect.
+- **An existing journal file is left alone**, not read and not deleted. `Status` reports that a leftover file exists, and `Compact` removes it on an explicit request.
+- **`Status` shows the active mode** and the journal path in both modes.
+
+This is a privacy and disk-hygiene control rather than a performance one. The most common reason to want it is that the journal persists real message text under the ZNC data directory, where it can reach backups and VPS snapshots; see [What it captures](#what-it-captures).
+
+---
+
+## Growth controls
+
+Everything the module keeps is a function of live state: the journal after compaction holds exactly the records needed to rebuild open and pending events, and nothing else. Bounding what is in memory therefore bounds what is on disk.
+
+Three settings do that, and each addresses a different way state grows.
+
+### `max_events` — how many events wait for replay
+
+Finalized events accumulate for as long as you stay detached. This is the dominant growth term: one event per highlight burst, with no natural end.
+
+The default is **100** since 0.11.0. Past that, the oldest pending event is dropped to make room, so a long absence leaves you with the 100 most recent highlights rather than the first 100.
+
+The binding constraint on this number is not memory or disk. A default-sized event is about 17 lines, which is roughly 7 KB in the journal and under 5 KB in memory, so even 1000 events would be about 7 MB on disk. The real limit is replay volume: 100 events is already around 1700 lines delivered to your client in one burst when you attach. That is a lot to read, and larger values get unwieldy fast.
+
+### `max_event_lines` — how large one event can grow
+
+Since 0.9.0, a highlight arriving inside an open event's `after` window [extends](#overlapping-highlights-extension) that event instead of starting a new one. Without a limit, a channel that keeps highlighting you keeps one event growing indefinitely.
+
+The default is **100** total lines, counting `before` + trigger + `after`.
+
+The cap limits extension only. An event always collects the full `before`/`after` window it started with, so no value of this setting can reduce the context you configured; setting it below the natural event size simply disables extension. When the cap stops an extension:
+
+- the trigger is still recorded and still marked `>>>`, and still counts in `triggers=`
+- the event's target does not grow
+- the header gains `capped`
+- once the event finalizes, the next highlight starts a fresh event
+
+So a sustained flood produces several bounded events instead of one unbounded one, and no highlight is lost. 100 lines allows roughly eleven extensions past a default window, which covers any realistic conversation in which someone keeps addressing you; beyond that, splitting into separate events is easier to read anyway.
+
+### `max_event_age` — how long events are kept
+
+Pending events are otherwise kept until you replay them, however old they are.
+
+The default is **off**, because the module exists to tell you what you missed, and discarding that by default would defeat it. If you are away for months, nothing expires unless you ask for it.
+
+Set it when the concern is retention rather than size: with journaling on, pending events are message text sitting on disk. `max_event_age=30d` drops anything older than 30 days without replaying it. Expiry runs at load, as traffic arrives, and immediately before replay.
+
+### Drops are always reported
+
+Whenever events are shed, for either reason, the count is reported at the top of your next replay:
+
+```text
+note: 12 older highlight event(s) were dropped before this replay (10 to stay within max_events=100, 2 expired after max_event_age=30d).
+```
+
+`Status` shows the same counters between replays, and they reset once reported. Before 0.11.0, `max_events` dropped events silently.
+
+### Resulting bound
+
+```text
+journal_bytes  ≈  (open_events + max_events) × max_event_lines × ~0.4 KB
+```
+
+`open_events` is bounded by your channel count: at most one event per channel is ever open at a time, because a highlight arriving while one is open extends it rather than starting another. With the defaults that is a worst case of roughly 4 MB, and typical use is far below it.
+
+Setting `journal=off` removes the on-disk term entirely; the in-memory bound still applies.
+
+### Compaction and large pending queues
+
+A compacted event occupies about 10 journal lines at default settings — the `before` lines live inside the `B` record rather than as separate lines — so a queue of 100 pending events is roughly 1000 journal lines.
+
+Up to 0.11.0, compaction was attempted whenever the journal exceeded a fixed 512 lines. Once live state alone exceeded that, a rewrite could not get below it, so the next appended line triggered another rewrite, and every eligible channel line cost a full journal rewrite with two `fsync` calls. Measured at stock defaults with 70 pending events: 10 rewrites per 10 channel lines.
+
+Since 0.11.1 the trigger point is derived from what the last compaction actually achieved:
+
+```text
+next compaction at  max(512, 2 x lines written by the last compaction)
+```
+
+The journal must therefore at least double before being rewritten again, so a compaction costing *L* line-writes is always preceded by at least *L* appends. Total rewrite work is proportional to the number of appends rather than to the queue size, at every scale. The same measurement on 0.11.1 gives 0 rewrites per 10 lines, and appending 160 events across about 1000 journal lines triggers a single compaction.
+
+The trade is that the file sits at up to twice the size of live state between compactions. With the default caps that peak is under 1 MB.
+
+Below 512 lines nothing changes: small journals compact exactly as before.
 
 ---
 
@@ -410,6 +513,17 @@ Maximum number of earlier lines to snapshot from the per-channel ring when a hig
 
 Maximum number of later lines to collect after the trigger.
 
+#### `journal=<off|on>`
+
+Controls whether highlight events are journaled to disk.
+
+- default is `on`
+- `off` keeps everything in memory only; nothing is written to disk
+- accepts the usual spellings: `on`/`off`, `1`/`0`, `yes`/`no`, `true`/`false`, `enable`/`disable`, `enabled`/`disabled`
+- any other value fails the module load with an explicit error
+- the value is stored in NV, so it survives a reload without arguments
+- see [Disabling the journal](#disabling-the-journal) for the trade-offs
+
 #### `require_ignore_drop=<off|on|auto>`
 
 Controls `ignore_drop` integration mode.
@@ -419,8 +533,28 @@ Controls `ignore_drop` integration mode.
 Maximum number of finalized pending events to keep at once.
 
 - `0` or `off` disables the cap
-- default is disabled
-- when the cap is reached, the oldest pending event is silently dropped to make room
+- **default is 100** (was disabled before 0.11.0)
+- when the cap is reached, the oldest pending event is dropped to make room, and the count is reported at your next replay
+- see [Growth controls](#growth-controls) for why 100
+
+#### `max_event_lines=<count|0|off>`
+
+Maximum total captured lines in a single event, counting `before` + trigger + `after`.
+
+- `0` or `off` disables the limit
+- default is `100`
+- limits [extension](#overlapping-highlights-extension) only; an event always collects the full `before`/`after` window it started with, whatever the cap is set to
+- a capped event shows `capped` in its replay header
+- see [Growth controls](#growth-controls)
+
+#### `max_event_age=<duration|off>`
+
+Drops pending events older than the given age without replaying them.
+
+- accepts `30d`, `12h`, `90m`, `3600s`, `2w`; a bare number is seconds
+- `off` or `0` disables expiry
+- **default is off**, so nothing is ever discarded by age unless you ask for it
+- this is a retention control, not a size control; see [Growth controls](#growth-controls)
 
 #### `excludes=<list>`
 
@@ -444,6 +578,12 @@ With larger context windows:
 
 ```text
 /msg *status LoadMod --type=network highlightctx before=12 after=20
+```
+
+Memory-only, with nothing written to disk:
+
+```text
+/msg *status LoadMod --type=network highlightctx before=12 after=20 journal=off
 ```
 
 With channel exclusions:
@@ -522,7 +662,7 @@ The module registers a fairly complete command set.
 /msg *highlightctx Reset
 ```
 
-Resets settings to defaults, but **does not discard pending/open events**.
+Resets settings to defaults, but **does not discard pending/open events**, and **does not change the journal setting**.
 
 ---
 
@@ -556,6 +696,9 @@ Shows current state, including:
 - number of excluded nicks/masks
 - number of open events
 - number of pending finalized events
+- `max_event_lines` and `max_event_age`
+- events dropped since the last replay, split by cause
+- whether journaling is enabled or disabled, and — when disabled and a leftover journal file exists — a note naming its size
 - journal path
 
 When `auto` mode is unarmed but `ignore_drop` is loaded, `Status` explains that the cause is hook-order position and points you to `Rearm` and the module-reload / `znc.conf` reorder workarounds.
@@ -582,17 +725,37 @@ Controls the pending finalized-event cap.
 
 If you lower the cap below the current number of pending events, the oldest pending events are dropped immediately.
 
+### `SetMaxEventLines <count|0|off>`
+
+Sets the maximum total captured lines per event (`before` + trigger + `after`). `0` or `off` disables the limit.
+
+Unlike `SetAfter`, the value is evaluated live rather than captured per event, so it also governs events rebuilt from the journal. Note that while a client is attached there are never any open events — attaching finalizes and replays them — so in practice the change takes effect on the capture that follows your next detach.
+
+If the value is below `before + 1 + after`, the module says so: extension is then effectively disabled, though events still collect their full configured window.
+
+### `SetMaxEventAge <duration|off>`
+
+Drops pending events older than the given duration without replaying them. Accepts `30d`, `12h`, `90m`, `3600s`, `2w`, or `off`.
+
+Expiry runs at load, as traffic arrives, and immediately before replay. Dropped counts are reported at your next replay.
+
 ### `Reset`
 
 Resets settings to compiled defaults:
 
 - `before=8`
 - `after=8`
-- `max_events=disabled`
+- `max_events=100`
+- `max_event_lines=100`
+- `max_event_age=disabled`
 - `require_ignore_drop=auto`
 - all exclusions (channel and nick/mask) cleared
 
 Pending and open events remain intact.
+
+`max_events`, `max_event_lines`, and `max_event_age` are restored to their defaults (100, 100, and disabled).
+
+The journal setting is deliberately **not** reset, so `Reset` can never silently resume writing highlight context to disk. The reply states the mode currently in effect.
 
 ### `AddExclude <#channel|nick|mask>`
 
@@ -642,9 +805,11 @@ Re-checks `ignore_drop` presence and hook-order position without reloading the m
 
 Rewrites the durable journal to the minimum current representation.
 
+With `journal=off`, there is nothing to compact, so `Compact` instead removes a journal file left over from an earlier session and reports how many bytes it deleted. If no such file exists, it says so and does nothing.
+
 ### `ClearPending`
 
-Clears all open and pending events, clears volatile state, and compacts the journal.
+Clears all open and pending events, clears volatile state, and compacts the journal. With `journal=off`, nothing is written to disk and the reply says so.
 
 This is useful for cleanup and testing.
 
@@ -656,7 +821,9 @@ Compiled/runtime defaults in the source:
 
 - `before = 8`
 - `after = 8`
-- `max_events = 0` → disabled
+- `max_events = 100`
+- `max_event_lines = 100`
+- `max_event_age = 0` → disabled
 - `require_ignore_drop = auto`
 - excluded channels = empty
 - excluded nicks/masks = empty
@@ -743,6 +910,10 @@ If native server-time replay is available, the client can show those lines with 
 ---
 
 ## Build and install
+
+### Tests
+
+The module ships with a live-ZNC test suite under [`tests/`](./tests/), which runs a real ZNC process against a fake IRC server and asserts on actual replay output. See [TESTING.md](./TESTING.md) for what it covers and how to run it.
 
 ### Build
 
@@ -917,7 +1088,7 @@ Details worth knowing:
 - **Excluded and self lines never extend.** Self lines and lines from nick/mask-excluded senders are ordinary context, just as they cannot start an event. Messages dropped by [`ignore_drop`](../ignore_drop/README.md) never reach `highlightctx` at all.
 - **Channels are independent.** A highlight in one channel never extends an event in another.
 - **`after=0` is unchanged.** Events finalize immediately and are never open, so each highlight is its own event.
-- **Extensions have no upper bound.** A channel that keeps highlighting you every few lines keeps one event open and growing until the highlights stop or you attach. This replaces the one-event-per-highlight growth of earlier versions and stores and replays fewer lines for the same traffic. A single extended event counts as one event towards `max_events`.
+- **Extensions are bounded by `max_event_lines`** (default 100 total lines) since 0.11.0. Before that they were unbounded. When the cap stops an extension the trigger is still marked, the event finishes its current window, and the next highlight after it finalizes starts a fresh event. A single extended event counts as one event towards `max_events`. See [Growth controls](#growth-controls).
 - **Legacy journals converge to one event.** A journal written by 0.8.0 or earlier can contain several overlapping open events on the same channel. After upgrading, only the newest of them is extended by later triggers, and the older ones finish their original windows.
 
 ### Event start behavior
@@ -950,7 +1121,7 @@ Finalization:
 - moves it into the pending list
 - appends a durable finalize record
 
-If `max_events` is enabled and the pending count exceeds the cap, the oldest pending events are marked delivered and dropped.
+If `max_events` is enabled and the pending count exceeds the cap, the oldest pending events are marked delivered and dropped, and a counter is incremented so the drop can be reported at the next replay. Expiry by `max_event_age` runs at the same point, plus at load and as traffic arrives.
 
 ### Replay output path
 
@@ -998,6 +1169,7 @@ Compatibility:
 
 - Journals written by 0.8.0 and earlier contain no `X` records and load unchanged.
 - 0.8.0 ignores unknown record types, so a 0.9.0 journal still loads after a downgrade. The extension marks and extended targets are lost, and open events finish at their original cap.
+- With `journal=off` (0.10.0+) no records are written or read at all, and the format is unchanged. A journal written while enabled stays valid and is loaded again if you re-enable it — as long as `Compact` has not removed it in the meantime.
 
 Nick/text and some fields are hex-encoded so the journal can safely represent arbitrary IRC text without relying on raw delimiters being absent.
 
@@ -1026,6 +1198,9 @@ The module stores persistent settings via module NV entries, including:
 - `before_max`
 - `after_max`
 - `max_events`
+- `max_event_lines`
+- `max_event_age_secs`
+- `dropped_by_cap` and `dropped_by_age` — drop counters, cleared once reported at replay
 - `require_ignore_drop_mode`
 - legacy compatibility key `require_ignore_drop`
 - `excluded_channels` — newline-separated lowercased channel names
@@ -1082,7 +1257,7 @@ Its main strengths are:
 
 - independence from normal playback buffers
 - focus on real missed highlights instead of general backlog
-- durable journaling of active events
+- durable journaling of active events (unless `journal=off`)
 - replay into a dedicated module window
 - native timestamp replay when the client supports it
 - configurable `ignore_drop` integration with position-aware auto mode and on-demand re-check via `Rearm`
