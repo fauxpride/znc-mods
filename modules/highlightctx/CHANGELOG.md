@@ -6,6 +6,138 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.11.1] — 2026-09-17
+
+Fixes a long-standing performance defect in journal compaction.
+
+Compaction was attempted whenever the journal exceeded a fixed 512 lines. That test compares against a threshold a rewrite may be unable to get below: once live state alone exceeded 512 lines, each compaction finished still over the limit, so the next appended line triggered another full rewrite. Every eligible channel line then cost a complete journal rewrite with two `fsync` calls.
+
+The defect predates 0.11.0, but the `max_events` default of 100 introduced there allows a steady state above the threshold — a compacted default-sized event is about 10 journal lines — so it became reachable in ordinary use rather than only in extreme ones.
+
+### Fixed
+
+* **Compaction is now triggered relative to what the last compaction achieved**, rather than against a fixed constant. After each successful compaction the next trigger point becomes `max(kCompactThresholdLines, 2 x lines written)`, so the journal must at least double before being rewritten again. A compaction costing *L* line-writes is therefore always preceded by at least *L* appends, making total rewrite work proportional to the number of appends rather than to the size of the pending queue.
+
+  Measured on a live instance at stock defaults with 70 pending events: 10 journal rewrites per 10 channel lines before, 0 after. Appending 160 events across roughly 1000 journal lines triggers a single compaction.
+
+### Changed
+
+* **The journal may sit at up to twice the size of live state** between compactions, instead of tracking it closely. With the default growth caps that peak is under 1 MB. Journals below the 512-line floor are unaffected and compact exactly as before.
+* **Version marker bumped** from `highlightctx 0.11.0` to `highlightctx 0.11.1`.
+
+### Security
+
+* **No change to what is stored or for how long.** The fix affects only how often the journal file is rewritten. Retention is still governed by `max_events`, `max_event_age`, and replay.
+* **Durability is unchanged.** Every append is still `fsync`ed along with its parent directory, and compaction still writes through a temporary file replaced by `rename()`. A crash between compactions recovers from a larger, less-compacted journal, which is covered by the test suite.
+* **Reduced write amplification** is the practical benefit: far fewer full-file rewrites and `fsync` pairs on storage where that matters.
+
+### Compatibility
+
+* **No format, setting, or command changes.** The trigger point is internal derived state, not persisted anywhere.
+* **Downgrading to 0.11.0** restores the previous rewrite behaviour; journals remain readable in both directions.
+* **ZNC compatibility.** No new ZNC API is used. Built with `znc-buildmod` and run against ZNC 1.9.0 (`znc-dev 1.9.0-2build3`) and ZNC 1.9.1 built from the upstream `znc-1.9.1` tag.
+
+---
+
+## [0.11.0] — 2026-09-17
+
+This release bounds how much state the module accumulates, and makes shedding visible.
+
+Before it, three quantities were unbounded: the number of pending events awaiting replay (`max_events` existed but defaulted to disabled), the size of a single event (extension could grow one event indefinitely), and how long events were kept. Because the journal after compaction holds exactly the records needed to rebuild open and pending events, all three showed up directly as on-disk growth.
+
+`max_events` now defaults to 100, a new `max_event_lines` caps a single event at 100 total lines by limiting extension, and an optional `max_event_age` expires old pending events. Dropped events are now reported instead of disappearing silently.
+
+Verified by a live-ZNC test harness on ZNC 1.9.0 and ZNC 1.9.1, including a full run under AddressSanitizer and UndefinedBehaviorSanitizer; see [TESTING.md](./TESTING.md).
+
+### Added
+
+* **`max_event_lines=<count|0|off>` load argument and `SetMaxEventLines` command.** Caps the total captured lines in one event (`before` + trigger + `after`), default `100`. It limits [extension](./README.md#overlapping-highlights-extension) only: an event always collects the full window it started with, so no cap value can reduce configured context. A cap below `before + 1 + after` disables extension and says so. Evaluated live rather than captured per event, so it also governs events rebuilt from the journal.
+* **`capped` field in the replay header** for events whose extension was suppressed, e.g. `(complete, before=8, after=24/24, triggers=4, capped)`. The suppressed trigger is still recorded, still marked `>>>`, and still counted in `triggers=`.
+* **New `C` journal record** marking an event as capped, written after the `A`/`X` records it relates to and preserved by compaction. Older builds ignore unknown record types.
+* **`max_event_age=<duration|off>` load argument and `SetMaxEventAge` command.** Drops pending events older than the given age without replaying them. Accepts `30d`, `12h`, `90m`, `3600s`, `2w`; a bare number is seconds. Default `off`. Expiry runs at load, as traffic arrives, and immediately before replay.
+* **Drop reporting.** Events shed by `max_events` or `max_event_age` are counted and reported at the top of the next replay, naming the cause and the limit. Counters persist across restarts in NV, appear in `Status`, and reset once reported.
+* **`Status` lines** for `max_event_lines`, `max_event_age`, and the drop counters.
+* **`Overview` paragraph** covering the growth controls.
+
+### Changed
+
+* **`max_events` now defaults to `100`** instead of disabled. Existing installs that set it explicitly, including to `0`, keep their value; only installs that never set it pick up the new default. The value was chosen on replay volume rather than resources: 100 default-sized events is roughly 1700 lines delivered at attach, while costing about 0.7 MB of journal.
+* **Dropping is no longer silent.** `max_events` previously discarded the oldest pending event with no indication at all.
+* **`Reset` restores the new defaults** (`max_events=100`, `max_event_lines=100`, `max_event_age=disabled`) and names them in its reply. The journal setting is still deliberately left unchanged.
+* **Load message** reports `max_event_lines` and `max_event_age` alongside the existing settings.
+* **Version marker bumped** from `highlightctx 0.10.0` to `highlightctx 0.11.0`.
+* **Module-header comment block** gains a "Growth controls (since 0.11.0)" section.
+
+### Fixed
+
+* **Journal recovery now reproduces a capped event's target exactly.** Recovery replays `X` records through the same cap-aware code path as live capture, rather than re-growing a target the cap had suppressed. A cap lowered between sessions is applied to recovered open events as well.
+* No other bug fixes. With `max_events=off max_event_lines=off max_event_age=off`, capture, replay, and journal contents are unchanged from 0.10.0.
+
+### Security
+
+* **Bounded state is the point.** Worst-case journal size is now `(open_events + max_events) × max_event_lines × ~0.4 KB`, with `open_events` bounded by channel count, since at most one event per channel is open at a time. With the defaults that is roughly 4 MB, against unbounded before.
+* **`max_event_age` is a retention control.** With journaling on, pending events are message text at rest; expiry puts a ceiling on how long it is kept. It defaults to off because discarding missed highlights by default would defeat the module's purpose.
+* **Shedding is visible.** Silent data loss is now reported, so a cap cannot quietly discard highlights you were relying on.
+* **No new untrusted input.** The `C` record is read from the module's own `0600` journal; its single numeric field is validated with full-string parsing and its event id is checked against already-loaded events. Duration parsing rejects unknown suffixes and overflow (capped at 100 years).
+
+### Compatibility
+
+* **Journal format stays backward and forward compatible.** The `C` record is additive, and 0.10.0 and earlier ignore unknown record types: a 0.11.0 journal loads there, losing only the capped flag.
+* **The `max_events` default change alters behavior on upgrade** for installs that never set it. Anyone relying on unbounded retention must set `max_events=off` explicitly.
+* **The new `max_events` default interacts with journal compaction.** A compacted default-sized event is about 10 journal lines, so the internal 512-line compaction threshold is crossed at roughly 51 pending events. Above it, every eligible channel line triggered a full journal rewrite — pre-existing behaviour, unchanged in this release, but reachable at the new default. Fixed in 0.11.1.
+* **Downgrading to 0.10.0** restores unbounded growth: `max_event_lines`, `max_event_age_secs`, and the drop counters are unknown NV keys there and are ignored.
+* **All other commands and load arguments are unchanged.**
+* **ZNC compatibility.** No new ZNC API is used. Built with `znc-buildmod` and run against ZNC 1.9.0 (`znc-dev 1.9.0-2build3`) and ZNC 1.9.1 built from the upstream `znc-1.9.1` tag.
+
+---
+
+## [0.10.0] — 2026-09-17
+
+This release adds a way to turn the durable journal off.
+
+Until now, journaling was unconditional: every highlight event was written to `highlightctx.journal` under the module save path, and stayed there until compaction removed it after delivery. That is what lets active captures survive a crash, but it also means real message text — channel names, nicks, and full line content — persists on disk, where it can reach backups and VPS snapshots. There was no setting, command, or load argument to prevent it.
+
+The new `journal=off` load argument makes the module memory-only: the journal is neither read at load nor written during operation. Capture, extension, exclusions, and replay behave exactly as before within a session. The trade-off is that open and pending events no longer survive an unload, restart, or crash.
+
+### Added
+
+* **`journal=<off|on>` load argument.** Default `on`, preserving existing behavior. Accepts the same spellings as the other boolean-ish settings (`on`/`off`, `1`/`0`, `yes`/`no`, `true`/`false`, `enable`/`disable`, `enabled`/`disabled`); any other value fails the load with `Invalid value for journal; use on or off.` The setting is stored in NV as `journal_enabled`, so a reload without arguments keeps it.
+* **Leftover-journal reporting.** Loading with `journal=off` while a journal file from an earlier session still exists appends a note to the load message, and `Status` reports the file and its size. The file is left untouched: not read, not written, not deleted.
+* **`Compact` removes a leftover journal file when journaling is disabled**, reporting the number of bytes deleted, and says so plainly when there is nothing to remove. This is the only path that deletes the file, so removal is always an explicit request.
+* **`Status` line showing the active mode**, alongside the existing journal path line.
+* **`Overview` paragraph** describing the opt-out and its trade-off.
+
+### Changed
+
+* **`Reset` no longer claims to reset every setting.** It now states which journal mode is in effect and that the mode was left unchanged. Resetting settings deliberately cannot re-enable writing highlight context to disk.
+* **`ClearPending` reply wording** when journaling is disabled, to say that nothing was written to disk.
+* **`Compact` help text** notes the disabled-mode behavior.
+* **Load message** includes `journal=on|off`.
+* **Version marker bumped** from `highlightctx 0.9.0` to `highlightctx 0.10.0`.
+* **Module-header comment block** gains a "Journaling opt-out (since 0.10.0)" section.
+
+### Fixed
+
+* No bug fixes in this release. With the default `journal=on`, capture, replay, journal contents, and command output are unchanged from 0.9.0, apart from the `Status`, `Reset`, `Compact`, and `Overview` text noted above.
+
+### Security
+
+* **This is the point of the release.** With `journal=off`, captured highlight context never reaches persistent storage, which removes it from filesystem backups, VPS snapshots, and offline disk access. The journal file is `0600` under a `0700` directory either way, so this addresses data-at-rest exposure, not local access control.
+* **Disabling is not destructive.** Turning journaling off never deletes existing data on its own; an old journal is ignored until you remove it with `Compact`. This avoids silent data loss for anyone flipping the setting to try it.
+* **The opt-out cannot be undone accidentally.** `Reset` leaves it alone, and re-enabling requires an explicit `journal=on` load argument.
+* **No new parsing of untrusted input.** The new value is a load argument supplied by the ZNC admin. Journal record parsing is unchanged.
+* **The durability guarantee is genuinely given up.** With journaling off, an unclean shutdown loses open and pending events. That is the intended trade and is stated in the load message, `Status`, `Overview`, and the README.
+
+### Compatibility
+
+* **Default behavior is unchanged.** Without `journal=on|off`, existing installs keep journaling exactly as in 0.9.0, including the NV keys and journal format.
+* **The journal format is untouched.** A journal written while enabled remains valid; re-enabling loads it normally unless `Compact` removed it while disabled.
+* **Downgrade to 0.9.0 resumes journaling**, because the `journal_enabled` NV key is unknown to it. Anyone relying on the opt-out should not downgrade.
+* **All other commands and load arguments are unchanged.**
+* **ZNC compatibility.** No new ZNC API is used. `stat()` and `unlink()` are used through the existing `<sys/stat.h>` and `<unistd.h>` includes. Built with `znc-buildmod` and run against ZNC 1.9.0 (`znc-dev 1.9.0-2build3`) and ZNC 1.9.1 built from the upstream `znc-1.9.1` tag.
+
+---
+
 ## [0.9.0] — 2026-09-11
 
 This release changes how overlapping highlights are captured.
@@ -14,7 +146,7 @@ Until 0.8.0, every qualifying highlight started its own event, even when it arri
 
 A highlight that lands inside an open event's `after` window now **extends** that event instead. The line is marked as an additional trigger, and the event keeps collecting until a full `after` window has followed the latest trigger. The same input now yields one event with no duplicated lines, and the on-disk journal stays backward compatible with 0.8.0 in both directions.
 
-Verified by a live-ZNC test harness on ZNC 1.9.0 and ZNC 1.9.1, including a full run under AddressSanitizer and UndefinedBehaviorSanitizer; see *Testing* below.
+Verified by a live-ZNC test harness on ZNC 1.9.0 and ZNC 1.9.1, including a full run under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### Added
 

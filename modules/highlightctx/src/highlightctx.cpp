@@ -44,6 +44,19 @@
 //   a new event as before (with a normal `before` snapshot).
 // - Extensions are journaled as `X` records so they survive a restart.
 //
+// Journaling opt-out (since 0.10.0):
+// - Load argument `journal=off` turns off the durable journal entirely. The
+//   journal file is then neither read at load nor written during operation,
+//   so captured highlight context (channel names, nicks, message text) never
+//   reaches disk.
+// - The trade-off is durability: with journaling off, open and pending events
+//   live only in memory and are lost on unload, restart, or crash.
+// - The setting persists in NV storage like the other settings, so a reload
+//   without arguments keeps it. `Reset` deliberately does NOT restore it to
+//   on, so resetting settings can never silently resume writing to disk.
+// - Turning it off leaves any existing journal file untouched and ignored;
+//   `Compact` removes that leftover file on an explicit request.
+//
 // Notes:
 // - The "before" and "after" values are maxima, not guarantees.
 // - If you attach before enough trailing lines arrive, the event is replayed as partial.
@@ -100,8 +113,12 @@
 
 namespace {
 
-static const char* kModVersion = "highlightctx 0.9.0";
+static const char* kModVersion = "highlightctx 0.11.1";
 static const char* kJournalName = "highlightctx.journal";
+// Floor for the compaction trigger. The effective trigger point is derived
+// from what the last compaction actually achieved (see m_compact_at), because
+// comparing against a fixed constant rewrites the journal on every appended
+// line once live state alone exceeds it.
 static const size_t kCompactThresholdLines = 512;
 
 enum class ERequireIgnoreMode {
@@ -121,6 +138,66 @@ static const char* ignore_mode_to_storage(ERequireIgnoreMode mode) {
 
 static CString ignore_mode_to_cstring(ERequireIgnoreMode mode) {
     return ignore_mode_to_storage(mode);
+}
+
+// Accepts the same on/off vocabulary as the other boolean-ish settings.
+static bool parse_on_off(const CString& s, bool& out) {
+    CString v = s.AsLower().Trim_n();
+    if (v == "0" || v == "off" || v == "no" || v == "false" || v == "disable" || v == "disabled") {
+        out = false;
+        return true;
+    }
+    if (v == "1" || v == "on" || v == "yes" || v == "true" || v == "enable" || v == "enabled") {
+        out = true;
+        return true;
+    }
+    return false;
+}
+
+// Duration for max_event_age: <number>[s|m|h|d|w], bare number = seconds,
+// and the usual off spellings mean "no expiry". Rejects overflow.
+static bool parse_duration_secs(const CString& s, long long& out) {
+    CString v = s.AsLower().Trim_n();
+    if (v.empty()) return false;
+    if (v == "0" || v == "off" || v == "no" || v == "false" || v == "disable" || v == "disabled") {
+        out = 0;
+        return true;
+    }
+    char unit = v[v.length() - 1];
+    long long mult = 1;
+    CString num = v;
+    if (unit < '0' || unit > '9') {
+        switch (unit) {
+            case 's': mult = 1; break;
+            case 'm': mult = 60; break;
+            case 'h': mult = 3600; break;
+            case 'd': mult = 86400; break;
+            case 'w': mult = 604800; break;
+            default: return false;
+        }
+        num = v.substr(0, v.length() - 1);
+    }
+    if (num.empty()) return false;
+    errno = 0;
+    char* endp = nullptr;
+    unsigned long long n = std::strtoull(num.c_str(), &endp, 10);
+    if (errno == ERANGE || !endp || *endp != '\0') return false;
+    const unsigned long long kMaxSecs = 100ULL * 365ULL * 86400ULL;  // 100 years
+    if (n > kMaxSecs / static_cast<unsigned long long>(mult)) return false;
+    out = static_cast<long long>(n) * mult;
+    return true;
+}
+
+static CString format_duration_secs(long long secs) {
+    if (secs <= 0) return "disabled";
+    struct { const char* suffix; long long unit; } units[] = {
+        {"w", 604800}, {"d", 86400}, {"h", 3600}, {"m", 60}, {"s", 1}};
+    for (const auto& u : units) {
+        if (secs % u.unit == 0) {
+            return CString(std::to_string(secs / u.unit)) + u.suffix;
+        }
+    }
+    return CString(std::to_string(secs)) + "s";
 }
 
 static bool parse_ignore_mode(const CString& s, ERequireIgnoreMode& out) {
@@ -375,6 +452,19 @@ static bool durable_replace_file(const std::string& path, const std::string& dat
     return ensure_parent_dir_fsync(path);
 }
 
+// Size of an existing regular file, or -1 if it does not exist / is not one.
+static long long file_size_or_missing(const std::string& path) {
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) return -1;
+    if (!S_ISREG(st.st_mode)) return -1;
+    return static_cast<long long>(st.st_size);
+}
+
+static bool remove_file_and_fsync_dir(const std::string& path) {
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) return false;
+    return ensure_parent_dir_fsync(path);
+}
+
 static bool slurp_lines(const std::string& path, std::vector<std::string>& lines) {
     lines.clear();
     FILE* fp = ::fopen(path.c_str(), "rb");
@@ -457,11 +547,17 @@ class CHighlightCtx : public CModule {
                    "Set the maximum number of messages to snapshot before a highlight trigger. This is a cap, not a guarantee; fewer lines may exist if the detached-only ring has less history.",
                    [this](const CString& sLine) { CmdSetBefore(sLine); });
         AddCommand("SetAfter", "<count>",
-                   "Set the maximum number of messages to collect after a highlight trigger. This is a cap, not a guarantee; if you attach before enough later traffic arrives, the event is replayed as partial. A further highlight inside an open event's after window extends that event by a fresh window of the cap the event started with, instead of starting an overlapping event.",
+                   "Set the maximum number of messages to collect after a highlight trigger. This is a cap, not a guarantee; if you attach before enough later traffic arrives, the event is replayed as partial. A further highlight inside an open event's after window extends that event by a fresh window of the cap the event started with, instead of starting an overlapping event, subject to max_event_lines.",
                    [this](const CString& sLine) { CmdSetAfter(sLine); });
         AddCommand("SetMaxEvents", "<count|0|off>",
                    "Set the maximum number of finalized pending events to keep at once. When the cap is reached the oldest event is silently dropped to make room. Use 0 or off to disable the cap entirely (the default).",
                    [this](const CString& sLine) { CmdSetMaxEvents(sLine); });
+        AddCommand("SetMaxEventLines", "<count|0|off>",
+                   "Set the maximum total captured lines per event (before + trigger + after). This limits extension only: an event always collects the before/after window it started with. 0/off disables the limit.",
+                   [this](const CString& sLine) { CmdSetMaxEventLines(sLine); });
+        AddCommand("SetMaxEventAge", "<duration|off>",
+                   "Drop pending events older than this duration without replaying them. Accepts 30d, 12h, 90m, 3600s, 2w, or off. This is a retention control, not a size control.",
+                   [this](const CString& sLine) { CmdSetMaxEventAge(sLine); });
         AddCommand("Reset", "",
                    "Reset all settings to compiled-in defaults: before=8, after=8, max_events=disabled, require_ignore_drop=auto, all exclusions (channel and nick/mask) cleared. Does not discard pending or open events.",
                    [this](const CString&) { CmdReset(); });
@@ -481,7 +577,7 @@ class CHighlightCtx : public CModule {
                    "Re-check ignore_drop presence and hook-order position without reloading the module. Reports whether strict ignore-aware capture is now armed. Note: if ignore_drop is present but positioned after highlightctx in the module list, Rearm cannot fix hook order on its own; unload and reload highlightctx to move it to the end of the list, or reorder the LoadModule lines in znc.conf for the next restart.",
                    [this](const CString&) { CmdRearm(); });
         AddCommand("Compact", "",
-                   "Rewrite the durable on-disk journal to the minimum representation needed for currently open/pending events. This is usually automatic after replay/clear and when the journal grows large.",
+                   "Rewrite the durable on-disk journal to the minimum representation needed for currently open/pending events. This is usually automatic after replay/clear and when the journal grows large. With journal=off, this instead removes a journal file left over from an earlier session.",
                    [this](const CString&) { CmdCompact(); });
         AddCommand("ClearPending", "",
                    "Discard all currently pending/open events for this network instance and compact the journal. This is mainly for emergency cleanup/testing.",
@@ -502,7 +598,22 @@ class CHighlightCtx : public CModule {
 
         TrimAllRings();
         EnsureJournalPath();
-        if (!LoadJournal(sMessage)) return false;
+        CString journal_note;
+        if (m_journal_enabled) {
+            if (!LoadJournal(sMessage)) return false;
+            ReapplyLineCapOnLoad();
+            ExpireOldPending();
+        } else {
+            // Do not read, write, or delete an existing journal here: leaving
+            // it untouched keeps the opt-out non-destructive, and Compact
+            // removes it on an explicit request.
+            m_journal_line_count = 0;
+            m_compact_at = kCompactThresholdLines;
+            const long long leftover = file_size_or_missing(m_journal_path);
+            if (leftover > 0) {
+                journal_note = " | note: journal=off, but a journal file from an earlier session still exists on disk and is being ignored; run Compact to remove it";
+            }
+        }
 
         SetNV("version_marker", kModVersion);
         sMessage = "Loaded ";
@@ -518,13 +629,20 @@ class CHighlightCtx : public CModule {
             sMessage += (m_auto_ignore_drop_armed ? "yes" : "no");
             sMessage += ")";
         }
+        sMessage += " journal=";
+        sMessage += (m_journal_enabled ? "on" : "off");
         sMessage += " max_events=";
         sMessage += (m_max_events == 0 ? "disabled" : CString(std::to_string(m_max_events)).c_str());
+        sMessage += " max_event_lines=";
+        sMessage += (m_max_event_lines == 0 ? "disabled" : CString(std::to_string(m_max_event_lines)).c_str());
+        sMessage += " max_event_age=";
+        sMessage += format_duration_secs(m_max_event_age_secs);
         sMessage += " excludes=";
         sMessage += CString(std::to_string(m_excluded.size()));
         sMessage += "ch/";
         sMessage += CString(std::to_string(m_excluded_nicks.size()));
         sMessage += "nick";
+        sMessage += journal_note;
         return true;
     }
 
@@ -611,6 +729,9 @@ class CHighlightCtx : public CModule {
         std::vector<CaptureLine> after;
         bool finalized{false};
         bool partial{false};
+        // Set when max_event_lines prevented at least one extension of this
+        // event. Journaled as a C record so it survives a restart.
+        bool capped{false};
     };
 
     struct NickExclude {
@@ -620,7 +741,19 @@ class CHighlightCtx : public CModule {
 
     unsigned int m_before_max{8};
     unsigned int m_after_max{8};
-    unsigned int m_max_events{0};  // 0 = disabled (no cap on pending events)
+    // Default since 0.11.0: keep the 100 most recent pending events rather
+    // than an unbounded queue. See README for how this value was chosen.
+    unsigned int m_max_events{100};
+    // 0 = disabled. Maximum total captured lines per event (before + trigger
+    // + after). Limits extension only; an event always gets its configured
+    // window. Evaluated against the current value, not captured per event.
+    unsigned int m_max_event_lines{100};
+    // 0 = disabled. Pending events older than this are dropped unreplayed.
+    long long m_max_event_age_secs{0};
+    // Events dropped since the last replay, reported to the user at replay
+    // time and in Status so that shedding is never silent.
+    unsigned long long m_dropped_by_cap{0};
+    unsigned long long m_dropped_by_age{0};
     ERequireIgnoreMode m_require_ignore_mode{ERequireIgnoreMode::Auto};
     bool m_ignore_drop_present_on_module_load{false};
     bool m_auto_ignore_drop_armed{false};
@@ -634,6 +767,17 @@ class CHighlightCtx : public CModule {
     unsigned long long m_next_id{1};
     std::string m_journal_path;
     size_t m_journal_line_count{0};
+    // Line count at which the next compaction is attempted. Recomputed after
+    // every successful compaction as max(kCompactThresholdLines, 2 x lines
+    // actually written), so the journal must at least double before it is
+    // rewritten again. That bounds total rewrite work to O(appends) instead
+    // of O(live_lines) per appended line, at the cost of letting the file sit
+    // at up to twice the size of live state between compactions.
+    size_t m_compact_at{kCompactThresholdLines};
+    // When false, the module keeps all state in memory only: the journal is
+    // neither read at load nor written during operation, so highlight context
+    // never touches disk and does not survive an unload or restart.
+    bool m_journal_enabled{true};
 
     void LoadConfig() {
         if (HasNV("before_max")) {
@@ -644,6 +788,23 @@ class CHighlightCtx : public CModule {
         }
         if (HasNV("max_events")) {
             m_max_events = GetNV("max_events").ToUInt();
+        }
+        if (HasNV("max_event_lines")) {
+            m_max_event_lines = GetNV("max_event_lines").ToUInt();
+        }
+        if (HasNV("max_event_age_secs")) {
+            long long parsed = 0;
+            if (parse_duration_secs(GetNV("max_event_age_secs"), parsed)) {
+                m_max_event_age_secs = parsed;
+            }
+        }
+        if (HasNV("dropped_by_cap")) m_dropped_by_cap = GetNV("dropped_by_cap").ToULongLong();
+        if (HasNV("dropped_by_age")) m_dropped_by_age = GetNV("dropped_by_age").ToULongLong();
+        if (HasNV("journal_enabled")) {
+            bool parsed = true;
+            if (parse_on_off(GetNV("journal_enabled"), parsed)) {
+                m_journal_enabled = parsed;
+            }
         }
         if (HasNV("require_ignore_drop_mode")) {
             ERequireIgnoreMode parsed = ERequireIgnoreMode::Auto;
@@ -690,7 +851,7 @@ class CHighlightCtx : public CModule {
             CString key = part.Token(0, false, "=").AsLower();
             CString val = part.Token(1, true, "=");
             if (key.empty() || val.empty()) {
-                sError = "Invalid load arg syntax. Use key=value pairs like before=8 after=8 require_ignore_drop=auto excludes=#chan1,#chan2";
+                sError = "Invalid load arg syntax. Use key=value pairs like before=8 after=8 max_events=100 max_event_lines=100 max_event_age=off journal=on require_ignore_drop=auto excludes=#chan1,#chan2";
                 return false;
             }
 
@@ -710,6 +871,35 @@ class CHighlightCtx : public CModule {
                 }
                 m_after_max = n;
                 SetNV("after_max", CString(std::to_string(m_after_max)));
+            } else if (key == "max_event_lines") {
+                CString vl = val.AsLower();
+                if (vl == "off" || vl == "no" || vl == "false" || vl == "disable" || vl == "disabled") {
+                    m_max_event_lines = 0;
+                } else {
+                    unsigned int n = 0;
+                    if (!parse_uint_cstr(val, n)) {
+                        sError = "Invalid value for max_event_lines; use a number or off/0 to disable.";
+                        return false;
+                    }
+                    m_max_event_lines = n;
+                }
+                SetNV("max_event_lines", CString(std::to_string(m_max_event_lines)));
+            } else if (key == "max_event_age") {
+                long long secs = 0;
+                if (!parse_duration_secs(val, secs)) {
+                    sError = "Invalid value for max_event_age; use a duration like 30d, 12h, 90m, or off.";
+                    return false;
+                }
+                m_max_event_age_secs = secs;
+                SetNV("max_event_age_secs", CString(std::to_string(m_max_event_age_secs)));
+            } else if (key == "journal") {
+                bool enabled = true;
+                if (!parse_on_off(val, enabled)) {
+                    sError = "Invalid value for journal; use on or off.";
+                    return false;
+                }
+                m_journal_enabled = enabled;
+                SetNV("journal_enabled", m_journal_enabled ? "1" : "0");
             } else if (key == "require_ignore_drop") {
                 ERequireIgnoreMode mode = ERequireIgnoreMode::Auto;
                 if (!parse_ignore_mode(val, mode)) {
@@ -980,10 +1170,21 @@ class CHighlightCtx : public CModule {
 
     // Apply an extension at `after_index` to `ev`. Shared by the live feed
     // path and journal recovery so both compute the target identically.
-    static void ApplyExtension(Event& ev, size_t after_index) {
+    // Mark the after-line at after_index as an additional trigger and grow the
+    // event's target, unless max_event_lines would be exceeded. Returns true
+    // if the target grew. Used by the live feed path AND by journal recovery,
+    // so a recovered event has exactly the target it had before the restart.
+    bool TryExtend(Event& ev, size_t after_index) {
         ev.after[after_index].extends_event = true;
-        const size_t new_target = after_index + 1 + static_cast<size_t>(ev.after_cap);
-        if (new_target > ev.after_target) ev.after_target = new_target;
+        const size_t proposed_target = after_index + 1 + static_cast<size_t>(ev.after_cap);
+        if (proposed_target <= ev.after_target) return false;
+        const size_t proposed_total = ev.before.size() + 1 + proposed_target;
+        if (m_max_event_lines > 0 && proposed_total > static_cast<size_t>(m_max_event_lines)) {
+            ev.capped = true;
+            return false;
+        }
+        ev.after_target = proposed_target;
+        return true;
     }
 
     static size_t CountExtensions(const Event& ev) {
@@ -992,6 +1193,13 @@ class CHighlightCtx : public CModule {
             if (line.extends_event) ++n;
         }
         return n;
+    }
+
+    // C record: max_event_lines suppressed at least one extension of this
+    // event. Carries no payload beyond the id; older builds ignore unknown
+    // record types, so this is safe to downgrade past.
+    static std::string SerializeCapped(unsigned long long id) {
+        return std::string("C\t") + std::to_string(id);
     }
 
     static std::string SerializeFinalize(unsigned long long id, bool partial) {
@@ -1003,6 +1211,7 @@ class CHighlightCtx : public CModule {
     }
 
     bool AppendJournal(const std::string& line) {
+        if (!m_journal_enabled) return true;
         if (m_journal_path.empty()) EnsureJournalPath();
         bool ok = durable_append_line(m_journal_path, line);
         if (ok) ++m_journal_line_count;
@@ -1085,7 +1294,16 @@ class CHighlightCtx : public CModule {
                 // to, so a valid index is already present. Ignore anything
                 // else (e.g. a torn write that lost the A record).
                 if (idx >= it->second.after.size()) continue;
-                ApplyExtension(it->second, static_cast<size_t>(idx));
+                TryExtend(it->second, static_cast<size_t>(idx));
+                if (id > max_id) max_id = id;
+            } else if (op == "C") {
+                if (parts.size() != 2) continue;
+                char* endp = nullptr;
+                unsigned long long id = std::strtoull(parts[1].c_str(), &endp, 10);
+                if (!endp || *endp != '\0' || parts[1].empty()) continue;
+                auto it = all.find(id);
+                if (it == all.end()) continue;
+                it->second.capped = true;
                 if (id > max_id) max_id = id;
             } else if (op == "F") {
                 if (parts.size() != 3) continue;
@@ -1119,7 +1337,7 @@ class CHighlightCtx : public CModule {
         }
 
         m_next_id = max_id + 1;
-        if (m_journal_line_count > kCompactThresholdLines) {
+        if (m_journal_line_count > m_compact_at) {
             if (!CompactJournalInternal()) {
                 sError = "highlightctx loaded, but journal compaction failed; continuing with existing state.";
             }
@@ -1128,6 +1346,9 @@ class CHighlightCtx : public CModule {
     }
 
     bool CompactJournalInternal() {
+        // With journaling off there is nothing on disk representing current
+        // state, and an untouched leftover file is only removed by Compact.
+        if (!m_journal_enabled) return true;
         std::string out;
         auto append_line = [&](const std::string& line) {
             out += line;
@@ -1147,6 +1368,10 @@ class CHighlightCtx : public CModule {
                         ++lines_written;
                     }
                 }
+                if (ev.capped) {
+                    append_line(SerializeCapped(ev.id));
+                    ++lines_written;
+                }
             }
         }
         for (const auto& ev : m_pending) {
@@ -1160,12 +1385,19 @@ class CHighlightCtx : public CModule {
                     ++lines_written;
                 }
             }
+            if (ev.capped) {
+                append_line(SerializeCapped(ev.id));
+                ++lines_written;
+            }
             append_line(SerializeFinalize(ev.id, ev.partial));
             ++lines_written;
         }
 
         bool ok = durable_replace_file(m_journal_path, out);
-        if (ok) m_journal_line_count = lines_written;
+        if (ok) {
+            m_journal_line_count = lines_written;
+            m_compact_at = std::max(kCompactThresholdLines, lines_written * 2);
+        }
         return ok;
     }
 
@@ -1295,13 +1527,86 @@ class CHighlightCtx : public CModule {
         m_pending.push_back(ev);
         AppendJournal(SerializeFinalize(ev.id, partial));
 
+        ExpireOldPending();
+
         // If max_events is enabled, drop the oldest pending event(s) to stay within the cap.
         if (m_max_events > 0) {
             while (m_pending.size() > m_max_events) {
                 AppendJournal(SerializeDelivered(m_pending.front().id));
                 m_pending.erase(m_pending.begin());
+                ++m_dropped_by_cap;
+                SetNV("dropped_by_cap", CString(std::to_string(m_dropped_by_cap)));
             }
         }
+    }
+
+    // Drop pending events older than max_event_age. Pending events are stored
+    // in finalize order, so this only has to inspect the front of the vector
+    // and is O(1) when nothing has expired.
+    void ExpireOldPending() {
+        if (m_max_event_age_secs <= 0 || m_pending.empty()) return;
+        const long long cutoff = static_cast<long long>(::time(nullptr)) - m_max_event_age_secs;
+        size_t dropped = 0;
+        while (!m_pending.empty() && m_pending.front().started_ts < cutoff) {
+            AppendJournal(SerializeDelivered(m_pending.front().id));
+            m_pending.erase(m_pending.begin());
+            ++dropped;
+        }
+        if (dropped > 0) {
+            m_dropped_by_age += dropped;
+            SetNV("dropped_by_age", CString(std::to_string(m_dropped_by_age)));
+            CompactJournalInternal();
+        }
+    }
+
+    // TryExtend already reproduces the live target during recovery. This only
+    // handles a cap that was LOWERED between sessions, so an event recovered
+    // with an older, larger target stops growing under the new limit.
+    void ReapplyLineCapOnLoad() {
+        if (m_max_event_lines == 0) return;
+        for (auto& kv : m_open_by_chan) {
+            for (auto& ev : kv.second) {
+                const size_t allowed = static_cast<size_t>(m_max_event_lines);
+                const size_t base = ev.before.size() + 1;
+                if (base + ev.after_target > allowed) {
+                    const size_t room = (allowed > base) ? (allowed - base) : 0;
+                    const size_t floor_target = static_cast<size_t>(ev.after_cap);
+                    const size_t new_target = (room > floor_target) ? room : floor_target;
+                    if (new_target < ev.after_target) {
+                        ev.after_target = new_target;
+                        ev.capped = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Tell the user about events shed since the last replay, so that dropping
+    // is never silent. Counters are cleared once reported.
+    void ReportDroppedEvents() {
+        if (m_dropped_by_cap == 0 && m_dropped_by_age == 0) return;
+        CString note = "note: ";
+        note += CString(std::to_string(m_dropped_by_cap + m_dropped_by_age));
+        note += " older highlight event(s) were dropped before this replay (";
+        bool first = true;
+        if (m_dropped_by_cap > 0) {
+            note += CString(std::to_string(m_dropped_by_cap));
+            note += " to stay within max_events=";
+            note += CString(std::to_string(m_max_events));
+            first = false;
+        }
+        if (m_dropped_by_age > 0) {
+            if (!first) note += ", ";
+            note += CString(std::to_string(m_dropped_by_age));
+            note += " expired after max_event_age=";
+            note += format_duration_secs(m_max_event_age_secs);
+        }
+        note += ").";
+        ReplayLineToClient(note, static_cast<long long>(::time(nullptr)));
+        m_dropped_by_cap = 0;
+        m_dropped_by_age = 0;
+        SetNV("dropped_by_cap", "0");
+        SetNV("dropped_by_age", "0");
     }
 
     void FinalizeAllOpenAsPartial() {
@@ -1315,7 +1620,7 @@ class CHighlightCtx : public CModule {
     }
 
     void MaybeCompactAfterMutation() {
-        if (m_journal_line_count > kCompactThresholdLines) {
+        if (m_journal_line_count > m_compact_at) {
             CompactJournalInternal();
         }
     }
@@ -1384,9 +1689,15 @@ class CHighlightCtx : public CModule {
             ev.after.push_back(line);
             AppendJournal(SerializeAfter(ev.id, line));
             if (is_trigger && i == extend_idx) {
+                // max_event_lines limits extension only: the event always
+                // keeps the window it started with, so no cap value can cut
+                // into the configured before/after context. A suppressed
+                // trigger is still marked, so replay stays honest about it.
                 const size_t idx = ev.after.size() - 1;
-                ApplyExtension(ev, idx);
+                const bool was_capped = ev.capped;
+                TryExtend(ev, idx);
                 AppendJournal(SerializeExtend(ev.id, idx));
+                if (ev.capped && !was_capped) AppendJournal(SerializeCapped(ev.id));
                 extended = true;
             }
             if (ev.after.size() >= ev.after_target) {
@@ -1407,6 +1718,9 @@ class CHighlightCtx : public CModule {
     template <typename TMsg>
     void HandleIncoming(TMsg& Message, char kind) {
         if (!ShouldCaptureNow()) return;
+        // Cheap front-of-queue check; O(1) when nothing has expired. Without a
+        // timer this is what keeps expiry timely on an active network.
+        ExpireOldPending();
         CChan* pChan = Message.GetChan();
         if (!pChan) return;
 
@@ -1447,6 +1761,8 @@ class CHighlightCtx : public CModule {
 
     void ReplayAndClear(bool manual) {
         FinalizeAllOpenAsPartial();
+        ExpireOldPending();
+        ReportDroppedEvents();
         if (m_pending.empty()) {
             if (manual) PutModule("No pending highlight events.");
             CompactJournalInternal();
@@ -1485,6 +1801,7 @@ class CHighlightCtx : public CModule {
                 header += ", triggers=";
                 header += CString(std::to_string(extensions + 1));
             }
+            if (ev.capped) header += ", capped";
             header += ")";
             ReplayLineToClient(header, ev.started_ts);
 
@@ -1512,6 +1829,8 @@ class CHighlightCtx : public CModule {
         PutModule("Replay target: *highlightctx. When the current client supports IRCv3 server-time/time tags, replay is emitted as synthetic raw PRIVMSG lines with original @time values so the client can display historical timestamps natively. If the client does not support that, replay falls back to text prefixed with the original UTC timestamp.");
         PutModule("Events are sorted by channel name first, then by event time/id within each channel. A spacer line is added between events for readability.");
         PutModule("Persistence strategy: ordinary chatter stays only in RAM, while actual highlight events are durably journaled to disk as they happen. That keeps the hot path light but preserves active highlight captures across an unexpected VPS shutdown.");
+        PutModule("Growth controls: max_events caps how many finalized events wait for replay (default 100, oldest dropped first). max_event_lines caps the total captured lines in one event (default 100) by limiting extension, never the configured window; a capped event shows 'capped' in its replay header and the next highlight after it finalizes starts a fresh event. max_event_age optionally drops pending events older than a given duration without replaying them, as a retention control (default off). Whenever events are dropped for either reason, the count is reported at the top of the next replay and in Status, so shedding is never silent.");
+        PutModule("Journaling can be turned off with the journal=off load argument. Highlight context then never touches disk, at the cost of losing open and pending events on unload, restart, or crash. Status shows which mode is active, and with journaling off, Compact removes a journal file left over from an earlier session.");
         PutModule("Exclusions: AddExclude accepts both channel names (starting with #, &, +, or !) and nick/hostmask patterns. Channel exclusions drop the channel entirely. Nick/mask exclusions are narrower: messages from the excluded sender still appear as before/after context for other events, but cannot start a new event themselves. Masks use RFC 1459 case folding and support * and ? wildcards, matching the syntax used by ignore_drop. A mask containing ! or @ is matched against the full nick!ident@host; otherwise it is matched against the nickname only.");
         PutModule("ignore_drop modes: off = never required. on = must already be loaded before highlightctx loads and capture pauses whenever it is absent. auto = the same strict behavior is armed only if ignore_drop is positioned ahead of highlightctx in the network's module list so its hooks fire before ours. Arming is re-evaluated at OnLoad, at OnBoot for znc.conf-loaded modules, and on demand via Rearm. Runtime load or unload of ignore_drop does not automatically re-arm; ZNC dispatches those lifecycle hooks to global-scope modules only, so Rearm is the supported way to refresh the state after a runtime change. Runtime capture is always protected by an independent HasIgnoreDropLoaded() check inside ShouldCaptureNow(), so when the strict requirement is effective but ignore_drop is absent, capture pauses regardless of the armed flag. Armed state is sticky by design: once armed, it stays armed across ignore_drop unload/reload so capture does not silently resume without the protection the user asked for.");
         PutModule("Primary commands: Status, SetBefore, SetAfter, SetMaxEvents, AddExclude, DelExclude, ListExcludes, SetRequireIgnoreDrop, Rearm, Reset, ReplayNow, Compact, ClearPending.");
@@ -1527,6 +1846,10 @@ class CHighlightCtx : public CModule {
         PutModule(CString("before cap: ") + CString(std::to_string(m_before_max)));
         PutModule(CString("after cap: ") + CString(std::to_string(m_after_max)));
         PutModule(CString("max_events: ") + (m_max_events == 0 ? "disabled" : CString(std::to_string(m_max_events)).c_str()));
+        PutModule(CString("max_event_lines: ") + (m_max_event_lines == 0 ? "disabled" : CString(std::to_string(m_max_event_lines)).c_str()));
+        PutModule(CString("max_event_age: ") + format_duration_secs(m_max_event_age_secs));
+        PutModule(CString("events dropped since last replay: ") + CString(std::to_string(m_dropped_by_cap)) +
+                  " by max_events, " + CString(std::to_string(m_dropped_by_age)) + " by max_event_age");
         PutModule(CString("require_ignore_drop mode: ") + IgnoreModeName());
         PutModule(CString("ignore_drop ahead of highlightctx in hook order: ") + (m_ignore_drop_present_on_module_load ? "yes" : "no"));
         PutModule(CString("auto mode armed: ") + ((m_require_ignore_mode == ERequireIgnoreMode::Auto && m_auto_ignore_drop_armed) ? "yes" : "no"));
@@ -1542,7 +1865,15 @@ class CHighlightCtx : public CModule {
         PutModule(CString("excluded nicks/masks: ") + CString(std::to_string(m_excluded_nicks.size())));
         PutModule(CString("open events: ") + CString(std::to_string(open_count)));
         PutModule(CString("pending finalized events: ") + CString(std::to_string(m_pending.size())));
+        PutModule(CString("journal: ") + (m_journal_enabled ? "enabled (events survive restarts)" : "disabled (memory only; events are lost on unload, restart, or crash)"));
         PutModule(CString("journal path: ") + m_journal_path.c_str());
+        if (!m_journal_enabled) {
+            const long long leftover = file_size_or_missing(m_journal_path);
+            if (leftover > 0) {
+                PutModule(CString("note: a journal file from an earlier session still exists at that path (") +
+                          CString(std::to_string(leftover)) + " bytes) and is being ignored. Run Compact to remove it.");
+            }
+        }
     }
 
     void CmdSetBefore(const CString& sLine) {
@@ -1819,7 +2150,9 @@ class CHighlightCtx : public CModule {
                 for (size_t i = 0; i < to_drop; ++i) {
                     AppendJournal(SerializeDelivered(m_pending.front().id));
                     m_pending.erase(m_pending.begin());
+                    ++m_dropped_by_cap;
                 }
+                SetNV("dropped_by_cap", CString(std::to_string(m_dropped_by_cap)));
                 PutModule(CString("Dropped ") + CString(std::to_string(to_drop)) +
                           " oldest pending event(s) to enforce the new cap immediately.");
                 CompactJournalInternal();
@@ -1827,10 +2160,66 @@ class CHighlightCtx : public CModule {
         }
     }
 
+    void CmdSetMaxEventLines(const CString& sLine) {
+        CString val = sLine.Token(1, false);
+        CString vl = val.AsLower();
+        if (val.empty()) {
+            PutModule("Usage: SetMaxEventLines <count|0|off>");
+            return;
+        }
+        if (vl == "off" || vl == "no" || vl == "false" || vl == "disable" || vl == "disabled" || vl == "0") {
+            m_max_event_lines = 0;
+        } else {
+            unsigned int n = 0;
+            if (!parse_uint_cstr(val, n)) {
+                PutModule("Usage: SetMaxEventLines <count|0|off>");
+                return;
+            }
+            m_max_event_lines = n;
+        }
+        SetNV("max_event_lines", CString(std::to_string(m_max_event_lines)));
+        if (m_max_event_lines == 0) {
+            PutModule("max_event_lines set to disabled (events can grow without limit through extension).");
+            return;
+        }
+        PutModule(CString("max_event_lines set to ") + CString(std::to_string(m_max_event_lines)) +
+                  " total lines per event. It applies to all capture from now on, including events recovered from the journal; attaching already closed any event that was in progress.");
+        const unsigned int natural = m_before_max + 1 + m_after_max;
+        if (m_max_event_lines < natural) {
+            PutModule(CString("note: that is below the natural size of a single event (before ") +
+                      CString(std::to_string(m_before_max)) + " + trigger + after " +
+                      CString(std::to_string(m_after_max)) + " = " + CString(std::to_string(natural)) +
+                      " lines), so extension is effectively disabled. Events still collect their full configured window.");
+        }
+    }
+
+    void CmdSetMaxEventAge(const CString& sLine) {
+        CString val = sLine.Token(1, false);
+        long long secs = 0;
+        if (val.empty() || !parse_duration_secs(val, secs)) {
+            PutModule("Usage: SetMaxEventAge <duration|off> — e.g. 30d, 12h, 90m, 3600s, 2w, off");
+            return;
+        }
+        m_max_event_age_secs = secs;
+        SetNV("max_event_age_secs", CString(std::to_string(m_max_event_age_secs)));
+        if (m_max_event_age_secs == 0) {
+            PutModule("max_event_age set to disabled (pending events are kept until replayed).");
+            return;
+        }
+        // Defensive: while a client is attached the pending queue is empty
+        // (attaching replays and clears it), so this normally drops nothing.
+        // Expiry that matters happens at load and as traffic arrives.
+        ExpireOldPending();
+        PutModule(CString("max_event_age set to ") + format_duration_secs(m_max_event_age_secs) +
+                  ". Pending events older than that are dropped without being replayed, and the count is reported at your next replay.");
+    }
+
     void CmdReset() {
         m_before_max = 8;
         m_after_max = 8;
-        m_max_events = 0;
+        m_max_events = 100;
+        m_max_event_lines = 100;
+        m_max_event_age_secs = 0;
         m_require_ignore_mode = ERequireIgnoreMode::Auto;
         m_excluded.clear();
         m_excluded_nicks.clear();
@@ -1838,15 +2227,31 @@ class CHighlightCtx : public CModule {
         TrimAllRings();
         SetNV("before_max", "8");
         SetNV("after_max", "8");
-        SetNV("max_events", "0");
+        SetNV("max_events", "100");
+        SetNV("max_event_lines", "100");
+        SetNV("max_event_age_secs", "0");
         SaveIgnoreMode();
         SaveExcludes();
         SaveExcludedNicks();
-        PutModule("All settings reset to defaults: before=8, after=8, max_events=disabled, require_ignore_drop=auto, all exclusions (channel and nick/mask) cleared.");
+        PutModule("All settings reset to defaults: before=8, after=8, max_events=100, max_event_lines=100, max_event_age=disabled, require_ignore_drop=auto, all exclusions (channel and nick/mask) cleared.");
         PutModule("Pending/open events were not affected. Use ClearPending to discard them.");
+        PutModule(CString("The journal setting was left unchanged (currently ") + (m_journal_enabled ? "on" : "off") +
+                  "), so Reset never re-enables writing highlight context to disk. Change it with the journal=on/off load argument.");
     }
 
     void CmdCompact() {
+        if (!m_journal_enabled) {
+            const long long leftover = file_size_or_missing(m_journal_path);
+            if (leftover < 0) {
+                PutModule("Journaling is disabled (journal=off) and no journal file exists; nothing to do.");
+            } else if (remove_file_and_fsync_dir(m_journal_path)) {
+                PutModule(CString("Journaling is disabled (journal=off). Removed the leftover journal file (") +
+                          CString(std::to_string(leftover)) + " bytes).");
+            } else {
+                PutModule("Journaling is disabled (journal=off), but removing the leftover journal file failed.");
+            }
+            return;
+        }
         if (CompactJournalInternal()) PutModule("Journal compacted.");
         else PutModule("Journal compaction failed.");
     }
@@ -1855,8 +2260,13 @@ class CHighlightCtx : public CModule {
         m_open_by_chan.clear();
         m_pending.clear();
         ClearVolatileState();
-        if (CompactJournalInternal()) PutModule("Cleared all open/pending highlight events and compacted the journal.");
-        else PutModule("Cleared in-memory events, but journal compaction failed.");
+        if (!m_journal_enabled) {
+            PutModule("Cleared all open/pending highlight events. Journaling is disabled, so nothing was written to disk.");
+        } else if (CompactJournalInternal()) {
+            PutModule("Cleared all open/pending highlight events and compacted the journal.");
+        } else {
+            PutModule("Cleared in-memory events, but journal compaction failed.");
+        }
     }
 };
 
