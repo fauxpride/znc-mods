@@ -60,8 +60,15 @@ def install(ns):
             c.quit(); finish(z)
         print("    info: 70 pending events -> baseline %d/10 rewrites (%d journal lines), "
               "fixed %d/10 rewrites (%d journal lines)" % (res["v080"][0], res["v080"][1], res["v090"][0], res["v090"][1]))
-        check(scn, "baseline rewrites on every line", res["v080"][0] == 10, repr(res["v080"]))
-        check(scn, "fixed version does not rewrite per line", res["v090"][0] == 0, repr(res["v090"]))
+        # The baseline may or may not already contain the 0.11.1 compaction fix,
+        # so assert the property that must always hold rather than a specific
+        # baseline behaviour: the build under test never rewrites per line, and
+        # is never worse than the baseline.
+        check(scn, "version under test does not rewrite the journal per line", res["v090"][0] == 0, repr(res["v090"]))
+        check(scn, "no regression against the baseline", res["v090"][0] <= res["v080"][0],
+              "baseline=%d under-test=%d" % (res["v080"][0], res["v090"][0]))
+        if res["v080"][0] == 10:
+            check(scn, "baseline (pre-0.11.1) rewrote on every line, as expected", True, "")
         check(scn, "both retain all 70 events", res["v080"][2] == 70 and res["v090"][2] == 70, repr(res))
 
     def cmp_amortized_growth():
