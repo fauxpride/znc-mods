@@ -30,8 +30,9 @@ def iso(ts):
 
 
 class FakeIRCd:
-    def __init__(self, port):
+    def __init__(self, port, nick=MYNICK):
         self.port = port
+        self.nick = nick
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.srv.bind(("127.0.0.1", port))
@@ -114,12 +115,12 @@ class FakeIRCd:
         elif cmd == "NICK":
             pass
         elif cmd == "USER":
-            self.raw(":irc.test 001 %s :Welcome" % MYNICK)
-            self.raw(":irc.test 002 %s :Host" % MYNICK)
-            self.raw(":irc.test 003 %s :Created" % MYNICK)
-            self.raw(":irc.test 004 %s irc.test fake-1 io ntk" % MYNICK)
-            self.raw(":irc.test 005 %s CHANTYPES=# PREFIX=(ov)@+ CASEMAPPING=rfc1459 :are supported" % MYNICK)
-            self.raw(":irc.test 422 %s :No MOTD" % MYNICK)
+            self.raw(":irc.test 001 %s :Welcome" % self.nick)
+            self.raw(":irc.test 002 %s :Host" % self.nick)
+            self.raw(":irc.test 003 %s :Created" % self.nick)
+            self.raw(":irc.test 004 %s irc.test fake-1 io ntk" % self.nick)
+            self.raw(":irc.test 005 %s CHANTYPES=# PREFIX=(ov)@+ CASEMAPPING=rfc1459 :are supported" % self.nick)
+            self.raw(":irc.test 422 %s :No MOTD" % self.nick)
             self.registered.set()
         elif cmd == "PING":
             self.raw(":irc.test PONG irc.test :" + ln.split(" ", 1)[1].lstrip(":"))
@@ -132,9 +133,9 @@ class FakeIRCd:
                 ch = ch.strip()
                 if not ch:
                     continue
-                self.raw(":%s!tim@me.test JOIN %s" % (MYNICK, ch))
-                self.raw(":irc.test 353 %s = %s :%s alice bob" % (MYNICK, ch, MYNICK))
-                self.raw(":irc.test 366 %s %s :End of NAMES" % (MYNICK, ch))
+                self.raw(":%s!tim@me.test JOIN %s" % (self.nick, ch))
+                self.raw(":irc.test 353 %s = %s :%s alice bob" % (self.nick, ch, MYNICK))
+                self.raw(":irc.test 366 %s %s :End of NAMES" % (self.nick, ch))
                 with self.lock:
                     self.joined.add(ch.lower())
 
@@ -200,7 +201,7 @@ def free_port():
 
 
 class Znc:
-    def __init__(self, workdir, znc_bin, modules, load_lines, chans=("#a", "#b"), extra_env=None):
+    def __init__(self, workdir, znc_bin, modules, load_lines, chans=("#a", "#b"), extra_env=None, nick=MYNICK):
         self.workdir = workdir
         self.znc_bin = znc_bin
         self.modules = modules          # dict name -> .so path
@@ -210,7 +211,8 @@ class Znc:
         self.proc = None
         self.listen_port = free_port()
         self.irc_port = free_port()
-        self.ircd = FakeIRCd(self.irc_port)
+        self.nick = nick
+        self.ircd = FakeIRCd(self.irc_port, nick=nick)
         shutil.rmtree(workdir, ignore_errors=True)
         os.makedirs(os.path.join(workdir, "configs"))
         os.makedirs(os.path.join(workdir, "modules"))
@@ -241,7 +243,7 @@ class Znc:
         Hash = pass
     </Pass>
     Admin = true
-    Nick = tim
+    Nick = {nick}
     AltNick = tim_
     Ident = tim
     RealName = tim
@@ -250,7 +252,7 @@ class Znc:
         Server = 127.0.0.1 {ip}
 {mods}{chans}    </Network>
 </User>
-""".format(lp=self.listen_port, ip=self.irc_port, mods=mods, chans=chan_blocks)
+""".format(lp=self.listen_port, ip=self.irc_port, mods=mods, chans=chan_blocks, nick=self.nick)
         with open(os.path.join(self.workdir, "configs", "znc.conf"), "w") as f:
             f.write(cfg)
 
@@ -401,7 +403,7 @@ def module_body(raw):
     return (t, body)
 
 
-HDR = re.compile(r"^\[(?P<chan>[^\]]+)\] highlight event #(?P<id>\d+) \((?P<state>complete|partial), before=(?P<before>\d+), after=(?P<after>\d+)/(?P<target>\d+)(?:, triggers=(?P<triggers>\d+))?(?P<capped>, capped)?\)$")
+HDR = re.compile(r"^\[(?P<chan>.+?)\] highlight event #(?P<id>\d+) \((?P<state>complete|partial), before=(?P<before>\d+), after=(?P<after>\d+)/(?P<target>\d+)(?:, triggers=(?P<triggers>\d+))?(?P<capped>, capped)?\)$")
 INLINE_TS = re.compile(r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.000Z\] ")
 
 

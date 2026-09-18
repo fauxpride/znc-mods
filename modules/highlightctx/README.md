@@ -2,7 +2,7 @@
 
 Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional `ignore_drop` integration.
 
-Current module version in source: **0.11.1**. See [CHANGELOG](./CHANGELOG.md) for per-release notes and [TESTING](./TESTING.md) for the test suite.
+Current module version in source: **0.12.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes and [TESTING](./TESTING.md) for the test suite.
 
 ---
 
@@ -925,6 +925,32 @@ znc-buildmod highlightctx8.cpp
 
 This should produce `highlightctx8.so` for ZNC module loading. If you prefer a shorter module name (`highlightctx` instead of `highlightctx8`), rename the source file to `highlightctx.cpp` before building.
 
+### Updating in place
+
+`/znc updatemod highlightctx` normally picks up a replaced `.so` without a restart. Verify with:
+
+```text
+/msg *highlightctx Version
+```
+
+If the version string still shows the old build after a successful `updatemod`, the previous library is still resident in the ZNC process and glibc has handed it back instead of reading the new file. This happens when the module defines an `STB_GNU_UNIQUE` symbol that the `znc` binary does not: glibc marks such a library as non-unloadable, so `dlclose()` does nothing and ZNC reports success while continuing to run the old code.
+
+Since 0.11.2 the module avoids the library internals that produced those symbols, so this should not occur. To check a build:
+
+```text
+nm -D ~/.znc/modules/highlightctx.so | awk '$2=="u"{print $3}' | sort -u > /tmp/mod_u
+nm -D "$(command -v znc)"            | awk '$2=="u"{print $3}' | sort -u > /tmp/znc_u
+comm -23 /tmp/mod_u /tmp/znc_u | c++filt
+```
+
+Any symbol listed by the last command will pin the module in memory. If one appears — for instance after a compiler upgrade introduces a new inline static — rebuild with:
+
+```text
+CXXFLAGS="-fno-gnu-unique" znc-buildmod highlightctx.cpp
+```
+
+That is a workaround for a build that will not update in place, not a required build step. It changes symbol binding only, never code generation or behavior. A full `/znc restart` also always loads the new file.
+
 ### Install
 
 Install the built module into the appropriate ZNC module path for your environment, then load it as a **network module**.
@@ -1025,6 +1051,21 @@ Each event stores:
 - captured `after` lines
 - finalized flag
 - partial flag
+
+### Case handling
+
+Nicks and channel names are compared using **RFC 1459 casemapping**, which is what Undernet and EFnet use: `[ ] \` are the uppercase forms of `{ } |`, and `~` of `^`, in addition to ordinary ASCII case-insensitivity.
+
+This applies to:
+
+- highlight matching against your current nick
+- the self-check that stops your own messages triggering events
+- nick and mask exclusions
+- channel exclusions and the module's internal channel keys
+
+So with the nick `ti[m]`, a message containing `ti{m}` is a highlight, and `AddExclude #te[st]` can be removed with `DelExclude #TE{ST}`.
+
+One limitation worth knowing: ZNC resolves channel names itself with plain ASCII case-insensitivity, so a message addressed to a case-equivalent spelling of a channel never reaches the module as that channel's traffic. Folding the module's channel keys keeps them internally consistent, but it cannot change how ZNC routes the message in the first place.
 
 ### Exclusion logic
 

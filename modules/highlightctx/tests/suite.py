@@ -5,7 +5,7 @@ import time
 import traceback
 import binascii
 
-sys.path.insert(0, "/home/claude/harness")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hx import Znc, events_of, parse_replay, BASE_TS  # noqa: E402
 
 ZNC_BIN = os.environ.get("ZNC_BIN", "/usr/bin/znc")
@@ -35,14 +35,14 @@ def check(scn, name, ok, detail=""):
         print("    FAIL %s :: %s :: %s" % (scn, name, detail))
 
 
-def mk(name, so, load="before=8 after=8", chans=("#a", "#b"), pre_mods=None):
+def mk(name, so, load="before=8 after=8", chans=("#a", "#b"), pre_mods=None, nick="tim"):
     mods = {"highlightctx": so}
     lines = []
     for mname, mso, margs in (pre_mods or []):
         mods[mname] = mso
         lines.append((mname + " " + margs).strip())
     lines.append(("highlightctx " + load).strip())
-    z = Znc(os.path.join(ROOT, name), ZNC_BIN, mods, lines, chans=chans, extra_env=EXTRA_ENV)
+    z = Znc(os.path.join(ROOT, name), ZNC_BIN, mods, lines, chans=chans, extra_env=EXTRA_ENV, nick=nick)
     open_zncs.append(z)
     z.start()
     return z
@@ -1078,10 +1078,39 @@ EXTENSIONS = [ext_tim_exact, ext_last_line_of_window, ext_first_line_after_windo
 import journal_off  # noqa: E402
 import growth  # noqa: E402
 import compaction  # noqa: E402
+import symbols  # noqa: E402
+import casemap  # noqa: E402
 
 journal_off.install(globals())
 growth.install(globals())
 compaction.install(globals())
+symbols.install(globals())
+casemap.install(globals())
+
+
+def run_casemap():
+    for fn in CASEMAP:
+        if ONLY and fn.__name__ not in ONLY and "cm" not in ONLY:
+            continue
+        print("  running", fn.__name__)
+        try:
+            fn()
+        except Exception:
+            check(fn.__name__, "no exception", False, traceback.format_exc())
+        finally:
+            for z in list(open_zncs):
+                finish(z)
+
+
+def run_symbols():
+    for fn in SYMBOLS:
+        if ONLY and fn.__name__ not in ONLY and "sym" not in ONLY:
+            continue
+        print("  running", fn.__name__)
+        try:
+            fn()
+        except Exception:
+            check(fn.__name__, "no exception", False, traceback.format_exc())
 
 
 def run_compaction():
@@ -1152,6 +1181,8 @@ if __name__ == "__main__":
     run_journal_off()
     run_growth()
     run_compaction()
+    run_symbols()
+    run_casemap()
     by = {}
     for scn, name, ok, det in results:
         by.setdefault(scn.split("_v0")[0], [0, 0])

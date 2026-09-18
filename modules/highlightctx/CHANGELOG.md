@@ -6,6 +6,82 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.12.0] — 2026-09-18
+
+Correctness and performance work, with no new features.
+
+### Fixed
+
+* **RFC 1459 casemapping is now used for nicks and channel names.** Nick/mask exclusions already folded `[ ] \ ~` to `{ } | ^`; highlight matching, the self-message check, channel keys and channel exclusions used plain ASCII lowercasing. On Undernet and EFnet those characters are case-equivalent, so the two disagreed.
+
+  Observable effect: with the nick `ti[m]`, a message containing `ti{m}` is now matched as a highlight, and `AddExclude #te[st]` can be removed with `DelExclude #TE{ST}`. Verified against 0.11.2 with the same traffic: 0 events before, 1 after.
+
+  This alters matching behavior, which is why the minor version moves rather than the patch version. Plain ASCII case-insensitivity is unchanged.
+
+  Note that ZNC resolves channel names with ASCII case-insensitivity of its own, so a case-equivalent channel spelling never reaches the module as that channel's traffic. Folding the module's channel keys makes them internally consistent; it cannot change ZNC's routing.
+
+### Changed
+
+* **Open events are no longer deep-copied on every incoming line.** `FeedOpenEvents` rebuilt its vector by copying each surviving event, which copied every `before` and `after` line — two `std::string`s each — for every message in a channel with an open event. At the default `max_event_lines=100` that was up to ~100 line copies per message, per open event. Events are now finalized in place and survivors moved, so only finalized entries are touched.
+* **Pending events are held in a `std::deque`** instead of a `std::vector`. Dropping the oldest event to satisfy `max_events` was `erase(begin())`, shifting every remaining element — up to 99 event moves per drop at the default cap. It is now O(1). Iteration order and replay order are unchanged.
+* **Removed the unused `lc()` helpers**, which also clears the `-Wunused-function` warning the module had emitted for several releases. The build is now warning-clean under `-Wall -Wextra`, so future warnings are meaningful.
+* **Version marker bumped** from `highlightctx 0.11.2` to `highlightctx 0.12.0`.
+
+### Added
+
+* **Casemapping tests** (`tests/casemap.py`), including a differential check that the folded-nick highlight matches on this version and not on the baseline, plus literal bracketed nicks, bracketed channel names, exclusion add/delete round-trips across spellings, and confirmation that ASCII case handling and self-detection are unchanged.
+
+### Security
+
+* **No change to what is captured, stored, or replayed**, beyond the matching correction above. Journal format, NV keys, commands and replay output are identical to 0.11.2.
+* **Slightly wider matching by design.** Folding means a nick containing `[ ] \ ~` now also matches its `{ } | ^` form. That is the correct behavior for these networks, and it applies equally to exclusions, so an excluded sender stays excluded under either spelling.
+* **Lower per-message cost** in channels with an open event reduces the work an attacker can induce by flooding a channel you are mentioned in, on top of the `max_event_lines` bound added in 0.11.0.
+
+### Compatibility
+
+* **No format, setting, or command changes.** Existing journals and NV settings load unchanged.
+* **Stored channel exclusions are re-folded on load**, so an exclusion added by an earlier version continues to match; entries differing only in `[ ] \ ~` versus `{ } | ^` collapse to a single entry.
+* **Downgrading to 0.11.2** restores ASCII comparison; exclusion entries written by 0.12.0 remain readable.
+* **ZNC compatibility.** No new ZNC API is used. Built with `znc-buildmod` and run against ZNC 1.9.0 (`znc-dev 1.9.0-2build3`) and ZNC 1.9.1 built from the upstream `znc-1.9.1` tag.
+
+---
+
+## [0.11.2] — 2026-09-18
+
+Fixes the module not updating in place with `/znc updatemod`.
+
+On some toolchains the module defined `STB_GNU_UNIQUE` symbols that the `znc` binary does not. glibc marks any library whose own unique symbol gets bound as non-unloadable, so `dlclose()` silently does nothing. `/znc updatemod` then unloads and reloads by path, glibc returns the still-resident old library instead of reading the replaced file, and every step reports success while the old code keeps running. Only a full `/znc restart` picked up the new build.
+
+The symbols came from `std::to_string`, which GCC 11 implements through `std::__detail::__to_chars_10_impl`, whose function-local `__digits` tables are emitted as unique symbols. Measured on Ubuntu 22.04 with GCC 11.2: 3 such symbols, none of them defined by `znc`. GCC 13 does not use that code path, which is why the same source is unaffected there.
+
+### Fixed
+
+* **The module no longer emits unique symbols that pin it in memory.** `std::to_string` is replaced by a module-local `dec_str()` helper with internal linkage, no function-local statics and no libstdc++ template internals, and the remaining `std::map::operator[]` uses are replaced with `insert(std::make_pair(...))`, which removes `std::piecewise_construct` as well. Decimal output is identical for every integer type the module converts, so no user-visible string changes.
+
+  Verified by compiling both versions with GCC 11.2 on Ubuntu 22.04: 5 unique symbols before (3 `__digits`, `piecewise_construct`, one `std::variant` vtable from ZNC's own headers), 1 after — the ZNC one, which `znc` defines itself and is therefore harmless. The mechanism and the fix were also demonstrated directly: a library built the old way stays mapped after `dlclose()`, one built the new way unloads cleanly.
+
+### Added
+
+* **Symbol-hygiene tests** (`tests/symbols.py`). The suite now fails if the built `.so` defines any unique symbol the `znc` binary does not, and separately guards against `__to_chars_10_impl`/`piecewise_construct` reappearing. This catches a regression introduced by an innocuous source change or a future compiler upgrade.
+* **README section on updating in place**, describing how to check a build for pinning symbols and giving `CXXFLAGS="-fno-gnu-unique"` as a workaround should one ever appear.
+
+### Changed
+
+* **Version marker bumped** from `highlightctx 0.11.1` to `highlightctx 0.11.2`.
+
+### Security
+
+* **No behavioral change and no change to stored data.** Only integer-to-string conversion and three map insertions were rewritten; formatting, journal contents, replay output, and command output are unchanged.
+* **Reduced operational risk.** Operators no longer need a full ZNC restart — which drops every network connection — to deploy a module update, including a security fix.
+
+### Compatibility
+
+* **No format, setting, or command changes.** Journals, NV keys, and replay output are identical to 0.11.1.
+* **Compiler-independent by construction.** The fix removes the dependency on libstdc++ internals rather than suppressing the symbols with a build flag, so it holds across compiler versions. The test suite verifies the property per build rather than assuming it.
+* **ZNC compatibility.** No new ZNC API is used. Built with `znc-buildmod` and run against ZNC 1.9.0 (`znc-dev 1.9.0-2build3`) and ZNC 1.9.1 built from the upstream `znc-1.9.1` tag; symbol emission additionally verified with GCC 11.2 on Ubuntu 22.04.
+
+---
+
 ## [0.11.1] — 2026-09-17
 
 Fixes a long-standing performance defect in journal compaction.

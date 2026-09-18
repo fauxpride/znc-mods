@@ -17,6 +17,8 @@ Everything lives under [`tests/`](./tests/), self-contained within the module:
 | `journal_off.py` | Journaling opt-out scenarios (`jo_*`). |
 | `growth.py` | Growth-control scenarios (`gc_*`). |
 | `compaction.py` | Journal compaction scenarios (`cmp_*`). |
+| `symbols.py` | Symbol-hygiene scenarios (`sym_*`). |
+| `casemap.py` | RFC 1459 casemapping scenarios (`cm_*`). |
 
 ---
 
@@ -67,7 +69,7 @@ python3 suite.py
 
 ### Selecting scenarios
 
-Pass scenario names, or a group prefix (`reg`, `ext`, `jo`, `gc`, `cmp`):
+Pass scenario names, or a group prefix (`reg`, `ext`, `jo`, `gc`, `cmp`, `sym`, `cm`):
 
 ```sh
 python3 suite.py gc                    # growth-control scenarios only
@@ -130,6 +132,20 @@ That `journal=off` writes nothing to disk at all; that in-session replay is iden
 
 That a large pending queue no longer triggers a rewrite on every channel line; that compaction count grows with journal size rather than with appends; that the file stays within about twice live state; that dead records are still reclaimed; that recovery from a less-compacted journal reproduces events exactly, including extension targets and capped flags; that journals below the 512-line floor behave byte-identically to the previous version; and that replay resets the trigger point.
 
+### `cm_*` — RFC 1459 casemapping
+
+That a bracketed nick is matched in its case-equivalent form (asserted differentially against the baseline, which does not match it), that literal bracketed nicks and channels still work, that exclusions can be added and removed across spellings, and that ASCII case handling and self-detection are unchanged.
+
+These use the harness's per-scenario nick support (`mk(..., nick="ti[m]")`), since the effect is only observable with a nick containing `[ ] \ ~`.
+
+### `sym_*` — symbol hygiene
+
+These inspect the built `.so` with `nm` rather than running ZNC.
+
+A library that defines an `STB_GNU_UNIQUE` symbol which nothing else in the process defines is marked non-unloadable by glibc. `dlclose()` then does nothing, so `/znc updatemod` reloads the already-resident old code while reporting success, and the module only updates after a full ZNC restart. libstdc++ emits such symbols for some inline internals — `std::to_string` reaches them on GCC 11 — so the property has to be checked per build rather than assumed.
+
+The scenarios assert that the module defines no unique symbol the `znc` binary lacks, that `__to_chars_10_impl` and `piecewise_construct` specifically do not reappear, and that the build under test is no worse than the baseline. They need `nm` and `c++filt` from binutils, and `ZNC_BIN` pointing at the same ZNC the module will be loaded into.
+
 ### `gc_*` — growth controls
 
 Defaults; explicit disabling; rewrite frequency at stock defaults; `max_event_lines` boundary arithmetic; that a cap below the natural event size never truncates the configured window; that the next highlight after a capped event starts a fresh one; live evaluation of the cap; capped events surviving `SIGKILL` and compaction with their target intact; a cap lowered between sessions; flood bounding; `max_event_age` expiry during operation and at load; drop reporting for both causes; drop counters surviving a restart; absence of a drop note in the normal case; and that the default cap retains the newest 100 events.
@@ -154,3 +170,4 @@ Scenarios that depend on baseline-specific behaviour gate on `baseline_version()
 - **Timing.** Wall-clock comparisons are deliberately avoided: the fake server feeds lines serially, so the harness dominates and any timing figure would be meaningless. Performance claims should be made with a purpose-built benchmark, not this suite.
 - **Journal write volume beyond compaction.** The `cmp_*` scenarios cover how often the journal is rewritten, but not the per-append `fsync` cost, which is inherent to the durability design and is not measured here.
 - **Character encodings.** Non-UTF-8 and mixed-encoding channel traffic is not covered.
+- **Channel-name casemapping end to end.** ZNC resolves channel names with ASCII case-insensitivity before the module sees them, so a case-equivalent channel spelling cannot be delivered to the module in a test. The `cm_*` scenarios cover the module's own folding, not ZNC's routing.

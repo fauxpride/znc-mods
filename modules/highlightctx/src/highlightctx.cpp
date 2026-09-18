@@ -92,6 +92,7 @@
 #include <znc/Message.h>
 
 #include <algorithm>
+#include <type_traits>
 #include <cctype>
 #include <cerrno>
 #include <climits>
@@ -113,7 +114,7 @@
 
 namespace {
 
-static const char* kModVersion = "highlightctx 0.11.1";
+static const char* kModVersion = "highlightctx 0.12.0";
 static const char* kJournalName = "highlightctx.journal";
 // Floor for the compaction trigger. The effective trigger point is derived
 // from what the last compaction actually achieved (see m_compact_at), because
@@ -141,6 +142,31 @@ static CString ignore_mode_to_cstring(ERequireIgnoreMode mode) {
 }
 
 // Accepts the same on/off vocabulary as the other boolean-ish settings.
+// Decimal conversion for the module's own strings.
+//
+// This deliberately avoids std::to_string. In some libstdc++ versions (seen
+// with GCC 11 on Ubuntu 22.04) std::to_string is implemented through
+// std::__detail::__to_chars_10_impl, whose function-local __digits tables are
+// emitted as STB_GNU_UNIQUE symbols. glibc refuses to unload any library whose
+// own unique symbol gets bound, so dlclose() silently does nothing and
+// `/znc updatemod` reloads the already-resident old code while reporting
+// success — the module only really updates after a full ZNC restart.
+//
+// Keeping the conversion in this module's own code (internal linkage, no
+// function-local statics, no libstdc++ template internals) produces no unique
+// symbols on any compiler, so the module stays unloadable. Output is identical
+// to std::to_string for every integer type used here.
+template <typename T>
+static std::string dec_str(T v) {
+    char buf[32];
+    if (std::is_signed<T>::value) {
+        std::snprintf(buf, sizeof buf, "%lld", static_cast<long long>(v));
+    } else {
+        std::snprintf(buf, sizeof buf, "%llu", static_cast<unsigned long long>(v));
+    }
+    return std::string(buf);
+}
+
 static bool parse_on_off(const CString& s, bool& out) {
     CString v = s.AsLower().Trim_n();
     if (v == "0" || v == "off" || v == "no" || v == "false" || v == "disable" || v == "disabled") {
@@ -194,10 +220,10 @@ static CString format_duration_secs(long long secs) {
         {"w", 604800}, {"d", 86400}, {"h", 3600}, {"m", 60}, {"s", 1}};
     for (const auto& u : units) {
         if (secs % u.unit == 0) {
-            return CString(std::to_string(secs / u.unit)) + u.suffix;
+            return CString(dec_str(secs / u.unit)) + u.suffix;
         }
     }
-    return CString(std::to_string(secs)) + "s";
+    return CString(dec_str(secs)) + "s";
 }
 
 static bool parse_ignore_mode(const CString& s, ERequireIgnoreMode& out) {
@@ -215,18 +241,6 @@ static bool parse_ignore_mode(const CString& s, ERequireIgnoreMode& out) {
         return true;
     }
     return false;
-}
-
-static std::string lc(const CString& in) {
-    std::string out(in.c_str());
-    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return out;
-}
-
-static std::string lc(const std::string& in) {
-    std::string out(in);
-    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return out;
 }
 
 static bool parse_uint_cstr(const CString& s, unsigned int& out) {
@@ -375,8 +389,12 @@ static bool wildmatch_folded(const std::string& pattern, const std::string& text
 }
 
 static bool contains_nick_highlight(const CString& text, const CString& nick) {
-    std::string hay = lc(text);
-    std::string needle = lc(nick);
+    // Fold both sides with RFC 1459 casemapping so a nick containing
+    // [ ] \ ~ matches the { } | ^ forms the server may present, consistently
+    // with the self-check and with nick/mask exclusions. Boundary detection is
+    // unaffected: both sets are nick characters.
+    std::string hay = rfc1459_fold(text);
+    std::string needle = rfc1459_fold(nick);
     if (needle.empty()) return false;
 
     size_t pos = 0;
@@ -619,9 +637,9 @@ class CHighlightCtx : public CModule {
         sMessage = "Loaded ";
         sMessage += kModVersion;
         sMessage += " | before=";
-        sMessage += CString(std::to_string(m_before_max));
+        sMessage += CString(dec_str(m_before_max));
         sMessage += " after=";
-        sMessage += CString(std::to_string(m_after_max));
+        sMessage += CString(dec_str(m_after_max));
         sMessage += " require_ignore_drop=";
         sMessage += IgnoreModeName();
         if (m_require_ignore_mode == ERequireIgnoreMode::Auto) {
@@ -632,15 +650,15 @@ class CHighlightCtx : public CModule {
         sMessage += " journal=";
         sMessage += (m_journal_enabled ? "on" : "off");
         sMessage += " max_events=";
-        sMessage += (m_max_events == 0 ? "disabled" : CString(std::to_string(m_max_events)).c_str());
+        sMessage += (m_max_events == 0 ? "disabled" : CString(dec_str(m_max_events)).c_str());
         sMessage += " max_event_lines=";
-        sMessage += (m_max_event_lines == 0 ? "disabled" : CString(std::to_string(m_max_event_lines)).c_str());
+        sMessage += (m_max_event_lines == 0 ? "disabled" : CString(dec_str(m_max_event_lines)).c_str());
         sMessage += " max_event_age=";
         sMessage += format_duration_secs(m_max_event_age_secs);
         sMessage += " excludes=";
-        sMessage += CString(std::to_string(m_excluded.size()));
+        sMessage += CString(dec_str(m_excluded.size()));
         sMessage += "ch/";
-        sMessage += CString(std::to_string(m_excluded_nicks.size()));
+        sMessage += CString(dec_str(m_excluded_nicks.size()));
         sMessage += "nick";
         sMessage += journal_note;
         return true;
@@ -716,7 +734,7 @@ class CHighlightCtx : public CModule {
     struct Event {
         unsigned long long id{0};
         CString channel;
-        std::string channel_lc;
+        std::string channel_lc;   // RFC 1459 case-folded channel key
         long long started_ts{0};
         unsigned int after_cap{0};
         // Number of trailing lines this event must collect before it is
@@ -758,11 +776,11 @@ class CHighlightCtx : public CModule {
     bool m_ignore_drop_present_on_module_load{false};
     bool m_auto_ignore_drop_armed{false};
 
-    std::set<std::string> m_excluded;                 // channel exclusions, lowercased names
+    std::set<std::string> m_excluded;                 // channel exclusions, RFC 1459 case-folded
     std::vector<NickExclude> m_excluded_nicks;        // nick/hostmask exclusions
     std::map<std::string, std::deque<CaptureLine>> m_ring_by_chan;
     std::map<std::string, std::vector<Event>> m_open_by_chan;
-    std::vector<Event> m_pending;
+    std::deque<Event> m_pending;
 
     unsigned long long m_next_id{1};
     std::string m_journal_path;
@@ -822,7 +840,7 @@ class CHighlightCtx : public CModule {
         GetNV("excluded_channels").Split("\n", lines, false);
         for (const auto& c : lines) {
             CString chan = c.Trim_n();
-            if (!chan.empty()) m_excluded.insert(lc(chan));
+            if (!chan.empty()) m_excluded.insert(rfc1459_fold(chan));
         }
 
         m_excluded_nicks.clear();
@@ -862,7 +880,7 @@ class CHighlightCtx : public CModule {
                     return false;
                 }
                 m_before_max = n;
-                SetNV("before_max", CString(std::to_string(m_before_max)));
+                SetNV("before_max", CString(dec_str(m_before_max)));
             } else if (key == "after") {
                 unsigned int n = 0;
                 if (!parse_uint_cstr(val, n)) {
@@ -870,7 +888,7 @@ class CHighlightCtx : public CModule {
                     return false;
                 }
                 m_after_max = n;
-                SetNV("after_max", CString(std::to_string(m_after_max)));
+                SetNV("after_max", CString(dec_str(m_after_max)));
             } else if (key == "max_event_lines") {
                 CString vl = val.AsLower();
                 if (vl == "off" || vl == "no" || vl == "false" || vl == "disable" || vl == "disabled") {
@@ -883,7 +901,7 @@ class CHighlightCtx : public CModule {
                     }
                     m_max_event_lines = n;
                 }
-                SetNV("max_event_lines", CString(std::to_string(m_max_event_lines)));
+                SetNV("max_event_lines", CString(dec_str(m_max_event_lines)));
             } else if (key == "max_event_age") {
                 long long secs = 0;
                 if (!parse_duration_secs(val, secs)) {
@@ -891,7 +909,7 @@ class CHighlightCtx : public CModule {
                     return false;
                 }
                 m_max_event_age_secs = secs;
-                SetNV("max_event_age_secs", CString(std::to_string(m_max_event_age_secs)));
+                SetNV("max_event_age_secs", CString(dec_str(m_max_event_age_secs)));
             } else if (key == "journal") {
                 bool enabled = true;
                 if (!parse_on_off(val, enabled)) {
@@ -920,7 +938,7 @@ class CHighlightCtx : public CModule {
                     }
                     m_max_events = n;
                 }
-                SetNV("max_events", CString(std::to_string(m_max_events)));
+                SetNV("max_events", CString(dec_str(m_max_events)));
             } else if (key == "excludes") {
                 m_excluded.clear();
                 m_excluded_nicks.clear();
@@ -930,7 +948,7 @@ class CHighlightCtx : public CModule {
                     CString item = c.Trim_n();
                     if (item.empty()) continue;
                     if (is_channel_name(item)) {
-                        m_excluded.insert(lc(item));
+                        m_excluded.insert(rfc1459_fold(item));
                     } else {
                         NickExclude ne;
                         if (MakeNickExclude(item, ne)) {
@@ -1107,7 +1125,7 @@ class CHighlightCtx : public CModule {
     }
 
     bool IsExcluded(const CString& channel) const {
-        return (m_excluded.find(lc(channel)) != m_excluded.end());
+        return (m_excluded.find(rfc1459_fold(channel)) != m_excluded.end());
     }
 
     void EnsureJournalPath() {
@@ -1119,7 +1137,7 @@ class CHighlightCtx : public CModule {
     static std::string SerializeLine(const CaptureLine& line) {
         const std::string nick_hex = hex_encode(std::string(line.nick.c_str()));
         const std::string text_hex = hex_encode(std::string(line.text.c_str()));
-        std::string raw = std::to_string(line.ts_sec) + ";" + std::string(1, line.kind) + ";" + nick_hex + ";" + text_hex;
+        std::string raw = dec_str(line.ts_sec) + ";" + std::string(1, line.kind) + ";" + nick_hex + ";" + text_hex;
         return hex_encode(raw);
     }
 
@@ -1149,23 +1167,23 @@ class CHighlightCtx : public CModule {
         before_hex.reserve(ev.before.size());
         for (const auto& line : ev.before) before_hex.push_back(SerializeLine(line));
 
-        return std::string("B\t") + std::to_string(ev.id) + "\t" +
+        return std::string("B\t") + dec_str(ev.id) + "\t" +
                hex_encode(std::string(ev.channel.c_str())) + "\t" +
-               std::to_string(ev.started_ts) + "\t" +
-               std::to_string(ev.after_cap) + "\t" +
+               dec_str(ev.started_ts) + "\t" +
+               dec_str(ev.after_cap) + "\t" +
                join_char(before_hex, ',') + "\t" +
                SerializeLine(ev.trigger);
     }
 
     static std::string SerializeAfter(unsigned long long id, const CaptureLine& line) {
-        return std::string("A\t") + std::to_string(id) + "\t" + SerializeLine(line);
+        return std::string("A\t") + dec_str(id) + "\t" + SerializeLine(line);
     }
 
     // X record: the after-line at zero-based `after_index` of event `id` is a
     // trigger that extended the event. The new target is not stored; it is
     // derived as after_index + 1 + after_cap from the event's B record.
     static std::string SerializeExtend(unsigned long long id, size_t after_index) {
-        return std::string("X\t") + std::to_string(id) + "\t" + std::to_string(after_index);
+        return std::string("X\t") + dec_str(id) + "\t" + dec_str(after_index);
     }
 
     // Apply an extension at `after_index` to `ev`. Shared by the live feed
@@ -1199,15 +1217,15 @@ class CHighlightCtx : public CModule {
     // event. Carries no payload beyond the id; older builds ignore unknown
     // record types, so this is safe to downgrade past.
     static std::string SerializeCapped(unsigned long long id) {
-        return std::string("C\t") + std::to_string(id);
+        return std::string("C\t") + dec_str(id);
     }
 
     static std::string SerializeFinalize(unsigned long long id, bool partial) {
-        return std::string("F\t") + std::to_string(id) + "\t" + (partial ? "1" : "0");
+        return std::string("F\t") + dec_str(id) + "\t" + (partial ? "1" : "0");
     }
 
     static std::string SerializeDelivered(unsigned long long id) {
-        return std::string("D\t") + std::to_string(id);
+        return std::string("D\t") + dec_str(id);
     }
 
     bool AppendJournal(const std::string& line) {
@@ -1251,7 +1269,7 @@ class CHighlightCtx : public CModule {
                 Event ev;
                 ev.id = id;
                 ev.channel = chan.c_str();
-                ev.channel_lc = lc(ev.channel);
+                ev.channel_lc = rfc1459_fold(ev.channel);
                 ev.started_ts = started;
                 ev.after_cap = static_cast<unsigned int>(after_cap_ul);
                 ev.after_target = ev.after_cap;
@@ -1267,7 +1285,7 @@ class CHighlightCtx : public CModule {
                 }
 
                 if (!DeserializeLine(parts[6], ev.trigger)) continue;
-                all[id] = ev;
+                all.insert(std::make_pair(id, Event())).first->second = ev;
                 if (id > max_id) max_id = id;
             } else if (op == "A") {
                 if (parts.size() != 3) continue;
@@ -1332,7 +1350,7 @@ class CHighlightCtx : public CModule {
             if (ev.finalized) {
                 m_pending.push_back(ev);
             } else {
-                m_open_by_chan[ev.channel_lc].push_back(ev);
+                m_open_by_chan.insert(std::make_pair(ev.channel_lc, std::vector<Event>())).first->second.push_back(ev);
             }
         }
 
@@ -1533,9 +1551,9 @@ class CHighlightCtx : public CModule {
         if (m_max_events > 0) {
             while (m_pending.size() > m_max_events) {
                 AppendJournal(SerializeDelivered(m_pending.front().id));
-                m_pending.erase(m_pending.begin());
+                m_pending.pop_front();
                 ++m_dropped_by_cap;
-                SetNV("dropped_by_cap", CString(std::to_string(m_dropped_by_cap)));
+                SetNV("dropped_by_cap", CString(dec_str(m_dropped_by_cap)));
             }
         }
     }
@@ -1549,12 +1567,12 @@ class CHighlightCtx : public CModule {
         size_t dropped = 0;
         while (!m_pending.empty() && m_pending.front().started_ts < cutoff) {
             AppendJournal(SerializeDelivered(m_pending.front().id));
-            m_pending.erase(m_pending.begin());
+            m_pending.pop_front();
             ++dropped;
         }
         if (dropped > 0) {
             m_dropped_by_age += dropped;
-            SetNV("dropped_by_age", CString(std::to_string(m_dropped_by_age)));
+            SetNV("dropped_by_age", CString(dec_str(m_dropped_by_age)));
             CompactJournalInternal();
         }
     }
@@ -1586,18 +1604,18 @@ class CHighlightCtx : public CModule {
     void ReportDroppedEvents() {
         if (m_dropped_by_cap == 0 && m_dropped_by_age == 0) return;
         CString note = "note: ";
-        note += CString(std::to_string(m_dropped_by_cap + m_dropped_by_age));
+        note += CString(dec_str(m_dropped_by_cap + m_dropped_by_age));
         note += " older highlight event(s) were dropped before this replay (";
         bool first = true;
         if (m_dropped_by_cap > 0) {
-            note += CString(std::to_string(m_dropped_by_cap));
+            note += CString(dec_str(m_dropped_by_cap));
             note += " to stay within max_events=";
-            note += CString(std::to_string(m_max_events));
+            note += CString(dec_str(m_max_events));
             first = false;
         }
         if (m_dropped_by_age > 0) {
             if (!first) note += ", ";
-            note += CString(std::to_string(m_dropped_by_age));
+            note += CString(dec_str(m_dropped_by_age));
             note += " expired after max_event_age=";
             note += format_duration_secs(m_max_event_age_secs);
         }
@@ -1629,7 +1647,7 @@ class CHighlightCtx : public CModule {
         Event ev;
         ev.id = AllocEventId();
         ev.channel = channel;
-        ev.channel_lc = lc(channel);
+        ev.channel_lc = rfc1459_fold(channel);
         ev.started_ts = trigger_line.ts_sec;
         ev.after_cap = m_after_max;
         ev.after_target = ev.after_cap;
@@ -1647,7 +1665,7 @@ class CHighlightCtx : public CModule {
         if (ev.after_cap == 0) {
             FinalizeEvent(ev, false);
         } else {
-            m_open_by_chan[ev.channel_lc].push_back(ev);
+            m_open_by_chan.insert(std::make_pair(ev.channel_lc, std::vector<Event>())).first->second.push_back(ev);
         }
     }
 
@@ -1670,7 +1688,7 @@ class CHighlightCtx : public CModule {
     // Returns true if the line extended an open event (the caller must then
     // NOT start a new event for it).
     bool FeedOpenEvents(const CString& channel, const CaptureLine& line, bool is_trigger) {
-        const std::string chan_l = lc(channel);
+        const std::string chan_l = rfc1459_fold(channel);
         auto it = m_open_by_chan.find(chan_l);
         if (it == m_open_by_chan.end()) return false;
         if (it->second.empty()) {
@@ -1681,9 +1699,12 @@ class CHighlightCtx : public CModule {
         const size_t extend_idx = it->second.size() - 1;
         bool extended = false;
 
-        std::vector<Event> survivors;
-        survivors.reserve(it->second.size());
-
+        // Finalize completed events in place. Earlier versions rebuilt the
+        // vector by copying every surviving Event, which deep-copied all of
+        // its before/after lines (two std::strings each) on every incoming
+        // message — up to max_event_lines worth of copies per line, per open
+        // event. Erasing in place touches only the finalized entries.
+        size_t kept = 0;
         for (size_t i = 0; i < it->second.size(); ++i) {
             Event& ev = it->second[i];
             ev.after.push_back(line);
@@ -1703,14 +1724,15 @@ class CHighlightCtx : public CModule {
             if (ev.after.size() >= ev.after_target) {
                 FinalizeEvent(ev, false);
             } else {
-                survivors.push_back(ev);
+                if (kept != i) it->second[kept] = std::move(ev);
+                ++kept;
             }
         }
 
-        if (survivors.empty()) {
+        if (kept == 0) {
             m_open_by_chan.erase(it);
         } else {
-            it->second.swap(survivors);
+            it->second.resize(kept);
         }
         return extended;
     }
@@ -1735,7 +1757,9 @@ class CHighlightCtx : public CModule {
         // an event, but their messages are still fed into open events and
         // the ring buffer as ordinary context.
         CString mynick = CurrentNick();
-        bool is_self = (lc(line.nick) == lc(mynick));
+// RFC 1459 casemapping: [ ] \ fold to { } | on the networks this module
+        // targets, so self-detection must fold rather than ASCII-lowercase.
+        bool is_self = (rfc1459_fold(line.nick) == rfc1459_fold(mynick));
         bool is_trigger = !is_self && contains_nick_highlight(line.text, mynick) &&
                           !IsSenderExcluded(Message, line.nick);
 
@@ -1752,7 +1776,7 @@ class CHighlightCtx : public CModule {
         // The ring buffer always receives every eligible channel line,
         // including from excluded senders, so their messages remain
         // available as 'before' context for any future trigger.
-        auto& dq = m_ring_by_chan[lc(channel)];
+        auto& dq = m_ring_by_chan.insert(std::make_pair(rfc1459_fold(channel), std::deque<CaptureLine>())).first->second;
         dq.push_back(line);
         while (dq.size() > m_before_max) dq.pop_front();
 
@@ -1785,21 +1809,21 @@ class CHighlightCtx : public CModule {
             CString header = "[";
             header += ev.channel;
             header += "] highlight event #";
-            header += CString(std::to_string(ev.id));
+            header += CString(dec_str(ev.id));
             header += " (";
             header += (ev.partial ? "partial" : "complete");
             header += ", before=";
-            header += CString(std::to_string(ev.before.size()));
+            header += CString(dec_str(ev.before.size()));
             header += ", after=";
-            header += CString(std::to_string(ev.after.size()));
+            header += CString(dec_str(ev.after.size()));
             header += "/";
-            header += CString(std::to_string(ev.after_target));
+            header += CString(dec_str(ev.after_target));
             // Only extended events get the extra field, so the header of an
             // event with a single trigger is identical to 0.8.0.
             const size_t extensions = CountExtensions(ev);
             if (extensions > 0) {
                 header += ", triggers=";
-                header += CString(std::to_string(extensions + 1));
+                header += CString(dec_str(extensions + 1));
             }
             if (ev.capped) header += ", capped";
             header += ")";
@@ -1843,13 +1867,13 @@ class CHighlightCtx : public CModule {
         PutModule(CString("Version marker: ") + kModVersion);
         PutModule(CString("Detached-only capture active now: ") + (ShouldCaptureNow() ? "yes" : "no"));
         PutModule(CString("Network attached right now: ") + ((GetNetwork() && GetNetwork()->IsUserAttached()) ? "yes" : "no"));
-        PutModule(CString("before cap: ") + CString(std::to_string(m_before_max)));
-        PutModule(CString("after cap: ") + CString(std::to_string(m_after_max)));
-        PutModule(CString("max_events: ") + (m_max_events == 0 ? "disabled" : CString(std::to_string(m_max_events)).c_str()));
-        PutModule(CString("max_event_lines: ") + (m_max_event_lines == 0 ? "disabled" : CString(std::to_string(m_max_event_lines)).c_str()));
+        PutModule(CString("before cap: ") + CString(dec_str(m_before_max)));
+        PutModule(CString("after cap: ") + CString(dec_str(m_after_max)));
+        PutModule(CString("max_events: ") + (m_max_events == 0 ? "disabled" : CString(dec_str(m_max_events)).c_str()));
+        PutModule(CString("max_event_lines: ") + (m_max_event_lines == 0 ? "disabled" : CString(dec_str(m_max_event_lines)).c_str()));
         PutModule(CString("max_event_age: ") + format_duration_secs(m_max_event_age_secs));
-        PutModule(CString("events dropped since last replay: ") + CString(std::to_string(m_dropped_by_cap)) +
-                  " by max_events, " + CString(std::to_string(m_dropped_by_age)) + " by max_event_age");
+        PutModule(CString("events dropped since last replay: ") + CString(dec_str(m_dropped_by_cap)) +
+                  " by max_events, " + CString(dec_str(m_dropped_by_age)) + " by max_event_age");
         PutModule(CString("require_ignore_drop mode: ") + IgnoreModeName());
         PutModule(CString("ignore_drop ahead of highlightctx in hook order: ") + (m_ignore_drop_present_on_module_load ? "yes" : "no"));
         PutModule(CString("auto mode armed: ") + ((m_require_ignore_mode == ERequireIgnoreMode::Auto && m_auto_ignore_drop_armed) ? "yes" : "no"));
@@ -1861,17 +1885,17 @@ class CHighlightCtx : public CModule {
         if (GetClient()) {
             PutModule(CString("current client native server-time replay support: ") + (ClientSupportsNativeServerTime(GetClient()) ? "yes" : "no"));
         }
-        PutModule(CString("excluded channels: ") + CString(std::to_string(m_excluded.size())));
-        PutModule(CString("excluded nicks/masks: ") + CString(std::to_string(m_excluded_nicks.size())));
-        PutModule(CString("open events: ") + CString(std::to_string(open_count)));
-        PutModule(CString("pending finalized events: ") + CString(std::to_string(m_pending.size())));
+        PutModule(CString("excluded channels: ") + CString(dec_str(m_excluded.size())));
+        PutModule(CString("excluded nicks/masks: ") + CString(dec_str(m_excluded_nicks.size())));
+        PutModule(CString("open events: ") + CString(dec_str(open_count)));
+        PutModule(CString("pending finalized events: ") + CString(dec_str(m_pending.size())));
         PutModule(CString("journal: ") + (m_journal_enabled ? "enabled (events survive restarts)" : "disabled (memory only; events are lost on unload, restart, or crash)"));
         PutModule(CString("journal path: ") + m_journal_path.c_str());
         if (!m_journal_enabled) {
             const long long leftover = file_size_or_missing(m_journal_path);
             if (leftover > 0) {
                 PutModule(CString("note: a journal file from an earlier session still exists at that path (") +
-                          CString(std::to_string(leftover)) + " bytes) and is being ignored. Run Compact to remove it.");
+                          CString(dec_str(leftover)) + " bytes) and is being ignored. Run Compact to remove it.");
             }
         }
     }
@@ -1883,9 +1907,9 @@ class CHighlightCtx : public CModule {
             return;
         }
         m_before_max = n;
-        SetNV("before_max", CString(std::to_string(m_before_max)));
+        SetNV("before_max", CString(dec_str(m_before_max)));
         TrimAllRings();
-        PutModule(CString("before cap set to ") + CString(std::to_string(m_before_max)));
+        PutModule(CString("before cap set to ") + CString(dec_str(m_before_max)));
     }
 
     void CmdSetAfter(const CString& sLine) {
@@ -1895,8 +1919,8 @@ class CHighlightCtx : public CModule {
             return;
         }
         m_after_max = n;
-        SetNV("after_max", CString(std::to_string(m_after_max)));
-        PutModule(CString("after cap set to ") + CString(std::to_string(m_after_max)) +
+        SetNV("after_max", CString(dec_str(m_after_max)));
+        PutModule(CString("after cap set to ") + CString(dec_str(m_after_max)) +
                   " (new events use the new cap; already-open events keep the cap they started with)");
     }
 
@@ -1908,7 +1932,7 @@ class CHighlightCtx : public CModule {
         }
         if (is_channel_name(tok)) {
             // Channel path — unchanged from 0.7.0 semantics.
-            const std::string key = lc(tok);
+            const std::string key = rfc1459_fold(tok);
             auto ins = m_excluded.insert(key);
             SaveExcludes();
             CString msg = ins.second ? "Excluded channel: " : "Channel already excluded: ";
@@ -1994,7 +2018,7 @@ class CHighlightCtx : public CModule {
 
         // Channel-name path.
         if (is_channel_name(tok)) {
-            auto it = m_excluded.find(lc(tok));
+            auto it = m_excluded.find(rfc1459_fold(tok));
             if (it == m_excluded.end()) {
                 PutModule("That channel is not currently excluded.");
                 return;
@@ -2038,12 +2062,12 @@ class CHighlightCtx : public CModule {
         std::sort(chans.begin(), chans.end());
         for (const auto& c : chans) {
             ++i;
-            PutModule(CString(std::to_string(i)) + ") " + c + " [channel]");
+            PutModule(CString(dec_str(i)) + ") " + c + " [channel]");
         }
         // Nick/mask exclusions in insertion order.
         for (const auto& ne : m_excluded_nicks) {
             ++i;
-            CString line = CString(std::to_string(i)) + ") " + ne.mask_folded.c_str()
+            CString line = CString(dec_str(i)) + ") " + ne.mask_folded.c_str()
                          + " [" + (ne.nick_only ? "nick" : "mask") + "]";
             PutModule(line);
         }
@@ -2138,22 +2162,22 @@ class CHighlightCtx : public CModule {
             }
             m_max_events = n;
         }
-        SetNV("max_events", CString(std::to_string(m_max_events)));
+        SetNV("max_events", CString(dec_str(m_max_events)));
 
         if (m_max_events == 0) {
             PutModule("max_events set to disabled (no cap on pending events).");
         } else {
-            PutModule(CString("max_events set to ") + CString(std::to_string(m_max_events)) +
+            PutModule(CString("max_events set to ") + CString(dec_str(m_max_events)) +
                       " (new events will start dropping the oldest once the cap is reached).");
             if (m_pending.size() > m_max_events) {
                 size_t to_drop = m_pending.size() - m_max_events;
                 for (size_t i = 0; i < to_drop; ++i) {
                     AppendJournal(SerializeDelivered(m_pending.front().id));
-                    m_pending.erase(m_pending.begin());
+                    m_pending.pop_front();
                     ++m_dropped_by_cap;
                 }
-                SetNV("dropped_by_cap", CString(std::to_string(m_dropped_by_cap)));
-                PutModule(CString("Dropped ") + CString(std::to_string(to_drop)) +
+                SetNV("dropped_by_cap", CString(dec_str(m_dropped_by_cap)));
+                PutModule(CString("Dropped ") + CString(dec_str(to_drop)) +
                           " oldest pending event(s) to enforce the new cap immediately.");
                 CompactJournalInternal();
             }
@@ -2177,18 +2201,18 @@ class CHighlightCtx : public CModule {
             }
             m_max_event_lines = n;
         }
-        SetNV("max_event_lines", CString(std::to_string(m_max_event_lines)));
+        SetNV("max_event_lines", CString(dec_str(m_max_event_lines)));
         if (m_max_event_lines == 0) {
             PutModule("max_event_lines set to disabled (events can grow without limit through extension).");
             return;
         }
-        PutModule(CString("max_event_lines set to ") + CString(std::to_string(m_max_event_lines)) +
+        PutModule(CString("max_event_lines set to ") + CString(dec_str(m_max_event_lines)) +
                   " total lines per event. It applies to all capture from now on, including events recovered from the journal; attaching already closed any event that was in progress.");
         const unsigned int natural = m_before_max + 1 + m_after_max;
         if (m_max_event_lines < natural) {
             PutModule(CString("note: that is below the natural size of a single event (before ") +
-                      CString(std::to_string(m_before_max)) + " + trigger + after " +
-                      CString(std::to_string(m_after_max)) + " = " + CString(std::to_string(natural)) +
+                      CString(dec_str(m_before_max)) + " + trigger + after " +
+                      CString(dec_str(m_after_max)) + " = " + CString(dec_str(natural)) +
                       " lines), so extension is effectively disabled. Events still collect their full configured window.");
         }
     }
@@ -2201,7 +2225,7 @@ class CHighlightCtx : public CModule {
             return;
         }
         m_max_event_age_secs = secs;
-        SetNV("max_event_age_secs", CString(std::to_string(m_max_event_age_secs)));
+        SetNV("max_event_age_secs", CString(dec_str(m_max_event_age_secs)));
         if (m_max_event_age_secs == 0) {
             PutModule("max_event_age set to disabled (pending events are kept until replayed).");
             return;
@@ -2246,7 +2270,7 @@ class CHighlightCtx : public CModule {
                 PutModule("Journaling is disabled (journal=off) and no journal file exists; nothing to do.");
             } else if (remove_file_and_fsync_dir(m_journal_path)) {
                 PutModule(CString("Journaling is disabled (journal=off). Removed the leftover journal file (") +
-                          CString(std::to_string(leftover)) + " bytes).");
+                          CString(dec_str(leftover)) + " bytes).");
             } else {
                 PutModule("Journaling is disabled (journal=off), but removing the leftover journal file failed.");
             }
