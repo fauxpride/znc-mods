@@ -6,6 +6,10 @@ import shutil
 import time
 import traceback
 from harness import ZNC, IRCd, listener, wait_for
+import symbols
+
+CURRENT = '+r12 '      # build marker of the module under test
+VARIANT = '+r12-variant '  # marker of the --variant build (see TESTING.md)
 
 
 def wait_attempt(z):
@@ -322,7 +326,7 @@ def settings_persistence(module, baseline=False):
         after = z.a.command('STATUS')
         for value in ('123s','9s','enabled','#gate','ON'):
             assert value in after, after
-        assert '+r11' in z.a.command('VERSION')
+        assert CURRENT in z.a.command('VERSION')
 
 
 def reload_pending(module, baseline=False):
@@ -463,24 +467,24 @@ def differential_commands(new_module, old_module):
     print(f'PASS differential_commands ({len(commands)} byte-identical command responses)', flush=True)
 
 
-def upgrade_from(new_module, old_module, revision):
+def upgrade_from(new_module, old_module, revision, variant=None):
     with ZNC(old_module, 'upgrade-'+revision, denied=('#gate',)) as z:
         z.setup(delay=123, retries=7, retrystep=3, stopperformon='#gate')
         z.run()
         wait_attempt(z)
-        replacement = z.path/'modules/missingchans.so.new'
-        shutil.copyfile(new_module, replacement)
-        os.replace(replacement, z.path/'modules/missingchans.so')
+        z.install(new_module)
         out = z.a.command('UpdateMod missingchans', 'status')
         assert 'reload' in out.lower(), out
         version = z.a.command('VERSION')
-        restart_used = '+'+revision in version
+        restart_used = '+'+revision+' ' in version
         if restart_used:
+            # Expected for pre-r12 binaries in this load order: the old code is
+            # what stays resident, and it has no in-place loader.
             print('  '+revision+' remained resident after UpdateMod; testing full restart fallback', flush=True)
             z.restart()
             version = z.a.command('VERSION')
-        assert '+r11' in version, version
-        assert '+r11' in z.b.command('VERSION')
+        assert CURRENT in version, version
+        assert CURRENT in z.b.command('VERSION')
         status = z.a.command('STATUS')
         assert list(status_rows(status)) == LEGACY_FIELDS, status
         for fragment in ('123s','3s','#gate','ON'):
@@ -489,7 +493,15 @@ def upgrade_from(new_module, old_module, revision):
         assert z.servers['a'].join_count('#gate') == 1
         z.a.command('RUN')
         wait_for(lambda: z.servers['a'].join_count('#gate') == 2)
-    print(f'PASS upgrade_from_{revision} (both networks, saved settings, pending timer; restart={restart_used})', flush=True)
+        inplace = ''
+        if variant:
+            # Once r12 is the resident loader, the next update needs no restart.
+            z.install(variant)
+            assert 'reload' in z.a.command('UpdateMod missingchans', 'status').lower()
+            for client in (z.a, z.b):
+                assert VARIANT in client.command('VERSION')
+            inplace = '; next update in place'
+    print(f'PASS upgrade_from_{revision} (both networks, saved settings, pending timer; restart={restart_used}{inplace})', flush=True)
 
 
 LEGACY_FIELDS = ['Delay', 'JoinMissing', 'ExpectedMode', 'RetryPerform', 'Retries',
@@ -596,17 +608,202 @@ def debug_recovery_guards(module, baseline=False):
 
 def differential_r10_status(new_module, old_module):
     captures = []
-    for label, module in [('r10', old_module), ('r11', new_module)]:
+    for label, module in [('r10', old_module), ('new', new_module)]:
         with ZNC(module, 'status-'+label) as z:
-            if label == 'r11':
+            if label == 'new':
                 z.a.command('SET debug on')
             z.setup(delay=123, retries=7, retrystep=9, stopperformon='#gate')
             rows = status_rows(z.a.command('STATUS'))
-            if label == 'r11':
+            if label == 'new':
                 assert rows.pop('Debug') == 'ON'
             captures.append(rows)
     assert captures[0] == captures[1], captures
     print('PASS differential_r10_status (all 21 r10 rows preserved with Debug ON)', flush=True)
+
+
+def differential_r11(new_module, old_module):
+    """r12 changes only VERSION (an added Loader line). Everything else that
+    r11 printed, including both STATUS layouts, must be byte-identical."""
+    commands = ['HELP', 'STATUS', 'SET debug on', 'STATUS', 'SET delay 77', 'SET retrystep 0',
+                'SET stopperformon #gate', 'STATUS', 'SET debug off', 'STATUS', 'SET', 'SHOW',
+                'SET nonsense 1', 'unknown']
+    captures, versions = [], []
+    for label, module in [('r11', old_module), ('r12', new_module)]:
+        with ZNC(module, 'differential-r11-'+label) as z:
+            captures.append([module_lines(z.a.command(command)) for command in commands])
+            versions.append(module_lines(z.a.command('VERSION')).splitlines())
+    for capture, marker in zip(captures, ('+r11 ', CURRENT)):
+        # HELP names the build; that line is the only intended difference.
+        lines = capture[0].splitlines()
+        assert lines[1].startswith('Build: ') and marker in lines[1], lines[1]
+        capture[0] = '\n'.join(lines[:1] + lines[2:])
+    for command, old, new in zip(commands, *captures):
+        assert old == new, (command, old, new)
+    assert len(versions[0]) == 1 and versions[0][0].startswith('missingchans build: ') and '+r11 ' in versions[0][0]
+    assert len(versions[1]) == 2 and versions[1][0].startswith('missingchans build: ') and CURRENT in versions[1][0]
+    assert versions[1][1].startswith('Loader: resident loader '), versions[1]
+    print(f'PASS differential_r11 ({len(commands)} responses identical apart from the build name; VERSION adds a Loader line)', flush=True)
+
+
+def module_lines(output):
+    return '\n'.join(line.split(' :', 1)[1] for line in output.splitlines()
+                     if line.startswith(':*missingchans!') and ' PRIVMSG ' in line)
+
+
+def loader_line(output):
+    for line in module_lines(output).splitlines():
+        if line.startswith('Loader: '):
+            return line[len('Loader: '):]
+    return ''
+
+
+def update(z):
+    out = z.a.command('UpdateMod missingchans', 'status')
+    assert 'reload' in out.lower(), out
+
+
+def expect_build(z, marker, loader_fragment):
+    for client in (z.a, z.b):
+        out = client.command('VERSION')
+        assert marker in out, out
+        assert loader_fragment in loader_line(out), out
+
+
+def inplace_update(module, variant):
+    """Worst-case load order for earlier revisions: missingchans is loaded
+    first and perform binds symbols into it. Updates must still take effect."""
+    with ZNC(module, 'inplace-update', denied=('#gate',)) as z:
+        z.a.command('SET debug on')
+        z.setup(delay=123, retries=7, retrystep=3, stopperformon='#gate')
+        before = status_rows(z.a.command('STATUS'))
+        expect_build(z, CURRENT, 'resident loader')
+        assert len(z.mapped_builds()) == 1, z.mapped_builds()
+        z.run()
+        wait_attempt(z)
+        builds = [variant, module] * 3
+        for build in builds:
+            z.install(build)
+            update(z)
+            expect_build(z, VARIANT if build == variant else CURRENT, 'updated in place by resident loader')
+            after = status_rows(z.a.command('STATUS'))
+            assert {k: after[k] for k in LEGACY_FIELDS[:7]} == {k: before[k] for k in LEGACY_FIELDS[:7]}, after
+            assert after['Debug'] == 'ON', after
+            assert list(status_rows(z.b.command('STATUS'))) == LEGACY_FIELDS
+            # Only the resident loader and the running build remain mapped.
+            assert len(z.mapped_builds()) == 2, z.mapped_builds()
+            assert z.leftover_links() == [], z.leftover_links()
+        # The retry pending before the first update died with that instance.
+        time.sleep(3.5)
+        assert z.servers['a'].join_count('#gate') == 1
+        z.a.command('RUN')
+        wait_for(lambda: z.servers['a'].join_count('#gate') == 2, description='retry from updated build')
+    print(f'PASS inplace_update ({len(builds)} consecutive updates on both networks; 2 builds mapped)', flush=True)
+
+
+def inplace_load_order(module, variant):
+    """missingchans loaded after perform/route_replies, so nothing pins it."""
+    with ZNC(module, 'inplace-order', network_perform=False, first_modules=('perform', 'route_replies')) as z:
+        for build, marker in ((variant, VARIANT), (module, CURRENT)):
+            z.install(build)
+            update(z)
+            expect_build(z, marker, 'updated in place by resident loader')
+            assert len(z.mapped_builds()) == 2, z.mapped_builds()
+    print('PASS inplace_load_order (missingchans after perform/route_replies)', flush=True)
+
+
+def inplace_reloadmod(module, variant):
+    with ZNC(module, 'inplace-reloadmod') as z:
+        z.install(variant)
+        out = z.a.command('ReloadMod missingchans', 'status')
+        assert 'reload' in out.lower(), out
+        assert VARIANT in z.a.command('VERSION')
+        out = z.b.command('VERSION')
+        assert CURRENT in out and 'resident loader' in loader_line(out), out
+        assert len(z.mapped_builds()) == 2, z.mapped_builds()
+        z.install(module)  # same code as the resident build, but a new file
+        update(z)
+        expect_build(z, CURRENT, 'updated in place by resident loader')
+        assert len(z.mapped_builds()) == 2, z.mapped_builds()
+    print('PASS inplace_reloadmod (per-network reload picks up the installed file)', flush=True)
+
+
+def inplace_unload_load(module, variant):
+    with ZNC(module, 'inplace-unload-load') as z:
+        for client in (z.a, z.b):
+            assert 'unloaded' in client.command('UnloadMod missingchans', 'status').lower()
+        z.install(variant)
+        for client in (z.a, z.b):
+            out = client.command('LoadMod missingchans', 'status')
+            assert 'loaded' in out.lower(), out
+            assert VARIANT in client.command('VERSION')
+        assert len(z.mapped_builds()) == 2, z.mapped_builds()
+        out = z.a.command('ListAvailMods', 'status')
+        assert 'missingchans' in out, out
+        assert VARIANT in z.a.command('VERSION')
+    print('PASS inplace_unload_load (UnloadMod/LoadMod and ListAvailMods)', flush=True)
+
+
+def inplace_bad_file(module, variant, mismatch=None):
+    with ZNC(module, 'inplace-bad-file') as z:
+        z.install(variant)
+        update(z)
+        expect_build(z, VARIANT, 'updated in place')
+        bad = z.path/'not-a-module.so'
+        bad.write_bytes(b'not an ELF file\n')
+        broken = [(bad, 'cannot load')]
+        if mismatch:
+            broken.append((mismatch, 'is built for ZNC'))
+        for path, reason in broken:
+            start = len(z.a.texts())
+            z.install(path)
+            update(z)
+            # Both networks keep running the build that ran before, and say so.
+            expect_build(z, VARIANT, 'WARNING: the installed missingchans.so was not loaded')
+            assert reason in z.a.command('VERSION'), reason
+            assert any('WARNING: the installed missingchans.so' in line for line in z.a.texts()[start:])
+            assert list(status_rows(z.a.command('STATUS'))) == LEGACY_FIELDS
+            assert z.leftover_links() == [], z.leftover_links()
+        z.install(module)
+        update(z)
+        expect_build(z, CURRENT, 'updated in place by resident loader')
+        assert 'WARNING' not in z.a.command('VERSION')
+        assert len(z.mapped_builds()) == 2, z.mapped_builds()
+    print(f'PASS inplace_bad_file ({len(broken)} unusable replacement(s) rejected; previous build kept)', flush=True)
+
+
+def inplace_link_denied(module, variant):
+    with ZNC(module, 'inplace-link-denied') as z:
+        z.install(variant)
+        moddir = z.path/'modules'
+        os.chmod(moddir, 0o555)
+        try:
+            update(z)
+            out = z.a.command('VERSION')
+            assert CURRENT in out and 'cannot create a temporary link' in out, out
+            assert CURRENT in z.b.command('VERSION')
+        finally:
+            os.chmod(moddir, 0o755)
+        update(z)
+        expect_build(z, VARIANT, 'updated in place by resident loader')
+    print('PASS inplace_link_denied (unwritable module directory reported; retry succeeds)', flush=True)
+
+
+def inplace_downgrade(module, r11, variant):
+    with ZNC(module, 'inplace-downgrade') as z:
+        z.setup(delay=123, retries=7, retrystep=3, stopperformon='#gate')
+        before = status_rows(z.a.command('STATUS'))
+        z.install(r11)
+        update(z)
+        for client in (z.a, z.b):
+            out = client.command('VERSION')
+            assert '+r11 ' in out and loader_line(out) == '', out
+        assert status_rows(z.a.command('STATUS')) == before
+        z.install(variant)
+        update(z)
+        expect_build(z, VARIANT, 'updated in place by resident loader')
+        # A pre-r12 build cannot report its instances, so it stays mapped.
+        assert len(z.mapped_builds()) == 3, z.mapped_builds()
+    print('PASS inplace_downgrade (r12 loader runs r11, then updates again)', flush=True)
 
 
 EXTRA = [sentinel_suppression, network_preference, successful_recovery, pending_settings,
@@ -624,6 +821,9 @@ def main():
     parser.add_argument('--module', required=True, help='absolute path to missingchans.so')
     parser.add_argument('--compare-r9', help='also compare unchanged command responses against this r9 .so')
     parser.add_argument('--compare-r10', help='also compare debug status and upgrade from this r10 .so')
+    parser.add_argument('--compare-r11', help='also compare responses with, upgrade from, and downgrade to this r11 .so')
+    parser.add_argument('--variant', help='same source built with the +r12-variant marker; enables in-place update tests')
+    parser.add_argument('--mismatch', help='variant built for a different ZNC version string; extends inplace_bad_file')
     parser.add_argument('--baseline', action='store_true', help='assert r9 bug reproductions instead of fixed behavior')
     parser.add_argument('tests', nargs='*')
     args = parser.parse_args()
@@ -633,10 +833,14 @@ def main():
         parser.error('module file does not exist: ' + module)
     if not shutil.which(os.environ.get('ZNC_BIN', 'znc')):
         parser.error('ZNC_BIN must identify an installed ZNC executable')
-    if args.compare_r9 and not os.path.isfile(args.compare_r9):
-        parser.error('r9 module file does not exist: ' + args.compare_r9)
-    if args.compare_r10 and not os.path.isfile(args.compare_r10):
-        parser.error('r10 module file does not exist: ' + args.compare_r10)
+    for option in ('compare_r9', 'compare_r10', 'compare_r11', 'variant', 'mismatch'):
+        value = getattr(args, option)
+        if value and not os.path.isfile(value):
+            parser.error(option.replace('_', '-') + ' file does not exist: ' + value)
+        if value:
+            setattr(args, option, os.path.abspath(value))
+    if args.mismatch and not args.variant:
+        parser.error('--mismatch requires --variant')
     unknown = set(chosen) - set(TESTS)
     if unknown:
         parser.error('unknown tests: ' + ', '.join(sorted(unknown)))
@@ -650,16 +854,41 @@ def main():
             failed += 1
             print(f'FAIL {name}', flush=True)
             traceback.print_exc()
-    comparisons = []
+    checks = []
+    if not args.baseline:
+        def symbol_check():
+            znc = shutil.which(os.environ.get('ZNC_BIN', 'znc'))
+            built = [module] + ([args.variant] if args.variant else [])
+            problems = [p for path in built for p in symbols.check_module(path, znc)]
+            assert not problems, '\n'.join(problems)
+            print(f'PASS symbols ({len(built)} build(s): no pinning unique symbols, entry points present, private names internal)', flush=True)
+        checks.append(('symbols', symbol_check))
     if args.compare_r9:
-        comparisons.extend([('differential_commands', differential_commands, args.compare_r9),
-                            ('upgrade_from_r9', lambda new, old: upgrade_from(new, old, 'r9'), args.compare_r9)])
+        old9 = args.compare_r9
+        checks += [('differential_commands', lambda: differential_commands(module, old9)),
+                   ('upgrade_from_r9', lambda: upgrade_from(module, old9, 'r9', args.variant))]
     if args.compare_r10:
-        comparisons.extend([('differential_r10_status', differential_r10_status, args.compare_r10),
-                            ('upgrade_from_r10', lambda new, old: upgrade_from(new, old, 'r10'), args.compare_r10)])
-    for name, check, old in comparisons:
+        old10 = args.compare_r10
+        checks += [('differential_r10_status', lambda: differential_r10_status(module, old10)),
+                   ('upgrade_from_r10', lambda: upgrade_from(module, old10, 'r10', args.variant))]
+    if args.compare_r11:
+        old11 = args.compare_r11
+        checks += [('differential_r11', lambda: differential_r11(module, old11)),
+                   ('upgrade_from_r11', lambda: upgrade_from(module, old11, 'r11', args.variant))]
+    if args.variant:
+        variant = args.variant
+        checks += [('inplace_update', lambda: inplace_update(module, variant)),
+                   ('inplace_load_order', lambda: inplace_load_order(module, variant)),
+                   ('inplace_reloadmod', lambda: inplace_reloadmod(module, variant)),
+                   ('inplace_unload_load', lambda: inplace_unload_load(module, variant)),
+                   ('inplace_bad_file', lambda: inplace_bad_file(module, variant, args.mismatch)),
+                   ('inplace_link_denied', lambda: inplace_link_denied(module, variant))]
+        if args.compare_r11:
+            checks.append(('inplace_downgrade', lambda: inplace_downgrade(module, args.compare_r11, variant)))
+    for name, check in checks:
+        start = time.monotonic()
         try:
-            check(module, os.path.abspath(old))
+            check()
         except Exception:
             failed += 1
             print('FAIL ' + name, flush=True)

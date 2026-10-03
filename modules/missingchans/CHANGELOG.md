@@ -7,6 +7,49 @@ This module uses sequential build revisions (`rN`) rather than [Semantic Version
 
 ---
 
+## r12 — 2026-10-04
+
+Fixes the module not updating in place with `/znc updatemod`.
+
+ZNC opens modules with `RTLD_GLOBAL`, and `znc-buildmod` compiles without optimization, so every module exports weak copies of standard-library template code (for example `std::string` construction, and the module-type set that `MODULEDEFS` fills in). A module loaded later binds its references to those symbols in the earliest loaded module that defines them, and glibc then keeps that earlier module mapped for as long as the later one is loaded. `UpdateMod` reopens the same path, gets the old mapping back, and reports `Done` while the old code keeps running. Only a full ZNC restart picked up the new build.
+
+Whether this hits `missingchans` depends on load order. Measured with ZNC 1.10.3 and `LD_DEBUG=bindings`: r11 stayed stale behind stock `perform` when it was the first module loaded (1 bound symbol), and — with `webadmin` loaded first — behind highlightctx (69 symbols on GCC 13, 4 on GCC 11) and the other repository modules loaded after it. It updated correctly only when nothing loaded after it used one of its symbols. This is not the highlightctx 0.11.2 problem: `missingchans` defines no `STB_GNU_UNIQUE` symbols on GCC 11.2, 11.5 or 13.3. No source-level visibility setting can stop an unoptimized build from exporting these instantiations, so they cannot simply be removed.
+
+### Fixed
+
+- **`UpdateMod` now loads the installed build, in any load order.** The module's ZNC loader callback compares the installed `missingchans.so` with the file the running code came from. If they differ, it loads the installed file privately (`RTLD_LOCAL`, through a temporary hard link so glibc cannot return the old mapping by name), checks it was built for the running ZNC, and creates the instance from that code. Private loads cannot be bound to by other modules, so they unload once closed; a build is closed when its last instance is gone. The first loader to create an instance stays resident (`RTLD_NODELETE`), so it is always the copy ZNC reaches.
+- **No extra build flags are needed.** The fix works with plain `znc-buildmod missingchans.cpp`.
+
+### Added
+
+- `VERSION` prints a second line, `Loader: …`, saying whether the build is the resident loader, was updated in place, or could not be loaded.
+- If an installed replacement cannot be used (not a module, built for another ZNC version, or no write access to the module directory for the temporary link), the network keeps running the build that ran before. The reason appears in `VERSION`, in the `LoadMod` message, and as a notice to attached clients.
+- Symbol-hygiene checks (`tests/symbols.py`): fail a build that defines an `STB_GNU_UNIQUE` symbol the ZNC binary lacks, that is missing either entry point, or that exports module-private names.
+- In-place update tests: repeated updates on both networks in the worst-case load order, a different load order, per-network `ReloadMod`, `UnloadMod`/`LoadMod`, unusable replacements, an unwritable module directory, and a downgrade to r11 and back.
+- `tests/probe_loadorder.py`, a diagnostic that reports whether `UpdateMod` took effect for a given module load order and which modules bound symbols into the resident copy.
+
+### Changed
+
+- All module-specific classes and helpers now have internal linkage (an anonymous namespace), whatever visibility flags the compiler is given. Different builds loaded side by side cannot bind to or collide with each other.
+- `MODULEDEFS` is replaced by an equivalent hand-written `ZNCModuleEntry` that installs the resident loader. A second exported function, `MissingChansDirectEntry`, lets a resident r12+ loader create instances from a privately loaded build; its layout is frozen and may only be extended.
+- `ReloadMod` and `LoadMod` also run the build installed on disk. `ReloadMod` on one network can therefore leave networks on different builds until `UpdateMod` is run.
+- Build marker bumped from `2026-10-03+r11 (optional debug status; r10 recovery fixes retained)` to `2026-10-04+r12 (in-place UpdateMod; r11 debug status and r10 recovery fixes retained)`.
+
+### Compatibility
+
+- **The first upgrade from r11 or older may still need one ZNC restart.** The old binary is what stays resident and it has no in-place loader. Verify with `VERSION` after `UpdateMod`.
+- **The loader logic is fixed at the first r12+ build loaded since ZNC started.** Later changes to the loader itself take effect after a restart; all other changes apply in place.
+- Settings, NV keys, defaults, commands, STATUS (both layouts), HELP text apart from the build line, and all recovery behavior are unchanged from r11.
+- When r12 is resident, downgrading to r11 or older also works in place. Such a build cannot report when it is unused, so it stays mapped until restart.
+- The ZNC account needs write access to the module directory for in-place updates; `~/.znc/modules` normally provides it.
+- No new ZNC API is used. Built and tested against ZNC 1.10.3 with GCC 13.3 (glibc 2.39), GCC 11.5 (glibc 2.39), and GCC 11.2 on Ubuntu 22.04 (glibc 2.35).
+
+### Testing
+
+- Full integration suite, r9/r10/r11 comparisons, and the new in-place tests on all three toolchains; sanitizer runs on all three. See [TESTING.md](./TESTING.md) and [tests/RESULTS.md](./tests/RESULTS.md).
+
+---
+
 ## r11 — 2026-10-03
 
 ### Changed

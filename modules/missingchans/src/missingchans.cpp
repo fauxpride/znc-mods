@@ -1,6 +1,6 @@
 // missingchans.cpp — ZNC 1.10.3; see ../CHANGELOG.md and ../TESTING.md.
 // Build: znc-buildmod missingchans.cpp
-// r11: optional debug STATUS fields; retains all r10 recovery fixes.
+// r12: in-place UpdateMod through a resident loader; r11/r10 behavior retained.
 
 #include <znc/Modules.h>
 #include <znc/IRCNetwork.h>
@@ -15,8 +15,39 @@
 #include <algorithm>
 #include <limits>
 #include <ctime>
+#include <cerrno>
+#include <cstring>
 
-#define MISSINGCHANS_BUILD "2026-10-03+r11 (optional debug status; r10 recovery fixes retained)"
+#include <dlfcn.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define MISSINGCHANS_BUILD "2026-10-04+r12 (in-place UpdateMod; r11 debug status and r10 recovery fixes retained)"
+
+// Interface between the resident loader and a privately loaded build (see the
+// loader section at the end of this file). The layout is frozen: a resident
+// r12 loader may load any later build, so fields may only ever be appended.
+extern "C" {
+struct MissingChansDirectEntryV1 {
+    unsigned int uSize;         // sizeof() as compiled by the provider
+    unsigned int uAbi;          // 1
+    const char* pcBuild;        // MISSINGCHANS_BUILD of the provider
+    CModInfo::ModLoader fpLoad; // creates an instance from the provider's code
+    unsigned int (*fpLiveInstances)();
+    void (*fpSetLoaderNote)(const char* pcNote, bool bWarning);
+};
+ZNC_EXPORT_LIB_EXPORT const MissingChansDirectEntryV1* MissingChansDirectEntry();
+}
+
+// Everything module-specific has internal linkage, independent of compiler
+// visibility flags, so no other object can bind to it or collide with it.
+namespace {
+
+// Instances created from this copy of the code, and the loader's message for
+// the next instance. Both are per loaded copy of the binary.
+unsigned int g_uLiveInstances = 0;
+CString g_sPendingLoaderNote;
+bool g_bPendingLoaderWarning = false;
 
 // Case-insensitive ordering for CString (good enough for typical channel names)
 struct CStringCI {
@@ -79,10 +110,20 @@ public:
 
         m_bHaveLastAttemptMissing = false;
         m_bLastAttemptTriggeredPerform = false;
+
+        ++g_uLiveInstances;
     }
+
+    ~CMissingChansMod() override { --g_uLiveInstances; }
 
     bool OnLoad(const CString& sArgs, CString& sMessage) override {
         (void)sArgs;
+
+        // Set by the loader immediately before this instance was created.
+        m_sLoaderNote = g_sPendingLoaderNote.empty() ? CString("direct") : g_sPendingLoaderNote;
+        const bool bLoaderWarning = g_bPendingLoaderWarning;
+        g_sPendingLoaderNote.clear();
+        g_bPendingLoaderWarning = false;
 
         CString s;
 
@@ -127,6 +168,11 @@ public:
         }
 
         sMessage = CString("missingchans loaded. Build: ") + MISSINGCHANS_BUILD;
+        if (bLoaderWarning) {
+            // UpdateMod does not display OnLoad messages, so also tell clients.
+            sMessage += " " + m_sLoaderNote;
+            PutModule(m_sLoaderNote);
+        }
         return true;
     }
 
@@ -157,7 +203,11 @@ public:
         CString rest = sCommand.Token(1, true);
 
         if (cmd.empty() || cmd == "help" || cmd == "h" || cmd == "?") { PrintHelp(); return; }
-        if (cmd == "version") { PutModule(CString("missingchans build: ") + MISSINGCHANS_BUILD); return; }
+        if (cmd == "version") {
+            PutModule(CString("missingchans build: ") + MISSINGCHANS_BUILD);
+            PutModule("Loader: " + m_sLoaderNote);
+            return;
+        }
         if (cmd == "status") { PrintStatus(); return; }
         if (cmd == "show") { ShowExpected(); return; }
         if (cmd == "run") { StartCheck(true, 0, true); return; }
@@ -359,6 +409,8 @@ private:
     bool m_bHaveLastAttemptMissing;
     bool m_bLastAttemptTriggeredPerform;
     CString m_sLastPerformSource;
+
+    CString m_sLoaderNote;
 
 private:
     void ResetVolatileState() {
@@ -990,12 +1042,301 @@ void CJoinAttemptTimer::RunJob() {
     m_pMod->TimerJoinAttempt(m_uAttempt, m_uGen);
 }
 
-MODULEDEFS(CMissingChansMod, "Verify/join missing channels by comparing expected list vs WHOIS (with retry + perform support).")
-
 CWhoisTimeout::CWhoisTimeout(CMissingChansMod* pMod)
     : CTimer(pMod, 30, 1, "missingchans_whois_timeout", "missingchans WHOIS watchdog") {}
 
 void CWhoisTimeout::RunJob() {
     SetName("");
     static_cast<CMissingChansMod*>(GetModule())->WhoisTimedOut();
+}
+
+//
+// Resident loader (r12).
+//
+// ZNC opens modules with RTLD_GLOBAL. Any module loaded later may bind its own
+// references to weak C++ template code that this file was first to define.
+// glibc then keeps this file mapped while that module is loaded, and
+// UpdateMod's dlopen() of the same path returns the old, still-mapped code.
+// Which modules do that depends on load order, and no source-level visibility
+// setting can stop a -O0 build from exporting libstdc++ instantiations.
+//
+// The fix: ZNC's loader callback below never trusts that the mapped code is
+// what is installed. It compares the installed file with the file this copy
+// was mapped from. If they differ, it maps the installed file privately
+// (RTLD_LOCAL, through a temporary hard link so glibc does not reuse the old
+// mapping by name) and creates the instance from that code. Other objects
+// cannot bind to a RTLD_LOCAL object (only STB_GNU_UNIQUE symbols could pin
+// it, and tests/symbols.py rules those out), so private copies unload when
+// closed; they are closed once their last instance is gone. The first loader
+// to create an instance keeps itself resident (RTLD_NODELETE), so it is always
+// the one ZNC reaches and its bookkeeping is never lost.
+//
+
+unsigned int LiveInstances() { return g_uLiveInstances; }
+
+void SetLoaderNote(const char* pcNote, bool bWarning) {
+    g_sPendingLoaderNote = pcNote ? pcNote : "";
+    g_bPendingLoaderWarning = bWarning;
+}
+
+CModule* DirectLoad(ModHandle p, CUser* pUser, CIRCNetwork* pNetwork, const CString& sModName,
+                    const CString& sDataPath, CModInfo::EModuleType eType) {
+    return new CMissingChansMod(p, pUser, pNetwork, sModName, sDataPath, eType);
+}
+
+const char kSelfAnchor = 0; // any address inside this mapping, for dladdr()
+
+struct LoadedBuild {
+    void* pHandle = nullptr;
+    dev_t dev = 0;
+    ino_t ino = 0;
+    const MissingChansDirectEntryV1* pDirect = nullptr; // r12 and later
+    CModInfo::ModLoader fpLegacyLoad = nullptr;         // r11 and earlier
+    CString sBuild;
+};
+
+struct LoaderState {
+    CString sSelfPath;
+    bool bSelfKnown = false;
+    dev_t selfDev = 0;
+    ino_t selfIno = 0;
+    void* pSelfPin = nullptr;
+    bool bPinAttempted = false;
+    CString sPendingPath;         // module path ZNC resolved for this load
+    unsigned long long uSeq = 0;  // temporary link names
+    std::vector<LoadedBuild> vBuilds;
+    int iLastUsed = -1;           // index in vBuilds; -1 means this copy
+};
+
+LoaderState InitialState() {
+    LoaderState st;
+    Dl_info info;
+    if (dladdr(&kSelfAnchor, &info) && info.dli_fname) {
+        st.sSelfPath = info.dli_fname;
+        struct stat sb;
+        if (stat(info.dli_fname, &sb) == 0) {
+            st.bSelfKnown = true;
+            st.selfDev = sb.st_dev;
+            st.selfIno = sb.st_ino;
+        }
+    }
+    return st;
+}
+
+// First used by FillModInfo, i.e. right after ZNC maps this file, so the
+// recorded file identity is the one this code came from.
+LoaderState& State() {
+    static LoaderState state = InitialState();
+    return state;
+}
+
+void PinSelf(LoaderState& st) {
+    if (st.bPinAttempted || st.sSelfPath.empty()) return;
+    st.bPinAttempted = true;
+    st.pSelfPin = dlopen(st.sSelfPath.c_str(), RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
+}
+
+CString Errno(int err) { return CString(std::strerror(err)); }
+
+// Close private copies that have no instances left, except the one at iKeep
+// (-1: none). Builds older than r12 cannot report their instances and stay
+// mapped until restart. Returns the new index of iKeep, or -1.
+int ReleaseIdle(LoaderState& st, int iKeep) {
+    std::vector<LoadedBuild> kept;
+    int iNewKeep = -1, iNewLast = -1;
+    for (int i = 0; i < static_cast<int>(st.vBuilds.size()); ++i) {
+        const LoadedBuild& build = st.vBuilds[i];
+        if (i != iKeep && build.pDirect && build.pDirect->fpLiveInstances() == 0) {
+            dlclose(build.pHandle);
+            continue;
+        }
+        if (i == iKeep) iNewKeep = static_cast<int>(kept.size());
+        if (i == st.iLastUsed) iNewLast = static_cast<int>(kept.size());
+        kept.push_back(build);
+    }
+    st.vBuilds.swap(kept);
+    st.iLastUsed = iNewLast;
+    return iNewKeep;
+}
+
+// Map the installed file privately. Returns the index in vBuilds, -1 for
+// "it is this copy", or -2 with sProblem set.
+int LoadPrivate(LoaderState& st, const CString& sPath, const struct stat& sb,
+                CModInfo::EModuleType eType, CString& sProblem) {
+    const CString::size_type slash = sPath.rfind('/');
+    const CString sDir = slash == CString::npos ? CString(".") : sPath.substr(0, slash);
+    CString sLink;
+    for (int i = 0; i < 100; ++i) {
+        sLink = sDir + "/.missingchans-load-" + CString(static_cast<unsigned int>(getpid())) + "-" +
+                CString(++st.uSeq);
+        if (link(sPath.c_str(), sLink.c_str()) == 0) break;
+        const int err = errno;
+        if (err != EEXIST) {
+            sProblem = "cannot create a temporary link next to " + sPath + ": " + Errno(err);
+            return -2;
+        }
+        sLink.clear();
+    }
+    if (sLink.empty()) {
+        sProblem = "cannot create a unique temporary link next to " + sPath;
+        return -2;
+    }
+
+    void* pHandle = dlopen(sLink.c_str(), RTLD_NOW | RTLD_LOCAL);
+    const char* pcErr = pHandle ? nullptr : dlerror();
+    const CString sErr = pcErr ? pcErr : "unknown dlopen error";
+    unlink(sLink.c_str()); // the mapping stays valid without the name
+    if (!pHandle) {
+        sProblem = "cannot load " + sPath + ": " + sErr;
+        return -2;
+    }
+    if (pHandle == st.pSelfPin) {
+        dlclose(pHandle);
+        return -1;
+    }
+
+    const CModuleEntry* (*fpEntry)() = nullptr;
+    *reinterpret_cast<void**>(&fpEntry) = dlsym(pHandle, "ZNCModuleEntry");
+    const CModuleEntry* pEntry = fpEntry ? fpEntry() : nullptr;
+    if (!pEntry) {
+        dlclose(pHandle);
+        sProblem = sPath + " is not a ZNC module";
+        return -2;
+    }
+    if (std::strcmp(pEntry->pcVersion, VERSION_STR) || std::strcmp(pEntry->pcVersionExtra, VERSION_EXTRA)) {
+        sProblem = sPath + " is built for ZNC " + CString(pEntry->pcVersion) + pEntry->pcVersionExtra +
+                   ", core is " + VERSION_STR + VERSION_EXTRA;
+        dlclose(pHandle);
+        return -2;
+    }
+    if (std::strcmp(pEntry->pcCompileOptions, ZNC_COMPILE_OPTIONS_STRING)) {
+        sProblem = sPath + " is built with incompatible ZNC options";
+        dlclose(pHandle);
+        return -2;
+    }
+
+    LoadedBuild build;
+    build.pHandle = pHandle;
+    build.dev = sb.st_dev;
+    build.ino = sb.st_ino;
+
+    const MissingChansDirectEntryV1* (*fpDirect)() = nullptr;
+    *reinterpret_cast<void**>(&fpDirect) = dlsym(pHandle, "MissingChansDirectEntry");
+    if (fpDirect) {
+        const MissingChansDirectEntryV1* pDirect = fpDirect();
+        if (!pDirect || pDirect->uAbi < 1 || pDirect->uSize < sizeof(MissingChansDirectEntryV1) ||
+            !pDirect->fpLoad || !pDirect->fpLiveInstances || !pDirect->fpSetLoaderNote) {
+            dlclose(pHandle);
+            sProblem = sPath + " has an unsupported loader interface";
+            return -2;
+        }
+        build.pDirect = pDirect;
+        build.sBuild = pDirect->pcBuild ? CString(pDirect->pcBuild).Token(0) : CString("unknown build");
+    } else {
+        // Builds before r12: use their own ZNC loader, which creates the
+        // instance directly. Never call an r12+ loader this way (recursion).
+        CModInfo info;
+        info.SetName("missingchans");
+        info.SetPath(sPath);
+        pEntry->fpFillModInfo(info);
+        if (!info.GetLoader() || !info.SupportsType(eType)) {
+            dlclose(pHandle);
+            sProblem = sPath + " cannot be loaded as this module type";
+            return -2;
+        }
+        build.fpLegacyLoad = info.GetLoader();
+        build.sBuild = "pre-r12 build";
+    }
+    st.vBuilds.push_back(build);
+    return static_cast<int>(st.vBuilds.size()) - 1;
+}
+
+CModule* Instantiate(LoaderState& st, int iBuild, const CString& sNote, bool bWarning,
+                     ModHandle p, CUser* pUser, CIRCNetwork* pNetwork, const CString& sModName,
+                     const CString& sDataPath, CModInfo::EModuleType eType) {
+    st.iLastUsed = iBuild;
+    if (iBuild < 0) {
+        SetLoaderNote(sNote.c_str(), bWarning);
+        return DirectLoad(p, pUser, pNetwork, sModName, sDataPath, eType);
+    }
+    const LoadedBuild& build = st.vBuilds[iBuild];
+    if (build.pDirect) {
+        build.pDirect->fpSetLoaderNote(sNote.c_str(), bWarning);
+        return build.pDirect->fpLoad(p, pUser, pNetwork, sModName, sDataPath, eType);
+    }
+    return build.fpLegacyLoad(p, pUser, pNetwork, sModName, sDataPath, eType);
+}
+
+// ZNC's loader callback. It must always return an instance: ZNC does not check.
+CModule* ResidentLoad(ModHandle p, CUser* pUser, CIRCNetwork* pNetwork, const CString& sModName,
+                      const CString& sDataPath, CModInfo::EModuleType eType) {
+    LoaderState& st = State();
+    PinSelf(st);
+    const CString sPath = st.sPendingPath.empty() ? st.sSelfPath : st.sPendingPath;
+    const CString sSelfBuild = CString(MISSINGCHANS_BUILD).Token(0);
+
+    CString sProblem;
+    struct stat sb;
+    int iBuild = -2;
+    if (sPath.empty()) {
+        sProblem = "the module path is unknown";
+    } else if (stat(sPath.c_str(), &sb) != 0) {
+        sProblem = "cannot stat " + sPath + ": " + Errno(errno);
+    } else if (st.bSelfKnown && sb.st_dev == st.selfDev && sb.st_ino == st.selfIno) {
+        iBuild = -1;
+    } else {
+        for (size_t i = 0; i < st.vBuilds.size(); ++i) {
+            if (st.vBuilds[i].dev == sb.st_dev && st.vBuilds[i].ino == sb.st_ino) {
+                iBuild = static_cast<int>(i);
+                break;
+            }
+        }
+        if (iBuild == -2) iBuild = LoadPrivate(st, sPath, sb, eType, sProblem);
+    }
+
+    if (iBuild == -1) {
+        ReleaseIdle(st, -1);
+        return Instantiate(st, -1, "resident loader " + sSelfBuild + " (in-place UpdateMod enabled)", false,
+                           p, pUser, pNetwork, sModName, sDataPath, eType);
+    }
+    if (iBuild >= 0) {
+        iBuild = ReleaseIdle(st, iBuild);
+        return Instantiate(st, iBuild, "updated in place by resident loader " + sSelfBuild, false,
+                           p, pUser, pNetwork, sModName, sDataPath, eType);
+    }
+
+    // Keep the network covered by the code that ran before, and say so.
+    const int iFallback = st.iLastUsed;
+    const CString sRunning = iFallback >= 0 ? st.vBuilds[iFallback].sBuild : sSelfBuild;
+    const CString sWarning = "WARNING: the installed missingchans.so was not loaded (" + sProblem +
+                             "). Still running " + sRunning +
+                             ". Fix the file and run UpdateMod again, or restart ZNC.";
+    return Instantiate(st, iFallback, sWarning, true, p, pUser, pNetwork, sModName, sDataPath, eType);
+}
+
+void FillModInfo(CModInfo& Info) {
+    State().sPendingPath = Info.GetPath();
+    Info.SetDescription("Verify/join missing channels by comparing expected list vs WHOIS (with retry + perform support).");
+    Info.SetDefaultType(CModInfo::NetworkModule);
+    Info.AddType(CModInfo::NetworkModule);
+    Info.SetLoader(ResidentLoad);
+    TModInfo<CMissingChansMod>(Info);
+}
+
+} // namespace
+
+// Same contract as ZNC's MODULEDEFS, with the resident loader as the loader.
+extern "C" {
+ZNC_EXPORT_LIB_EXPORT const CModuleEntry* ZNCModuleEntry();
+ZNC_EXPORT_LIB_EXPORT const CModuleEntry* ZNCModuleEntry() {
+    static const CModuleEntry ThisModule = {VERSION_STR, VERSION_EXTRA, ZNC_COMPILE_OPTIONS_STRING,
+                                            FillModInfo};
+    return &ThisModule;
+}
+
+ZNC_EXPORT_LIB_EXPORT const MissingChansDirectEntryV1* MissingChansDirectEntry() {
+    static const MissingChansDirectEntryV1 Entry = {sizeof(MissingChansDirectEntryV1), 1, MISSINGCHANS_BUILD,
+                                                   DirectLoad, LiveInstances, SetLoaderNote};
+    return &Entry;
+}
 }

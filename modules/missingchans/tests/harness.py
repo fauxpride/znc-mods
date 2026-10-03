@@ -233,7 +233,7 @@ def listener(port=0):
 
 class ZNC:
     def __init__(self, module, name, channels=("#gate",), denied=(), network_perform=True,
-                 user_perform=False, extra_modules=(), chan_options=None):
+                 user_perform=False, extra_modules=(), chan_options=None, first_modules=()):
         root = os.environ.get("MC_TEST_ROOT")
         if root:
             Path(root).mkdir(parents=True, exist_ok=True)
@@ -272,7 +272,11 @@ ServerThrottle = 0
         if user_perform:
             config += " LoadModule = perform\n"
         for n, server in self.servers.items():
-            config += f" <Network {n}>\n  Server = 127.0.0.1 {server.port}\n  FloodBurst = 1000\n  FloodRate = 0.1\n  LoadModule = missingchans\n"
+            config += f" <Network {n}>\n  Server = 127.0.0.1 {server.port}\n  FloodBurst = 1000\n  FloodRate = 0.1\n"
+            # Load order matters for which shared object other modules bind to.
+            for mod in first_modules:
+                config += f"  LoadModule = {mod}\n"
+            config += "  LoadModule = missingchans\n"
             if network_perform and n == 'a':
                 config += "  LoadModule = perform\n"
             for mod in extra_modules:
@@ -328,6 +332,31 @@ ServerThrottle = 0
             (self.path/f'irc-{name}-before-restart.log').write_text('\n'.join(server.texts()))
             self.servers[name] = IRCd(listener(server.port), name, server.denied)
         self.__enter__()
+
+    def install(self, module):
+        """Replace the module file the way the README instructs: copy to a
+        sibling, then rename over the installed file (new inode)."""
+        target = self.path/'modules/missingchans.so'
+        staging = self.path/'modules/missingchans.so.new'
+        shutil.copyfile(module, staging)
+        if os.geteuid() == 0:
+            os.chown(staging, 65534, 65534)
+        os.replace(staging, target)
+
+    def mapped_builds(self):
+        """Distinct missingchans files currently mapped into the ZNC process,
+        as (inode, path) pairs. Private loads appear under their unlinked
+        temporary names."""
+        found = set()
+        with open(f'/proc/{self.proc.pid}/maps') as maps:
+            for line in maps:
+                fields = line.split(None, 5)
+                if len(fields) == 6 and 'missingchans' in fields[5]:
+                    found.add((fields[4], fields[5].strip().replace(' (deleted)', '')))
+        return found
+
+    def leftover_links(self):
+        return sorted(p.name for p in (self.path/'modules').iterdir() if p.name.startswith('.missingchans-load-'))
 
     def client(self, network):
         client = Client(self.port, network)
