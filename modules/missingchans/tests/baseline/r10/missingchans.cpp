@@ -1,6 +1,7 @@
 // missingchans.cpp — ZNC 1.10.3; see ../CHANGELOG.md and ../TESTING.md.
 // Build: znc-buildmod missingchans.cpp
-// r11: optional debug STATUS fields; retains all r10 recovery fixes.
+// r10: live membership reconciliation, scoped perform invocation, bounded
+// verification, timer replacement, and retained per-network diagnostics.
 
 #include <znc/Modules.h>
 #include <znc/IRCNetwork.h>
@@ -16,7 +17,7 @@
 #include <limits>
 #include <ctime>
 
-#define MISSINGCHANS_BUILD "2026-10-03+r11 (optional debug status; r10 recovery fixes retained)"
+#define MISSINGCHANS_BUILD "2026-10-03+r10 (live membership + scoped perform + retry diagnostics)"
 
 // Case-insensitive ordering for CString (good enough for typical channel names)
 struct CStringCI {
@@ -91,9 +92,6 @@ public:
             unsigned int v = s.ToUInt();
             if (v >= 1) m_uDelaySec = v;
         }
-
-        s = GetNV("debug");
-        if (!s.empty()) m_bDebug = ToBool(s);
 
         s = GetNV("joinmissing");
         if (!s.empty()) m_bJoinMissing = ToBool(s);
@@ -318,7 +316,6 @@ public:
 private:
     unsigned int m_uDelaySec;
     bool m_bJoinMissing;
-    bool m_bDebug = false;
 
     CString m_sExpectedMode;
 
@@ -808,33 +805,29 @@ private:
         t.AddRow(); t.SetCell("Setting", "VerifiedJoined(count)");
         t.SetCell("Value", CString((unsigned int)m_verifiedJoined.size()));
 
-        // Presentation only: retain diagnostics even while hidden.
-        if (m_bDebug) {
-            auto row = [&](const CString& key, const CString& value) {
-                t.AddRow(); t.SetCell("Setting", key); t.SetCell("Value", value);
-            };
-            row("Debug", "ON");
-            unsigned int joined = 0;
-            if (GetNetwork()) for (const CChan* chan : GetNetwork()->GetChans())
-                if (chan && chan->IsOn()) ++joined;
-            row("Network", GetNetwork() ? GetNetwork()->GetName() : CString("none"));
-            row("Phase", m_sPhase);
-            row("Attempt", CString(m_uAttempt));
-            row("LiveJoined(count)", CString(joined));
-            row("WhoisJoined(last snapshot)", CString(static_cast<unsigned int>(m_actual.size())));
-            row("Missing(last check)", MissingList());
-            row("LastAction", m_sLastAction);
-            CString lastMissing;
-            for (const CString& chan : m_lastAttemptMissing) {
-                if (!lastMissing.empty()) lastMissing += " ";
-                lastMissing += chan;
-            }
-            row("LastAttemptMissing", lastMissing.empty() ? CString("none") : lastMissing);
-            row("LastAttemptTriggeredPerform", m_bLastAttemptTriggeredPerform ? "yes" : "no");
-            row("PerformCalls(this connection)", CString(m_uPerformCount));
-            row("LastPerformSource", m_sLastPerformSource.empty() ? CString("none") : m_sLastPerformSource);
-            row("LastPerformAt", m_sLastPerformAt);
+        auto row = [&](const CString& key, const CString& value) {
+            t.AddRow(); t.SetCell("Setting", key); t.SetCell("Value", value);
+        };
+        unsigned int joined = 0;
+        if (GetNetwork()) for (const CChan* chan : GetNetwork()->GetChans())
+            if (chan && chan->IsOn()) ++joined;
+        row("Network", GetNetwork() ? GetNetwork()->GetName() : CString("none"));
+        row("Phase", m_sPhase);
+        row("Attempt", CString(m_uAttempt));
+        row("LiveJoined(count)", CString(joined));
+        row("WhoisJoined(last snapshot)", CString(static_cast<unsigned int>(m_actual.size())));
+        row("Missing(last check)", MissingList());
+        row("LastAction", m_sLastAction);
+        CString lastMissing;
+        for (const CString& chan : m_lastAttemptMissing) {
+            if (!lastMissing.empty()) lastMissing += " ";
+            lastMissing += chan;
         }
+        row("LastAttemptMissing", lastMissing.empty() ? CString("none") : lastMissing);
+        row("LastAttemptTriggeredPerform", m_bLastAttemptTriggeredPerform ? "yes" : "no");
+        row("PerformCalls(this connection)", CString(m_uPerformCount));
+        row("LastPerformSource", m_sLastPerformSource.empty() ? CString("none") : m_sLastPerformSource);
+        row("LastPerformAt", m_sLastPerformAt);
 
         PutModule(t);
     }
@@ -846,14 +839,7 @@ private:
         CString val = TrimSpaces(sRest.Token(1, true));
 
         if (key.empty()) {
-            PutModule("Usage: SET <delay|joinmissing|expectedmode|retryperform|retries|retrystep|stopperformon|debug> <value>");
-            return;
-        }
-
-        if (key == "debug") {
-            m_bDebug = ToBool(val);
-            SetNV("debug", m_bDebug ? "1" : "0");
-            PutModule(CString("OK. Debug is now ") + (m_bDebug ? "ON." : "OFF."));
+            PutModule("Usage: SET <delay|joinmissing|expectedmode|retryperform|retries|retrystep|stopperformon> <value>");
             return;
         }
 
@@ -954,9 +940,6 @@ private:
         PutModule("  retrystep <seconds>");
         PutModule("      Backoff step between attempts. Attempt i waits (i * retrystep) seconds");
         PutModule("      before firing (minimum wait 1s). Default 20.");
-        PutModule("  debug <on|off>");
-        PutModule("      Show additional diagnostic fields in STATUS. Default OFF (r9 fields).");
-        PutModule("      Presentation only; does not change recovery or clear recorded diagnostics.");
         PutModule("  stopperformon <#channel|off>");
         PutModule("      Sentinel channel. If it appears joined (live state, WHOIS or self-443), perform");
         PutModule("      Execute is suppressed for the rest of this cycle. Use 'off' (or 'none',");

@@ -1,6 +1,51 @@
-// missingchans.cpp — ZNC 1.10.3; see ../CHANGELOG.md and ../TESTING.md.
+// missingchans.cpp — ZNC 1.9.1 compatible
 // Build: znc-buildmod missingchans.cpp
-// r11: optional debug STATUS fields; retains all r10 recovery fixes.
+//
+// Changes vs r8:
+// - The WHOIS round-trip that the module sends as part of its internal
+//   verification logic is no longer surfaced to attached IRC clients. The
+//   module's own WHOIS reply numerics (311/312/313/317/319/330/338/671/318/
+//   401 for the module's target) are intercepted and dropped before they
+//   reach the client.
+// - User-initiated /whois (issued from an attached client) is unaffected;
+//   those replies still reach clients exactly as before.
+// - Distinguishing module-vs-user WHOIS is done with a FIFO queue of request
+//   origins, since IRC servers serialize WHOIS replies in request order on
+//   a single connection. When the module sends WHOIS it pushes "ours" onto
+//   the queue; when a client sends WHOIS (caught via OnUserRawMessage) it
+//   pushes "user" onto the queue. The front of the queue identifies whose
+//   replies are currently arriving; we pop on 318/401 (end of WHOIS).
+// - The queue is cleared on IRC disconnect to avoid stale state.
+// - Bumps build marker to r9.
+//
+// Changes vs r7:
+// - Fixes a parser bug where 319 reply tokens like "+#chan" (voiced in #chan)
+//   or "&#chan" (admin in #chan on networks where '&' is a user-mode prefix)
+//   were treated as the channel name itself rather than having the user-mode
+//   prefix stripped. Symptom: when the user is voiced (or admin) in some of
+//   their channels, those channels show up as "missing" because m_actual
+//   ends up containing "+#chan" / "&#chan" instead of "#chan".
+//   Root cause: StripPrefix stopped at the first '+' or '&', which are valid
+//   channel-type prefixes on some networks but also valid user-mode prefixes.
+//   Fix: disambiguate by looking at the next character — if it's another
+//   prefix-like char, the leading '+' / '&' is a user-mode prefix and gets
+//   stripped; otherwise it's the channel-type prefix and we stop there.
+// - Also: StripPrefix now returns empty when the result doesn't start with a
+//   channel-type prefix, so 319 parsing can't silently insert garbage tokens
+//   into m_actual.
+// - Bumps build marker to r8.
+//
+// Changes vs r6:
+// - Cosmetic only: HELP command now lists every SET key with a short description,
+//   instead of showing a "key settings" subset. No behavior changes.
+// - Bumps build marker to r7.
+//
+// Changes vs r5:
+// - Fixes cases where self-WHOIS DOES include +s/+p channels but module still misses them:
+//   * Case-insensitive channel comparisons (avoids #Chan vs #chan false "missing")
+//   * More robust parsing of 319 by concatenating params[2..end]
+// - Keeps 443 fallback ("already on channel") as additional server-truth
+// - Bumps build marker to r6
 
 #include <znc/Modules.h>
 #include <znc/IRCNetwork.h>
@@ -12,11 +57,8 @@
 #include <vector>
 #include <deque>
 #include <cctype>
-#include <algorithm>
-#include <limits>
-#include <ctime>
 
-#define MISSINGCHANS_BUILD "2026-10-03+r11 (optional debug status; r10 recovery fixes retained)"
+#define MISSINGCHANS_BUILD "2026-05-21+r9 (robust 319 + case-insensitive chans + 443 fallback; voiced-channel parser fix; hidden self-WHOIS)"
 
 // Case-insensitive ordering for CString (good enough for typical channel names)
 struct CStringCI {
@@ -37,12 +79,6 @@ private:
     CMissingChansMod* m_pMod;
     unsigned long long m_uGen;
     bool m_bResetAttempts;
-};
-
-class CWhoisTimeout : public CTimer {
-public:
-    explicit CWhoisTimeout(CMissingChansMod* pMod);
-    void RunJob() override;
 };
 
 class CJoinAttemptTimer : public CTimer {
@@ -92,9 +128,6 @@ public:
             if (v >= 1) m_uDelaySec = v;
         }
 
-        s = GetNV("debug");
-        if (!s.empty()) m_bDebug = ToBool(s);
-
         s = GetNV("joinmissing");
         if (!s.empty()) m_bJoinMissing = ToBool(s);
 
@@ -131,16 +164,12 @@ public:
     }
 
     void OnIRCConnected() override {
-        CancelTimers();
-        ResetVolatileState();
         const unsigned long long gen = NextGen();
-        m_sPhase = "initial delay";
         PutModule("IRC connected. Scheduling verification in " + CString(m_uDelaySec) + "s.");
         AddTimer(new CRunTimer(this, m_uDelaySec, gen, true, "missingchans delayed run"));
     }
 
     void OnIRCDisconnected() override {
-        CancelTimers();
         NextGen();
         ResetVolatileState();
     }
@@ -167,39 +196,55 @@ public:
     }
 
     EModRet OnUserRawMessage(CMessage& msg) override {
-        if (msg.GetCommand().Equals("WHOIS") && !msg.GetParams().empty()) {
-            VCString targets;
-            msg.GetParams().back().Split(",", targets, false);
-            for (const CString& target : targets) {
-                m_whoisOrigins.push_back({target.AsLower(), false});
-            }
-            if (m_whoisOrigins.size() > 128) {
-                AbortWhois("WHOIS tracking limit reached; no repair attempted.");
-            }
+        // Track user-initiated WHOIS so we don't accidentally suppress its
+        // replies. The actual decision is made in OnNumericMessage by looking
+        // at the front of m_whoisOrigins.
+        if (msg.GetCommand().Equals("WHOIS")) {
+            m_whoisOrigins.push_back(false);
         }
         return CONTINUE;
     }
 
-    EModRet OnRawMessage(CMessage& raw) override {
-        // Observe numerics before core routing: route_replies can consume a
-        // client's WHOIS before OnNumericMessage would see its terminator.
-        if (raw.GetType() != CMessage::Type::Numeric) return CONTINUE;
-        CNumericMessage& msg = raw.As<CNumericMessage>();
+    EModRet OnNumericMessage(CNumericMessage& msg) override {
         const unsigned int code = msg.GetCode();
 
-        // 443 names the user who is already present. It is not generally
-        // returned for duplicate JOINs, and an INVITE may name someone else.
-        if (code == 443 && msg.GetParams().size() >= 3 &&
-            msg.GetParam(1).Equals(GetNetwork()->GetIRCNick().GetNick())) {
-            const CString chan = msg.GetParam(2);
-            if (m_expected.count(chan) || m_lastAttemptMissing.count(chan)) {
-                m_verifiedJoined.insert(chan);
-                m_departed.erase(chan);
-                MaybeSuppressPerform();
+        // 443 <me> <user> <channel> :is already on channel
+        // Robustly extract channel (don’t assume fixed index), and only accept it if relevant to expected/missing.
+        if (code == 443) {
+            CString chan;
+            const size_t n = msg.GetParams().size();
+            for (size_t i = 0; i < n; ++i) {
+                CString p = msg.GetParam((unsigned int)i);
+                if (!p.empty() && p[0] == ':') p.erase(0, 1);
+                CString c = StripPrefix(p);
+                if (!c.empty() && (c[0] == '#' || c[0] == '&' || c[0] == '!' || c[0] == '+')) {
+                    chan = c;
+                    break;
+                }
+            }
+
+            if (!chan.empty()) {
+                // Only learn channels we care about (avoids polluting verified set)
+                if (m_expected.find(chan) != m_expected.end() || m_lastAttemptMissing.find(chan) != m_lastAttemptMissing.end()) {
+                    const bool wasNew = (m_verifiedJoined.insert(chan).second);
+                    if (wasNew) {
+                        PutModule(CString("Server confirms you're already on ") + chan +
+                                  " (443). Treating it as joined (useful if WHOIS is incomplete).");
+                    }
+                }
             }
         }
 
-        // Only a matching WHOIS target may consume an origin marker.
+        // WHOIS-related numerics. We need to decide two things here:
+        //   1) whether to do the module's own internal parsing (only for our
+        //      self-WHOIS, gated on m_bWaitingWhois + target match), and
+        //   2) whether to hide this numeric from attached clients (only for
+        //      replies that match our request at the front of the queue).
+        //
+        // The queue is FIFO: each WHOIS request — ours or a user's — pushes
+        // one entry, and 318/401 pops one entry. IRC servers serialize WHOIS
+        // replies in request order on a single connection, so the front of
+        // the queue identifies whose replies are currently arriving.
         const bool isWhoisRelated =
             (code == 311 || code == 312 || code == 313 || code == 317 ||
              code == 319 || code == 330 || code == 338 || code == 671 ||
@@ -209,23 +254,9 @@ public:
             return CONTINUE;
         }
 
-        // 401 may terminate WHOIS by itself, or be followed by an optional
-        // 318. Retire it once and absorb that optional terminator without
-        // consuming the next request. A fresh 311 starts a new reply batch.
-        if (msg.GetParams().size() >= 2 && !m_sFailedWhoisTarget.empty() &&
-            msg.GetParam(1).AsLower() == m_sFailedWhoisTarget) {
-            if (code == 318) {
-                const bool hide = m_bFailedWhoisOurs;
-                m_sFailedWhoisTarget.clear();
-                return hide ? HALT : CONTINUE;
-            }
-            if (code == 311) m_sFailedWhoisTarget.clear();
-        }
-
-        const bool matchesFront = msg.GetParams().size() >= 2 &&
-            !m_whoisOrigins.empty() &&
-            msg.GetParam(1).AsLower() == m_whoisOrigins.front().target;
-        const bool isOursAtFront = matchesFront && m_whoisOrigins.front().ours;
+        const bool isEndOfWhois = (code == 318 || code == 401);
+        const bool isOursAtFront =
+            !m_whoisOrigins.empty() && m_whoisOrigins.front();
 
         // Module's internal parsing — only when this numeric corresponds to
         // OUR request AND we're still waiting for the WHOIS to complete.
@@ -255,56 +286,22 @@ public:
                     }
                 } else if (code == 318) {
                     m_bWaitingWhois = false;
-                    RemTimer("missingchans_whois_timeout");
-                    m_sPhase = "checked";
                     FinishCheck();
                 } else if (code == 401) {
                     m_bWaitingWhois = false;
-                    m_sPhase = "WHOIS failed";
-                    m_sLastAction = "WHOIS failed (401); no repair attempted";
-                    PutModule(m_sLastAction);
-
+                    PutModule("WHOIS failed (401). Cannot verify channel membership right now.");
                 }
             }
         }
 
         // Pop the request marker on end-of-whois (regardless of whether it
         // was ours or the user's).
-        if ((code == 318 || code == 401) && matchesFront) {
-            if (code == 401) {
-                m_sFailedWhoisTarget = msg.GetParam(1).AsLower();
-                m_bFailedWhoisOurs = isOursAtFront;
-            }
+        if (isEndOfWhois && !m_whoisOrigins.empty()) {
             m_whoisOrigins.pop_front();
-            if (m_whoisOrigins.empty()) m_bWhoisUnsafe = false;
-            if (isOursAtFront) RemTimer("missingchans_whois_timeout");
         }
 
         // Suppress from attached clients only if this batch was ours.
         return isOursAtFront ? HALT : CONTINUE;
-    }
-
-    void OnJoinMessage(CJoinMessage& msg) override {
-        if (!msg.GetNick().NickEquals(GetNetwork()->GetIRCNick().GetNick())) return;
-        const CString chan = msg.GetParam(0);
-        m_departed.erase(chan);
-        m_missing.erase(chan);
-        // ZNC sets IsOn before invoking this hook.
-        MaybeSuppressPerform();
-    }
-
-    void OnPartMessage(CPartMessage& msg) override {
-        if (msg.GetNick().NickEquals(GetNetwork()->GetIRCNick().GetNick()))
-            ForgetJoined(msg.GetParam(0));
-    }
-
-    void OnKickMessage(CKickMessage& msg) override {
-        if (msg.GetKickedNick().Equals(GetNetwork()->GetIRCNick().GetNick()))
-            ForgetJoined(msg.GetParam(0));
-    }
-
-    void WhoisTimedOut() {
-        AbortWhois("WHOIS timed out; no repair attempted. Wait for the old reply before RUN, or reconnect.");
     }
 
     void TimerStartCheck(unsigned long long gen, bool resetAttempts) {
@@ -318,7 +315,6 @@ public:
 private:
     unsigned int m_uDelaySec;
     bool m_bJoinMissing;
-    bool m_bDebug = false;
 
     CString m_sExpectedMode;
 
@@ -333,17 +329,11 @@ private:
     CString m_sWhoisTarget;
     CString m_sWhoisTargetLower;
 
-    // FIFO target-aware WHOIS origins. Aborted requests are drained visibly.
-    struct WhoisOrigin { CString target; bool ours; };
-    std::deque<WhoisOrigin> m_whoisOrigins;
-    std::set<CString, CStringCI> m_departed;
-    bool m_bWhoisUnsafe = false;
-    CString m_sFailedWhoisTarget;
-    bool m_bFailedWhoisOurs = false;
-    CString m_sPhase = "idle";
-    CString m_sLastAction = "none";
-    CString m_sLastPerformAt = "never";
-    unsigned int m_uPerformCount = 0;
+    // FIFO queue of WHOIS request origins, used to decide whether each
+    // incoming WHOIS-related numeric should be suppressed from clients.
+    // true  = this WHOIS was sent by the module itself (suppress replies)
+    // false = this WHOIS was sent by an attached client (let replies through)
+    std::deque<bool> m_whoisOrigins;
 
     std::set<CString, CStringCI> m_expected;
     std::set<CString, CStringCI> m_actual;
@@ -371,9 +361,6 @@ private:
         m_sWhoisTargetLower.clear();
         m_uAttempt = 0;
         m_whoisOrigins.clear();
-        m_bWhoisUnsafe = false;
-        m_sFailedWhoisTarget.clear();
-        m_bFailedWhoisOurs = false;
 
         m_lastAttemptMissing.clear();
         m_bHaveLastAttemptMissing = false;
@@ -382,59 +369,6 @@ private:
         m_sAttachNotice.clear();
 
         m_bPerformSuppressed = false;
-        m_departed.clear();
-        m_sPhase = "idle";
-        m_sLastAction = "none";
-        m_sLastPerformAt = "never";
-        m_uPerformCount = 0;
-    }
-
-    void CancelTimers() {
-        RemTimer("missingchans_run");
-        RemTimer("missingchans_join");
-        RemTimer("missingchans_whois_timeout");
-    }
-
-    void AbortWhois(const CString& reason) {
-        m_bWaitingWhois = false;
-        m_bWhoisUnsafe = true;
-        // Drain an abandoned reply visibly before accepting another check.
-        // Otherwise a late 318 could complete a new check with an empty list.
-        for (auto& origin : m_whoisOrigins) origin.ours = false;
-        m_bFailedWhoisOurs = false;
-        if (m_whoisOrigins.size() > 128) m_whoisOrigins.clear();
-        m_actual.clear();
-        m_missing.clear();
-        CancelTimers();
-        NextGen();
-        m_sPhase = "verification aborted";
-        m_sLastAction = reason;
-        PutModule(reason);
-    }
-
-    void ForgetJoined(const CString& chan) {
-        m_actual.erase(chan);
-        m_verifiedJoined.erase(chan);
-        m_departed.insert(chan);
-        // Suppression stays latched for this cycle. No perpetual monitoring
-        // or new retry sequence is started by a PART or KICK.
-    }
-
-    void RefreshMissing() {
-        BuildExpected();
-        m_missing.clear();
-        for (const CString& chan : m_expected) {
-            if (!IsKnownJoined(chan)) m_missing.insert(chan);
-        }
-    }
-
-    CString MissingList() const {
-        CString list;
-        for (const CString& chan : m_missing) {
-            if (!list.empty()) list += " ";
-            list += chan;
-        }
-        return list.empty() ? CString("none") : list;
     }
 
     unsigned long long NextGen() {
@@ -456,20 +390,58 @@ private:
         return "all";
     }
 
-    // Use negotiated PREFIX and CHANTYPES, including unusual ranks such as
-    // '!'. A symbol that is both a rank and a channel type is stripped only
-    // if followed by another rank/channel prefix (e.g. +#chan vs +modeless).
-    CString StripPrefix(CString token) const {
-        const CIRCSock* sock = GetNetwork() ? GetNetwork()->GetIRCSock() : nullptr;
-        const CString perms = sock ? sock->GetPerms() : CString("~&@%+");
-        const CString types = sock ? sock->GetISupport("CHANTYPES", "#&!+") : CString("#&!+");
-        while (token.size() >= 2 && perms.find(token[0]) != CString::npos) {
-            if (types.find(token[0]) != CString::npos &&
-                types.find(token[1]) == CString::npos && perms.find(token[1]) == CString::npos) break;
-            token.erase(0, 1);
+    // Strip leading user-mode prefixes from a WHOIS-channel-list token, leaving
+    // the channel name. Handles the ambiguity that '+' and '&' can appear as
+    // EITHER a user-mode prefix OR a channel-type prefix:
+    //
+    //   "#chan"     -> "#chan"             (no user-mode prefix)
+    //   "+#chan"    -> "#chan"             (voiced in #chan)  <-- the r8 fix
+    //   "@#chan"    -> "#chan"             (op in #chan)
+    //   "~&@#chan"  -> "#chan"             (owner+admin+op in #chan)
+    //   "+chan"     -> "+chan"             (modeless channel)
+    //   "&chan"     -> "&chan"             (local channel)
+    //   "+&chan"    -> "&chan"             (voiced in local channel)
+    //
+    // Disambiguation rule: a leading '+' or '&' is treated as a user-mode prefix
+    // iff the next character is itself prefix-like ('~','@','%','+','&','#','!').
+    // Otherwise the '+' or '&' IS the channel-type prefix and we stop there.
+    //
+    // Returns the empty string if the result does not start with a recognized
+    // channel-type prefix character ('#','&','!','+'), so the caller cannot
+    // silently insert garbage tokens.
+    static CString StripPrefix(CString s) {
+        while (s.size() >= 2) {
+            const char c = s[0];
+            const char next = s[1];
+
+            // Unambiguous user-mode prefix characters.
+            if (c == '~' || c == '@' || c == '%') {
+                s.erase(0, 1);
+                continue;
+            }
+
+            // '+' and '&' are ambiguous: user-mode prefix OR channel-type prefix.
+            if (c == '+' || c == '&') {
+                const bool nextIsPrefixLike =
+                    (next == '~' || next == '@' || next == '%' ||
+                     next == '+' || next == '&' ||
+                     next == '#' || next == '!');
+                if (nextIsPrefixLike) {
+                    s.erase(0, 1);
+                    continue;
+                }
+            }
+
+            // Either c is a channel-type prefix (we stop) or c is junk (caller filters).
+            break;
         }
-        if (token.empty() || types.find(token[0]) == CString::npos) return CString();
-        return token;
+
+        // Final shape check: a real channel name must start with a channel-type
+        // prefix. If we ended up with anything else, refuse it.
+        if (s.empty() || (s[0] != '#' && s[0] != '&' && s[0] != '!' && s[0] != '+')) {
+            return CString();
+        }
+        return s;
     }
 
     static CString TrimSpaces(CString s) {
@@ -506,22 +478,12 @@ private:
     }
 
     void StartCheck(bool bManual, unsigned long long genFromTimer, bool resetAttempts) {
-        if (!GetNetwork() || !GetNetwork()->IsIRCConnected()) {
+        if (!GetNetwork() || !GetNetwork()->GetIRCSock()) {
             PutModule("Not connected to IRC right now.");
             return;
         }
 
-        if (m_bWhoisUnsafe) {
-            PutModule("Previous WHOIS is incomplete; wait for its reply or reconnect before RUN.");
-            return;
-        }
-        if (m_bWaitingWhois || std::any_of(m_whoisOrigins.begin(), m_whoisOrigins.end(),
-                [](const WhoisOrigin& origin) { return origin.ours; })) {
-            PutModule("Verification already in progress; RUN did not reset the current cycle.");
-            return;
-        }
         if (genFromTimer == 0) {
-            CancelTimers();
             NextGen();
         } else {
             if (genFromTimer != m_uGen) return;
@@ -531,6 +493,7 @@ private:
             m_uAttempt = 0;
             m_bHaveLastAttemptMissing = false;
             m_bLastAttemptTriggeredPerform = false;
+            m_sLastPerformSource.clear();
             m_bPerformSuppressed = false;
 
             // Clear verification cache per new cycle
@@ -539,7 +502,6 @@ private:
 
         m_actual.clear();
         m_missing.clear();
-        m_departed.clear();
 
         BuildExpected();
 
@@ -558,33 +520,32 @@ private:
 
         // Mark this WHOIS as originating from the module BEFORE sending, so the
         // origin marker is in place by the time replies arrive.
-        m_sPhase = "waiting for WHOIS";
-        m_whoisOrigins.push_back({m_sWhoisTargetLower, true});
-        RemTimer("missingchans_whois_timeout");
-        AddTimer(new CWhoisTimeout(this));
+        m_whoisOrigins.push_back(true);
         PutIRC(CString("WHOIS ") + m_sWhoisTarget);
     }
 
-    bool IsKnownJoined(const CString& chan) const {
-        if (m_departed.count(chan)) return false;
-        const CChan* pChan = GetNetwork() ? GetNetwork()->FindChan(chan) : nullptr;
-        return (pChan && pChan->IsOn()) || m_actual.count(chan) || m_verifiedJoined.count(chan);
+    bool IsJoinedServerTruth(const CString& chan) const {
+        return (m_actual.find(chan) != m_actual.end()) || (m_verifiedJoined.find(chan) != m_verifiedJoined.end());
     }
 
     void MaybeSuppressPerform() {
         if (m_bPerformSuppressed) return;
         if (m_sStopPerformOn.empty()) return;
 
-        if (IsKnownJoined(m_sStopPerformOn)) {
+        if (IsJoinedServerTruth(m_sStopPerformOn)) {
             m_bPerformSuppressed = true;
-            CString how = "live membership / WHOIS / self-443";
+            CString how = (m_actual.find(m_sStopPerformOn) != m_actual.end()) ? "WHOIS" : "443 verification";
             PutModule(CString("StopPerformOn triggered: '") + m_sStopPerformOn +
                       "' is joined on the server (" + how + "). Future attempts will NOT run perform Execute.");
         }
     }
 
     void FinishCheck() {
-        RefreshMissing();
+        // Missing = expected - (WHOIS_actual U verified_joined)
+        for (const CString& e : m_expected) {
+            if (!IsJoinedServerTruth(e)) m_missing.insert(e);
+        }
+
         MaybeSuppressPerform();
 
         CTable t;
@@ -593,12 +554,6 @@ private:
 
         for (const CString& e : m_expected) { t.AddRow(); t.SetCell("Group", "expected"); t.SetCell("Channel", e); }
         for (const CString& a : m_actual)    { t.AddRow(); t.SetCell("Group", "actual");   t.SetCell("Channel", a); }
-        for (const CString& e : m_expected) {
-            const CChan* chan = GetNetwork()->FindChan(e);
-            if (chan && chan->IsOn() && !m_actual.count(e)) {
-                t.AddRow(); t.SetCell("Group", "live"); t.SetCell("Channel", e);
-            }
-        }
         for (const CString& v : m_verifiedJoined) {
             if (m_expected.find(v) != m_expected.end()) {
                 t.AddRow(); t.SetCell("Group", "verified"); t.SetCell("Channel", v);
@@ -609,8 +564,6 @@ private:
         PutModule(t);
 
         if (m_missing.empty()) {
-            m_sPhase = "complete";
-            m_sLastAction = "All expected channels joined; no repair needed";
             PutModule("✔ All expected channels appear joined on the server.");
             return;
         }
@@ -633,16 +586,12 @@ private:
         }
 
         if (m_uAttempt >= m_uRetries) {
-            m_sPhase = "retries exhausted";
             PutModule("Reached maximum join attempts; stopping.");
             return;
         }
 
         m_uAttempt++;
-        const unsigned long long wait = static_cast<unsigned long long>(m_uRetryStepSec) * m_uAttempt;
-        const unsigned int waitSec = static_cast<unsigned int>(std::max(1ULL,
-            std::min(wait, static_cast<unsigned long long>(std::numeric_limits<unsigned int>::max()))));
-        m_sPhase = "retry scheduled";
+        const unsigned int waitSec = m_uRetryStepSec * m_uAttempt;
 
         PutModule(CString("Scheduling join attempt ") + CString(m_uAttempt) + "/" + CString(m_uRetries) +
                   " in " + CString(waitSec) + "s (RetryStep=" + CString(m_uRetryStepSec) + ").");
@@ -681,33 +630,8 @@ private:
         }
 
         PutModule(CString("RetryPerform is ON: triggering perform Execute (") + where + " module).");
-        // Calling OnModCommand directly bypasses ZNC's usual context guards.
-        // Restore every field, including null client context, on all exits.
-        struct ContextGuard {
-            CModule* mod;
-            CIRCNetwork* network;
-            CUser* user;
-            CClient* client;
-            explicit ContextGuard(CModule* m) : mod(m), network(m->GetNetwork()),
-                user(m->GetUser()), client(m->GetClient()) {}
-            ~ContextGuard() {
-                mod->SetNetwork(network);
-                mod->SetUser(user);
-                mod->SetClient(client);
-            }
-        } context(pPerf);
-        pPerf->SetNetwork(GetNetwork());
-        pPerf->SetUser(GetUser());
-        pPerf->SetClient(nullptr);
-        CModCallProtector call(*pPerf);
         pPerf->OnModCommand("Execute");
 
-        ++m_uPerformCount;
-        const std::time_t now = std::time(nullptr);
-        char stamp[32] = {};
-        if (const std::tm* utc = std::gmtime(&now))
-            std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S UTC", utc);
-        m_sLastPerformAt = stamp;
         m_bLastAttemptTriggeredPerform = true;
         m_sLastPerformSource = where;
         return true;
@@ -716,33 +640,20 @@ private:
     void DoJoinAttempt(unsigned int attempt, unsigned long long gen) {
         if (gen != m_uGen) return;
 
-        if (!GetNetwork() || !GetNetwork()->IsIRCConnected()) {
+        if (!GetNetwork() || !GetNetwork()->GetIRCSock()) {
             PutModule("Not connected to IRC; cannot join.");
             return;
         }
 
-        if (!m_bJoinMissing || attempt > m_uRetries) {
-            m_sPhase = "retry cancelled";
-            m_sLastAction = "Pending retry cancelled by current settings";
-            PutModule(m_sLastAction);
-            return;
-        }
-        RefreshMissing();
-        MaybeSuppressPerform();
         if (m_missing.empty()) {
-            m_sPhase = "complete";
-            m_sLastAction = "No missing channels remain; skipped pending retry";
             PutModule("No missing channels remain; skipping join attempt.");
             return;
         }
 
         m_lastAttemptMissing = m_missing;
-        m_sLastAction = "Attempt " + CString(attempt) + " on network '" +
-            GetNetwork()->GetName() + "'; missing: " + MissingList();
-        PutModule(m_sLastAction);
-        m_sPhase = "post-join wait";
         m_bHaveLastAttemptMissing = true;
         m_bLastAttemptTriggeredPerform = false;
+        m_sLastPerformSource.clear();
 
         if (m_bRetryPerform) {
             ExecutePerformNow();
@@ -808,34 +719,6 @@ private:
         t.AddRow(); t.SetCell("Setting", "VerifiedJoined(count)");
         t.SetCell("Value", CString((unsigned int)m_verifiedJoined.size()));
 
-        // Presentation only: retain diagnostics even while hidden.
-        if (m_bDebug) {
-            auto row = [&](const CString& key, const CString& value) {
-                t.AddRow(); t.SetCell("Setting", key); t.SetCell("Value", value);
-            };
-            row("Debug", "ON");
-            unsigned int joined = 0;
-            if (GetNetwork()) for (const CChan* chan : GetNetwork()->GetChans())
-                if (chan && chan->IsOn()) ++joined;
-            row("Network", GetNetwork() ? GetNetwork()->GetName() : CString("none"));
-            row("Phase", m_sPhase);
-            row("Attempt", CString(m_uAttempt));
-            row("LiveJoined(count)", CString(joined));
-            row("WhoisJoined(last snapshot)", CString(static_cast<unsigned int>(m_actual.size())));
-            row("Missing(last check)", MissingList());
-            row("LastAction", m_sLastAction);
-            CString lastMissing;
-            for (const CString& chan : m_lastAttemptMissing) {
-                if (!lastMissing.empty()) lastMissing += " ";
-                lastMissing += chan;
-            }
-            row("LastAttemptMissing", lastMissing.empty() ? CString("none") : lastMissing);
-            row("LastAttemptTriggeredPerform", m_bLastAttemptTriggeredPerform ? "yes" : "no");
-            row("PerformCalls(this connection)", CString(m_uPerformCount));
-            row("LastPerformSource", m_sLastPerformSource.empty() ? CString("none") : m_sLastPerformSource);
-            row("LastPerformAt", m_sLastPerformAt);
-        }
-
         PutModule(t);
     }
 
@@ -846,14 +729,7 @@ private:
         CString val = TrimSpaces(sRest.Token(1, true));
 
         if (key.empty()) {
-            PutModule("Usage: SET <delay|joinmissing|expectedmode|retryperform|retries|retrystep|stopperformon|debug> <value>");
-            return;
-        }
-
-        if (key == "debug") {
-            m_bDebug = ToBool(val);
-            SetNV("debug", m_bDebug ? "1" : "0");
-            PutModule(CString("OK. Debug is now ") + (m_bDebug ? "ON." : "OFF."));
+            PutModule("Usage: SET <delay|joinmissing|expectedmode|retryperform|retries|retrystep|stopperformon> <value>");
             return;
         }
 
@@ -929,8 +805,7 @@ private:
         PutModule(" ");
         PutModule("Notes:");
         PutModule("  - This build compares channel names case-insensitively and parses WHOIS 319 robustly.");
-        PutModule("  - Live joined state and self JOIN/PART/KICK events supplement WHOIS.");
-        PutModule("  - Self-targeted 443 is an optional fallback, not a duplicate-JOIN guarantee.");
+        PutModule("  - 443 (already on channel) remains as a fallback verification signal.");
         PutModule(" ");
         PutModule("Settings (configure via: SET <key> <value>):");
         PutModule("  delay <seconds>");
@@ -953,12 +828,9 @@ private:
         PutModule("      Default 3.");
         PutModule("  retrystep <seconds>");
         PutModule("      Backoff step between attempts. Attempt i waits (i * retrystep) seconds");
-        PutModule("      before firing (minimum wait 1s). Default 20.");
-        PutModule("  debug <on|off>");
-        PutModule("      Show additional diagnostic fields in STATUS. Default OFF (r9 fields).");
-        PutModule("      Presentation only; does not change recovery or clear recorded diagnostics.");
+        PutModule("      before firing. Default 20.");
         PutModule("  stopperformon <#channel|off>");
-        PutModule("      Sentinel channel. If it appears joined (live state, WHOIS or self-443), perform");
+        PutModule("      Sentinel channel. If it appears joined (via WHOIS or 443), perform");
         PutModule("      Execute is suppressed for the rest of this cycle. Use 'off' (or 'none',");
         PutModule("      or '-') to clear. Default off.");
         PutModule(" ");
@@ -976,7 +848,6 @@ CRunTimer::CRunTimer(CMissingChansMod* pMod, unsigned int uDelaySec, unsigned lo
 
 void CRunTimer::RunJob() {
     if (!m_pMod) return;
-    SetName(""); // Do not let cancellation of a pending label delete this callback.
     m_pMod->TimerStartCheck(m_uGen, m_bResetAttempts);
 }
 
@@ -986,16 +857,7 @@ CJoinAttemptTimer::CJoinAttemptTimer(CMissingChansMod* pMod, unsigned int uDelay
 
 void CJoinAttemptTimer::RunJob() {
     if (!m_pMod) return;
-    SetName(""); // Do not let cancellation of a pending label delete this callback.
     m_pMod->TimerJoinAttempt(m_uAttempt, m_uGen);
 }
 
 MODULEDEFS(CMissingChansMod, "Verify/join missing channels by comparing expected list vs WHOIS (with retry + perform support).")
-
-CWhoisTimeout::CWhoisTimeout(CMissingChansMod* pMod)
-    : CTimer(pMod, 30, 1, "missingchans_whois_timeout", "missingchans WHOIS watchdog") {}
-
-void CWhoisTimeout::RunJob() {
-    SetName("");
-    static_cast<CMissingChansMod*>(GetModule())->WhoisTimedOut();
-}

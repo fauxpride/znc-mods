@@ -1,704 +1,151 @@
-See [CHANGELOG.md](./CHANGELOG.md) for version history and release notes.
-
 # missingchans
 
-[`missingchans`](./src/missingchans.cpp) is a ZNC network module that verifies whether the channels you **expect** to be on are actually joined on the **IRC server**, and can optionally retry joins for anything that is still missing.
+See [CHANGELOG.md](./CHANGELOG.md) for revision history and [TESTING.md](./TESTING.md) for the reproducible test suite.
 
-It is designed for reconnect scenarios where your configured channel list and your real server-side membership can drift apart for a while after connect — especially on networks where joining certain community channels depends on first authenticating to a **non-service bot**, obtaining a **community-specific cloak**, or waiting for some other post-connect condition to complete.
+`missingchans` is a **network module** for recovering missing channel joins after an IRC connection. It is useful when a community bot, authentication step, cloak, or temporary service outage prevents the initial joins from succeeding.
 
-With the proper configuration, this helps make sure your channels are eventually joined even if there is a **temporary server issue**, a **community bot outage**, or a race where the first burst of joins happens before the network is ready to admit you everywhere.
+**Current build:** `2026-10-03+r11 (optional debug status; r10 recovery fixes retained)`
 
-In practical terms, this module is useful when:
+**Source:** [`src/missingchans.cpp`](./src/missingchans.cpp)
 
-- some channels only become joinable **after** a custom auth bot grants access;
-- you rely on a bot-driven cloak, vhost, or account state before certain channels will accept you;
-- the initial post-connect join burst can fail partially during outages, lag, or service instability;
-- you want ZNC to **verify** the final joined state from the server side instead of assuming the first attempt worked.
+**Build and integration-test target:** ZNC 1.10.3. Recompile for the ZNC installation that will load the module. Older ZNC releases have not been validated for r11.
 
-Although the module is generic, it is particularly aimed at IRC environments where **community bots besides the core channel service bots** are part of the login and channel-access flow.
+## How it works
 
----
+1. After connecting to IRC, wait `Delay` seconds and query the current nick with WHOIS.
+2. Build the expected-channel set from this network's ZNC channel entries.
+3. Combine positive WHOIS evidence, ZNC's current `CChan::IsOn()` state, and any relevant self-targeted numeric 443 confirmations. An omitted WHOIS channel is **not** proof that you are absent.
+4. If channels are missing and `JoinMissing` is on, schedule a bounded retry sequence.
+5. Immediately before each retry, rebuild the expected and missing sets using current membership and settings. Self JOIN/PART/KICK events invalidate outdated evidence. Skip the retry if nothing is missing.
+6. If enabled and not suppressed, invoke `perform Execute` on this network; then send JOINs, reusing stored channel keys. Recheck via WHOIS three seconds later.
 
-## What problem this module solves
+This is connection recovery, not perpetual channel monitoring. A manual `RUN` starts another cycle. Merely attaching a client, reading `STATUS`, or receiving a PART/KICK does not start a new cycle. Loading or reloading the module on an already connected network does not automatically run recovery.
 
-ZNC already remembers channels and can auto-join them, and many users also run ZNC's built-in `perform` module to send post-connect commands. That is often enough.
+A self-PART normally removes the channel from ZNC's list, so it is no longer expected. A KICK can leave a disabled channel entry; whether it remains expected depends on `ExpectedMode`.
 
-The trouble starts when channel access depends on additional timing-sensitive steps such as:
+### Membership and WHOIS
 
-- authenticating to a network-specific or community-specific helper bot;
-- waiting for a cloak or mode change before joining protected channels;
-- reconnecting during a temporary outage where your initial joins only partially succeed;
-- racing your auth flow against the first join attempts after reconnect.
+`actual` rows in the check output are parsed WHOIS channels. `live` rows identify channels ZNC knows are joined but which were not in that WHOIS reply. `verified` rows are additional self-443 evidence. `missing` is the difference from the expected set.
 
-In those cases, you can end up in a state where:
+The parser uses the server's advertised `PREFIX` and `CHANTYPES`, including unusual rank symbols. Prefixes such as `@#chan`, `+#chan`, `~@#chan`, and, when advertised, `!#chan` are stripped. Comparison remains ASCII case-insensitive, as in r9; it does not implement full IRC CASEMAPPING equivalence for punctuation.
 
-- ZNC thinks the network is connected;
-- some channels did join;
-- some channels did **not** join;
-- the original join opportunity has passed;
-- and unless you notice manually, you stay detached from part of your normal channel set.
+The module hides its recognized internal WHOIS numerics. Client WHOIS requests are tracked separately, including multiple targets, errors ending with `401` alone, and the common `401` followed by `318` error sequence. Numerics are observed in the raw-message hook so `route_replies` cannot make the bookkeeping miss ordinary client replies.
 
-`missingchans` adds a delayed verification pass and optional rejoin logic on top of that flow.
+A WHOIS that fails or has not completed within **30 seconds** causes **no repair action**. The timeout includes ZNC's outbound flood queue. After a timeout, late replies are allowed through to clients and must finish before another `RUN` can proceed; reconnect if the old reply never finishes. This prevents a late reply from being mistaken for the next verification. Client WHOIS tracking is limited to 128 queued entries, with at most one additional internal request; overflow aborts verification and requires reconnect if tracking cannot drain.
 
----
+### Perform scope
 
-## High-level behavior
+The module prefers this network's `perform` instance. If only a user-level `perform` exists, r10 temporarily gives it the originating network/user context and clears the client context, invokes it, then restores all three fields. Commands and the confirmation therefore go to the originating network, including its other attached clients.
 
-After the IRC connection is established, the module:
+This corrects r9's user-level fallback: it could print `perform commands sent` across networks without actually sending the configured IRC commands. **Upgrading makes that fallback functional.** Review the user-level perform list if a network relies on it; all its commands will now be replayed on that originating network when a genuine retry requires it. Network-level perform still takes precedence.
 
-1. waits for a configurable initial delay;
-2. builds the set of **expected** channels from your ZNC network channel list;
-3. performs a self-`WHOIS` on your current nick;
-4. parses the server's channel list for your nick;
-5. compares **expected** vs **actually joined**;
-6. if anything is missing, optionally schedules one or more delayed join attempts;
-7. re-checks again after each attempt.
+`perform Execute` replays the whole selected perform list, not only authentication commands. `missingchans` does not invoke `delayedperform`, modify either perform list, or change normal connection-time execution. It does not wait for asynchronous bot authentication between Execute and JOIN; later retries accommodate delayed bot responses.
 
-It can also optionally trigger ZNC's built-in `perform` module before a retry attempt, which is useful if your recovery flow depends on re-sending authentication or helper-bot commands before retrying the missing joins.
+## Settings
 
----
+Set options with `/msg *missingchans SET <key> <value>` on the intended network. All seven existing NV keys and defaults are preserved; no migration is required. r11 adds one optional, per-network `debug` setting, defaulting to off when absent.
 
-## Why this is useful for bot-gated channels and cloaks
+| Key | Default | Meaning |
+|---|---|---|
+| `debug` | `off` | Show the extra r10 diagnostic fields in STATUS. Persisted per network; changes presentation only. |
+| `delay` | `300` | Seconds from IRC connection to the first check; minimum 1. |
+| `joinmissing` | `off` | Whether to send JOINs for missing channels. |
+| `expectedmode` | `all` | `all`: every known channel; `config`: only `InConfig` entries; `enabled`: `InConfig` entries that are not disabled. |
+| `retryperform` | `off` | Invoke perform before a retry, unless suppressed. |
+| `retries` | `3` | Maximum JOIN attempts per cycle; minimum 1. |
+| `retrystep` | `20` | Attempt N waits N × this many seconds; effective wait is at least one second. Multiplication is protected against overflow. |
+| `stopperformon` | `off` | Sentinel channel whose known membership suppresses further perform calls for the current cycle. `off`, `none`, `-`, or an empty value clears the configured sentinel. |
 
-Some IRC communities use access bots, helper bots, cloak bots, or other non-standard automation that must recognize you before you can fully rejoin your normal channel set.
+`StopPerformOn` suppression is **latched for the cycle**. Once triggered it stays set even if the sentinel later parts or the setting is cleared. A new `RUN` or connection cycle resets it and evaluates current membership again. It suppresses perform, not JOIN attempts for other missing channels.
 
-Examples include situations where you must:
+Pending retries respect changes to `JoinMissing`, `RetryPerform`, `ExpectedMode`, `StopPerformOn`, and a lowered retry limit when they fire. Changing `RetryStep` does not move an already scheduled timer; it affects subsequently scheduled attempts. Changing `Delay` affects future connection cycles.
 
-- message a bot after connect to identify yourself;
-- wait for a custom cloak/vhost before joining invite-restricted or community-restricted channels;
-- rely on a network/community automation step that can occasionally lag or fail during outages.
+For `Delay=300`, `RetryStep=300`, `Retries=10`, the retry waits are 5, 10, 15, …, 50 minutes. With prompt replies the last attempt is roughly 4 hours 40 minutes after connection, including the intervening three-second checks. These are increasing delays, not ten retries at fixed five-minute intervals.
 
-If that step fails temporarily, or happens too slowly relative to the first auto-join burst, the result can be a partial join state.
+## Commands and diagnostics
 
-With the proper setup:
-
-- `perform` can re-send the auth or bot-contact commands;
-- `missingchans` can delay and retry joins afterward;
-- server-side verification can confirm which channels are still missing;
-- and channel keys stored in ZNC are reused automatically when retrying joins.
-
-That combination is what makes the module suitable for “make sure everything gets joined eventually” workflows during transient outages.
-
----
-
-## Features
-
-- Delayed post-connect verification instead of checking immediately.
-- Server-side channel verification via self-`WHOIS`.
-- Optional automatic rejoin of missing channels.
-- Optional multi-attempt retry logic with increasing delay.
-- Optional integration with ZNC's built-in `perform` module via `perform Execute`.
-- Optional `StopPerformOn` sentinel channel to suppress further `perform` retries once a key channel is confirmed joined.
-- Reuses channel keys from ZNC channel configuration when re-sending `JOIN`.
-- Case-insensitive channel comparison.
-- User-mode-aware WHOIS parsing: channels you are voiced (`+`), op (`@`), halfop (`%`), admin (`&`), or owner (`~`) in are correctly recognized as the same channel, not as separate prefixed entries.
-- The WHOIS exchange the module performs as part of its own verification is hidden from attached IRC clients (no noisy `311` / `312` / `319` / `318` numerics for the bouncer's own nick appear in client windows). User-initiated `/whois` is unaffected.
-- Extra fallback learning from numeric `443` (“already on channel”).
-- Persistent configuration via ZNC module NV storage.
-
----
-
-## Module identity
-
-- **Module name:** `missingchans`
-- **Source file:** `missingchansv9.cpp`
-- **Current build marker in source:** `2026-05-21+r9 (robust 319 + case-insensitive chans + 443 fallback; voiced-channel parser fix; hidden self-WHOIS)`
-
-The module advertises itself as:
-
-> Verify/join missing channels by comparing expected list vs WHOIS (with retry + perform support).
-
----
-
-## Installation
-
-### Build
-
-```bash
-znc-buildmod missingchansv9.cpp
-```
-
-This should produce a module shared object suitable for your ZNC installation.
-
-### Load
-
-From a connected IRC client attached to the target network:
-
-```text
-/msg *status LoadMod missingchans
-```
-
-Or, if loading as a network module through the web interface or your usual module workflow, load it on the specific network where you want this behavior.
-
-On load, the module restores its saved settings from NV storage.
-
----
-
-## Default settings
-
-The source defaults are:
-
-- `Delay = 300` seconds
-- `JoinMissing = off`
-- `ExpectedMode = all`
-- `RetryPerform = off`
-- `Retries = 3`
-- `RetryStep = 20` seconds
-- `StopPerformOn = off`
-
-These defaults are intentionally conservative:
-
-- verification is delayed long enough for many post-connect flows to settle;
-- auto-joining is disabled by default so you can observe behavior first;
-- retrying `perform` is also disabled by default.
-
----
-
-## Commands
-
-All module commands are issued through the module query window or via `/msg` to the module.
-
-Examples below assume the module window is `*missingchans`.
-
-### Help
-
-```text
+```irc
 /msg *missingchans HELP
-```
-
-Shows built-in help and the main setting names.
-
-### Version
-
-```text
 /msg *missingchans VERSION
-```
-
-Prints the module build marker.
-
-### Status
-
-```text
 /msg *missingchans STATUS
-```
-
-Shows the current configuration and some run-state details such as whether `perform` is currently suppressed for the active cycle.
-
-### Show expected channels
-
-```text
 /msg *missingchans SHOW
-```
-
-Builds and displays the expected-channel set according to the current `ExpectedMode`.
-
-### Run a verification immediately
-
-```text
 /msg *missingchans RUN
 ```
 
-Forces an immediate verification cycle instead of waiting for the next automatic delayed run.
+- `HELP`: commands and all settings; `h` and `?` are aliases.
+- `VERSION`: build marker.
+- `SHOW`: expected channels; does not query WHOIS, invoke perform, reset suppression, or start a cycle.
+- `STATUS`: the nine original r9 fields by default; extended diagnostics when `Debug` is on. No repair action or timer reset.
+- `RUN`: starts a new verification/recovery cycle and replaces pending timers. It can lead to real perform/JOIN commands with the configured settings. While an internal WHOIS is outstanding, a second `RUN` is rejected rather than overlapping it.
 
-### Change settings
+r11 gates the fields introduced in r10 behind `Debug`. To enable them on the current network:
 
-```text
-/msg *missingchans SET <key> <value>
+```irc
+/msg *missingchans SET debug on
+/msg *missingchans STATUS
 ```
 
-Supported keys:
+Restore the compact display with `/msg *missingchans SET debug off`. The change takes effect immediately and survives module reload, IRC reconnect, and a ZNC restart. It does not change membership checks, perform invocation, timers, retry limits, suppression, or other module messages. Diagnostic history continues to be recorded while hidden; toggling Debug does not reset counters or replay commands.
 
-- `delay`
-- `joinmissing`
-- `expectedmode`
-- `retryperform`
-- `retries`
-- `retrystep`
-- `stopperformon`
+With Debug off, STATUS contains exactly these nine rows, in the r9 order: `Delay`, `JoinMissing`, `ExpectedMode`, `RetryPerform`, `Retries`, `RetryStep`, `StopPerformOn`, `PerformSuppressed(this run)`, and `VerifiedJoined(count)`. There is no Debug row in this mode.
 
----
+With Debug on, STATUS adds `Debug = ON` and all of these r10 fields:
 
-## Settings reference
+| Field | Meaning |
+|---|---|
+| `Network` | Originating network. |
+| `Phase`, `Attempt` | Current recovery phase and scheduled/last attempt number. |
+| `LiveJoined(count)` | Channels currently marked joined by ZNC. |
+| `WhoisJoined(last snapshot)` | Channels in the latest parsed WHOIS snapshot. |
+| `Missing(last check)` | Cached missing set, also pruned by self JOINs; not a new verification. |
+| `LastAction` | Last recorded repair decision. |
+| `LastAttemptMissing` | Channels considered missing immediately before the last attempted repair. |
+| `LastAttemptTriggeredPerform` | Whether that attempt invoked perform. |
+| `PerformCalls(this connection)` | Number of Execute invocations by this instance, including invocations with an empty perform list. |
+| `LastPerformSource`, `LastPerformAt` | Network/user module selection and timestamp in UTC of the last invocation. |
 
-### `SET delay <seconds>`
+The retained original `VerifiedJoined(count)` is **only the self-443 cache**, not your joined-channel count. Zero is normal. Numeric 443 is not a reliable response to a duplicate JOIN: IRCds commonly ignore duplicate JOINs silently. A 443 naming someone else is ignored.
 
-Controls how long the module waits **after IRC connection** before starting the verification cycle.
+Diagnostics are in memory and reset on disconnect/reload; configuration, including Debug, persists. Like the existing boolean settings, Debug accepts `on`, `1`, `yes`, `true`, `enable`, or `enabled` (case-insensitive) as on; other values, including an empty value, mean off. Prefer the explicit `on`/`off` forms. Last-perform source/time/count persist across manual runs within the same connection. No perform text, passwords, or channel keys are included in these new diagnostics. Channel names and network names are included.
 
-Example:
+## Build, replace, and verify
 
-```text
-/msg *missingchans SET delay 180
+Run the shell commands as the Unix account that runs ZNC. Build with its installed `znc-buildmod` in a separate directory:
+
+```sh
+mkdir -p ~/znc-module-build/missingchans-r11
+cd ~/znc-module-build/missingchans-r11
+cp /path/to/modules/missingchans/src/missingchans.cpp .
+znc-buildmod missingchans.cpp
 ```
 
-Use a longer delay when your post-connect flow depends on slow bot responses, cloaks, or other network-side processing.
+For the standard user module directory, back up the existing binary and install using a **rename**, so a loaded shared object is not overwritten in place:
 
----
-
-### `SET joinmissing <on|off>`
-
-Enables or disables automatic retry-join behavior for channels found to be missing.
-
-Example:
-
-```text
-/msg *missingchans SET joinmissing on
+```sh
+cp -p ~/.znc/modules/missingchans.so ~/.znc/modules/missingchans.so.pre-r11-backup
+install -m 0644 missingchans.so ~/.znc/modules/missingchans.so.new
+mv -f ~/.znc/modules/missingchans.so.new ~/.znc/modules/missingchans.so
 ```
 
-When off, the module will still detect and report missing channels, but it will not attempt to fix them.
+Adjust `~/.znc` if your ZNC uses a different data directory or module location. Then, from an IRC client connected as a ZNC administrator, run **once**:
 
----
-
-### `SET expectedmode <all|config|enabled>`
-
-Controls how the module builds its **expected** channel set from ZNC's configured channel list.
-
-#### `all`
-Includes every channel known to the network object.
-
-#### `config`
-Includes only channels that are present in ZNC's saved config.
-
-#### `enabled`
-Includes only channels that are both:
-
-- in config, and
-- not disabled.
-
-Example:
-
-```text
-/msg *missingchans SET expectedmode enabled
+```irc
+/msg *status UpdateMod missingchans
 ```
 
-For most real-world use, `enabled` is the safest and most intuitive setting if you keep disabled channels in your config.
+`UpdateMod` unloads/reloads **all loaded instances of this module across ZNC users and networks**. It resets their pending recovery cycles. It does not disconnect IRC. Then check each relevant network:
 
----
-
-### `SET retryperform <on|off>`
-
-If enabled, the module will try to locate ZNC's built-in `perform` module and call:
-
-```text
-Execute
+```irc
+/msg *missingchans VERSION
+/msg *missingchans STATUS
 ```
 
-just before a retry join attempt.
+Confirm `+r11` and that your settings remain intact. **Do not treat “Done” from UpdateMod as proof of a version change.** In the test build, an r9 library loaded before `perform` was retained by the dynamic loader because `perform` had bound shared C++ symbols to it. UpdateMod therefore still reported r9. If any instance remains on an older revision, restart the ZNC process using your usual service/process-management method and check VERSION again. That full-restart upgrade path was tested; it reconnects your IRC networks and starts normal connection recovery. Both r9-to-r11 and r10-to-r11 upgrades required and passed this restart fallback in the test build. An already loaded old binary cannot be made unloadable by editing the replacement source. Reload cancels that instance's pending retries and resets volatile diagnostics; it does not disconnect IRC. It does not automatically start recovery on an already connected network. Use `RUN` only if you intend to start a repair cycle, or let the next IRC connection start it normally. `RetryPerform` can remain enabled.
 
-Example:
+Rollback: copy the backed-up binary to a temporary sibling, rename it over `missingchans.so`, and run `UpdateMod missingchans` once again, then verify the version on the affected networks. The seven original settings remain compatible with r9/r10; those revisions ignore the additional Debug key. If the previous revision does not appear after rollback, use the same full-restart fallback.
 
-```text
-/msg *missingchans SET retryperform on
-```
+## Tests and limits
 
-This is especially useful when your reconnect workflow requires re-sending:
+See [TESTING.md](./TESTING.md) and [tests/RESULTS.md](./tests/RESULTS.md). Tests exercise the actual compiled module in real ZNC with two loopback-only fake IRC servers and multiple clients. The unchanged r9 and r10 sources are included solely as reproduction/differential and upgrade fixtures under `tests/baseline/`. The full r10 regression suite is retained and extended with Debug coverage.
 
-- auth messages to a helper bot;
-- cloak requests;
-- timing-sensitive setup commands;
-- or any post-connect commands that should happen again before retrying missing joins.
-
-The module looks for `perform` first at the **network** level, then at the **user** level.
-
-If no `perform` module is loaded, it reports that and continues without it.
-
----
-
-### `SET retries <N>`
-
-Sets the maximum number of join-attempt rounds.
-
-Example:
-
-```text
-/msg *missingchans SET retries 5
-```
-
-Each attempt can optionally re-run `perform` and then sends `JOIN` for all channels still considered missing.
-
----
-
-### `SET retrystep <seconds>`
-
-Controls the base retry spacing.
-
-Attempt `i` waits:
-
-```text
-i * retrystep
-```
-
-seconds.
-
-So with `retrystep = 20`:
-
-- attempt 1 runs after 20s
-- attempt 2 runs after 40s
-- attempt 3 runs after 60s
-
-Example:
-
-```text
-/msg *missingchans SET retrystep 30
-```
-
-This increasing wait pattern is useful for giving services, bots, or network state time to recover.
-
----
-
-### `SET stopperformon <#channel|off>`
-
-Sets a sentinel channel that, once confirmed joined on the server, suppresses future `perform Execute` calls for the current run.
-
-Example:
-
-```text
-/msg *missingchans SET stopperformon #communityhub
-```
-
-Why this matters:
-
-- maybe your `perform` script contacts a helper bot;
-- that helper bot only needs to succeed once;
-- once a key channel proves that access is working, there is no need to keep re-running `perform` on later retry rounds.
-
-The module checks this against **server-truth** membership, using either:
-
-- `WHOIS` channel visibility, or
-- `443` fallback confirmation.
-
-To disable the sentinel:
-
-```text
-/msg *missingchans SET stopperformon off
-```
-
-Accepted “off” values in the source are `off`, `none`, or `-`.
-
----
-
-## Typical usage patterns
-
-### 1. Report only, no automatic repair
-
-This is the safest first-step deployment.
-
-```text
-/msg *missingchans SET delay 300
-/msg *missingchans SET expectedmode enabled
-/msg *missingchans SET joinmissing off
-```
-
-What you get:
-
-- the module waits 5 minutes after connect;
-- checks server-side membership;
-- reports anything missing;
-- does not send any corrective joins.
-
----
-
-### 2. Rejoin missing channels after a slow auth/cloak flow
-
-```text
-/msg *missingchans SET delay 180
-/msg *missingchans SET expectedmode enabled
-/msg *missingchans SET joinmissing on
-/msg *missingchans SET retries 4
-/msg *missingchans SET retrystep 30
-```
-
-This is a straightforward recovery configuration when your initial connect sequence may be too early for some channels.
-
----
-
-### 3. Re-run `perform` before join retries
-
-```text
-/msg *missingchans SET delay 180
-/msg *missingchans SET joinmissing on
-/msg *missingchans SET retryperform on
-/msg *missingchans SET retries 4
-/msg *missingchans SET retrystep 30
-```
-
-Use this when your built-in ZNC `perform` module contains the commands needed to authenticate to a helper bot or trigger a cloak before the retry joins happen.
-
----
-
-### 4. Use a sentinel channel to stop repeated `perform` retries
-
-```text
-/msg *missingchans SET delay 180
-/msg *missingchans SET joinmissing on
-/msg *missingchans SET retryperform on
-/msg *missingchans SET stopperformon #communityhub
-/msg *missingchans SET retries 5
-/msg *missingchans SET retrystep 30
-```
-
-In this design:
-
-- `perform` may re-contact the helper bot on early retries;
-- once `#communityhub` is confirmed joined, repeated `perform Execute` calls are suppressed;
-- plain join retries can still continue for any remaining channels.
-
-This is a sensible pattern when one “gateway” channel is a good proxy for “the auth/cloak flow is working now.”
-
----
-
-## Example scenario: community bot outage or lag
-
-Suppose a network/community setup works like this:
-
-1. you connect;
-2. ZNC's built-in `perform` messages a community auth bot;
-3. that bot normally grants the state needed to enter a set of channels;
-4. a temporary outage or delay prevents the first auth/join window from succeeding cleanly.
-
-Without extra recovery logic, you might end up joined to only part of your channel list.
-
-With `missingchans` configured appropriately:
-
-- the module waits for the initial connection storm to settle;
-- it checks what the server says you are actually on;
-- it identifies which expected channels are still missing;
-- it can re-run `perform Execute` if needed;
-- it retries missing joins using any stored keys from ZNC;
-- and it re-checks again afterward.
-
-That is the main reason this module is valuable in environments with helper bots or other non-standard channel-access prerequisites.
-
----
-
-## How the module determines “expected” channels
-
-The expected set comes from ZNC's channel objects for the current network.
-
-Internally, the module supports three modes:
-
-- `all`
-- `config`
-- `enabled`
-
-The code path is:
-
-- `all`: include every channel returned by `GetNetwork()->GetChans()`;
-- `config`: include only channels where `InConfig()` is true;
-- `enabled`: include only channels where `InConfig()` is true and `IsDisabled()` is false.
-
-If you maintain channels in config that you do not always want joined, `enabled` is typically the best fit.
-
----
-
-## How server-side verification works
-
-The module does **not** trust only the local ZNC channel list. Instead, it asks the server.
-
-### Primary mechanism: self-WHOIS
-
-It sends:
-
-```text
-WHOIS <your-current-nick>
-```
-
-and parses numeric replies:
-
-- `319` — channel list
-- `318` — end of WHOIS
-- `401` — WHOIS target failure
-
-The final missing set is computed as:
-
-```text
-expected - (actual_from_whois ∪ verified_from_443)
-```
-
-### Fallback mechanism: numeric 443
-
-If a retry `JOIN` gets:
-
-```text
-443 ... :is already on channel
-```
-
-the module treats that as server-truth that you are already joined there and adds that channel to a verified set.
-
-This is helpful if WHOIS visibility is incomplete for some reason but the server explicitly confirms channel membership during a retry.
-
----
-
-## Implementation details
-
-### Delayed automatic run on connect
-
-When `OnIRCConnected()` fires, the module:
-
-- increments an internal generation counter;
-- logs that verification is scheduled;
-- installs a one-shot timer for `Delay` seconds.
-
-This generation system helps ignore stale timer callbacks from older connection cycles.
-
-### State reset on disconnect
-
-When the IRC connection drops, the module:
-
-- advances generation;
-- clears volatile state;
-- resets retry/run-specific bookkeeping.
-
-### Retry scheduling model
-
-Retries are not all scheduled at once.
-
-Instead, after each verification cycle that still finds missing channels, the module schedules the **next** join attempt with:
-
-```text
-wait = attempt_number * RetryStep
-```
-
-That means later retries back off naturally.
-
-### Recheck after every join burst
-
-After sending the `JOIN` commands for the current missing set, the module schedules a short recheck timer 3 seconds later.
-
-This keeps the feedback loop tight:
-
-- join attempt;
-- short pause;
-- WHOIS again;
-- recompute missing set.
-
-### Channel keys are preserved
-
-For each missing channel, the module looks up the configured ZNC channel object.
-
-If the channel has a stored key, it sends:
-
-```text
-JOIN <channel> <key>
-```
-
-otherwise it sends:
-
-```text
-JOIN <channel>
-```
-
-This is important for recovering keyed channels automatically.
-
-### Case-insensitive channel comparisons
-
-The source uses a case-insensitive comparator for `CString` sets. This reduces false mismatches such as:
-
-- `#Chan`
-- `#chan`
-
-being treated as different entries during expected/actual comparison.
-
-### Robust WHOIS 319 parsing
-
-The module concatenates WHOIS parameters from index 2 onward before splitting the channel list. This is more tolerant of parser/layout differences in the `319` reply.
-
-### User-mode prefix handling
-
-WHOIS `319` channel-list tokens often carry your user-mode prefix in each channel — for example, a token of `+#chan` means "voiced in `#chan`", `@#chan` means "op in `#chan`", and `~&@#chan` means "owner + admin + op in `#chan`".
-
-The module strips these user-mode prefixes from each token so that the underlying channel name is compared against the expected list. The tricky cases are `+` and `&`, because each of those characters can appear either as a user-mode prefix (voice / admin) *or* as a channel-type prefix (modeless channels / local channels).
-
-The parser disambiguates by looking at the character that follows: a leading `+` or `&` is treated as a user-mode prefix only when the next character is itself another prefix character or a clear channel-type prefix (`#`, `!`). Otherwise the `+` or `&` is treated as the channel-type prefix and parsing stops there. This correctly handles `+#chan` (voiced in `#chan`), `&#chan` (admin in `#chan`), `+chan` (modeless channel), `&local` (local channel), and combinations like `@+modeless` (op in a modeless channel).
-
-### Hiding the module's self-WHOIS from clients
-
-The verification cycle is driven by a `WHOIS` that the module sends against your own current nick. Without intervention, the server's reply numerics (`311`, `312`, `313`, `317`, `319`, `330`, `338`, `671`, `318`, and on failure `401`) propagate to every attached client, which is noisy because the user did not ask for that WHOIS. The module intercepts those replies and drops them before they reach any attached client. The internal parsing still runs, so the verification table (expected / actual / verified / missing) is produced exactly as before — only the underlying WHOIS exchange is hidden from clients.
-
-User-initiated `/whois` is unaffected. To distinguish module-initiated from user-initiated WHOIS, the module keeps a small FIFO queue of request origins: every time it sends WHOIS, it pushes "ours" onto the queue; every time an attached client sends WHOIS (caught via `OnUserRawMessage`), it pushes "user". The front of the queue identifies whose replies are currently arriving, and entries are popped on `318` or `401`. Because IRC servers serialize WHOIS replies in request order on a single connection, this ordering is reliable. The queue is cleared on IRC disconnect.
-
-The suppression is unconditional and has no `SET` option to toggle it. If you ever need to inspect the module's WHOIS exchange for debugging, use ZNC's traffic log rather than an attached client.
-
-### Client-attach notice
-
-If a retry join attempt happens while no client is attached to ZNC, the module stores a short notice and prints it when a client later attaches.
-
----
-
-## Interaction with ZNC's built-in `perform` module
-
-`missingchans` does **not** replace `perform`. Instead, it can optionally use it as a recovery helper.
-
-The integration flow is:
-
-1. `missingchans` detects missing channels;
-2. before a retry join round, it optionally finds `perform`;
-3. if found, it sends `Execute` to that module;
-4. it then sends `JOIN` for the currently missing channels.
-
-Lookup order for `perform` is:
-
-1. network module `perform`
-2. user module `perform`
-
-This makes `missingchans` especially useful when your auth workflow is already encoded in `perform` and you simply need a verification/retry layer on top of it.
-
----
-
-## Recommended configuration strategy
-
-For bot-gated or cloak-gated channels:
-
-1. put your prerequisite bot/auth commands in ZNC's built-in `perform` module;
-2. set a `Delay` long enough for the normal happy-path flow to complete;
-3. enable `JoinMissing` so failed joins can be retried;
-4. enable `RetryPerform` if re-triggering the auth flow is useful;
-5. optionally set `StopPerformOn` to a reliable “gateway” channel.
-
-A practical starting point might be:
-
-```text
-/msg *missingchans SET delay 180
-/msg *missingchans SET expectedmode enabled
-/msg *missingchans SET joinmissing on
-/msg *missingchans SET retryperform on
-/msg *missingchans SET retries 4
-/msg *missingchans SET retrystep 30
-/msg *missingchans SET stopperformon #communityhub
-```
-
-Tune from there based on how quickly the network, helper bot, or cloak system normally settles after reconnect.
-
----
-
-## Limitations and caveats
-
-- The module's server-side truth is based primarily on self-`WHOIS`, so behavior depends on what the network exposes there.
-- `443` improves correctness when the server says you are already on a retried channel, but it is only a fallback, not a complete substitute for WHOIS visibility.
-- If your network hides some channel memberships from WHOIS and never emits a useful `443` for them, they may continue to appear missing.
-- The module only retries channels that are part of the expected set built from ZNC's configured channel objects.
-- `RetryPerform` only helps if your `perform` contents are actually suitable for safe re-execution.
-- A poorly chosen `Delay` that is too short can make retries start before your normal auth flow has had time to succeed.
-
----
-
-## Safe rollout advice
-
-A good way to deploy this module is:
-
-1. load it with `JoinMissing` off;
-2. watch what `SHOW`, `STATUS`, and `RUN` report after real reconnects;
-3. switch to `ExpectedMode enabled` if needed;
-4. only then enable `JoinMissing`;
-5. add `RetryPerform` after confirming that re-running `perform` is safe in your environment.
-
-That gives you confidence in the verification logic before enabling automated repair actions.
-
----
-
-## Summary
-
-`missingchans` is best thought of as a **verification and recovery layer** for ZNC reconnect behavior.
-
-It does not assume that the first connect-time join sequence succeeded. Instead, it asks the server what actually happened, identifies what is missing, and can retry in a controlled way.
-
-That makes it particularly well suited to IRC environments where channel access depends on additional moving parts such as custom auth bots, cloaks, delayed permissions, or intermittent outages.
+Positive live ZNC membership is deliberately trusted. This prevents false retries caused by incomplete WHOIS but does not independently prove that ZNC and the IRCd can never disagree. Tests do not cover every IRCd, service bot, TLS/SASL deployment, or arbitrary third-party module. WHOIS correlation still relies on serialized replies; there are no IRCv3 labeled responses. A module that intercepts, reorders, or injects overlapping WHOIS traffic can interfere. Ordinary `route_replies` use is tested; overlapping route-replies routing may expose internal replies to a client before this module can hide them. If attribution fails, the watchdog stops recovery rather than assuming missing membership.
