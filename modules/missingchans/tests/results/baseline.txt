@@ -1,0 +1,7 @@
+  logs: /tmp/missingchans-results/baseline/omitted-joined-mpipugkp
+PASS omitted_joined (2.37s)
+  logs: /tmp/missingchans-results/baseline/late-join-jbnappks
+PASS late_join (3.39s)
+  logs: /tmp/missingchans-results/baseline/user-perform-mm0yd34f
+PASS user_perform (2.51s)
+3/3 passed

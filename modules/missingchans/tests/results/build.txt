@@ -1,0 +1,36 @@
+r11 release validation, 2026-10-03. Both builds exited 0.
+Strict CXXFLAGS: -Wall -Wextra -Wpedantic -Werror
+Sanitized build additionally: -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g
+Sanitized LDFLAGS: -fsanitize=address,undefined
+
+=== r11 production ===
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found ZNC 1.10.3
+-- Configuring done (0.4s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/tmpbewz171e
+[ 50%] Building CXX object CMakeFiles/module_missingchans.dir/workspace/scratch/49d61b2c594d/znc-mods/modules/missingchans/src/missingchans.cpp.o
+[100%] Linking CXX shared module missingchans.so
+[100%] Built target module_missingchans
+Writing /tmp/missingchans-r11/missingchans.so
+
+=== r11 sanitized ===
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found ZNC 1.10.3
+-- Configuring done (0.7s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/tmp036l_zut
+[ 50%] Building CXX object CMakeFiles/module_missingchans.dir/workspace/scratch/49d61b2c594d/znc-mods/modules/missingchans/src/missingchans.cpp.o
+[100%] Linking CXX shared module missingchans.so
+[100%] Built target module_missingchans
+Writing /tmp/missingchans-r11-sanitized/missingchans.so

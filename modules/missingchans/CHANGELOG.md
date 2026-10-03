@@ -7,6 +7,60 @@ This module uses sequential build revisions (`rN`) rather than [Semantic Version
 
 ---
 
+## r11 — 2026-10-03
+
+### Changed
+
+- Added persistent per-network `SET debug <on|off>`, default OFF. Absent settings in r9/r10 installations require no migration.
+- With Debug OFF, STATUS shows exactly the nine r9 rows in their original order, including PerformSuppressed and VerifiedJoined. No Debug row is added to this compact display.
+- With Debug ON, STATUS adds Debug=ON and all twelve diagnostic rows introduced in r10, including PerformCalls, LastPerformSource, and LastPerformAt.
+- Debug controls STATUS presentation only. Diagnostic history is retained while hidden. Toggling it does not restart checks, change timers, reset counters, invoke perform, or alter other messages.
+- All r10 recovery, membership, WHOIS, perform-context, timer, and overflow fixes remain unchanged. Existing settings remain compatible; Debug uses the same boolean parsing as JoinMissing/RetryPerform.
+- HELP and empty-SET usage now document Debug; build marker bumped to r11.
+
+### Testing
+
+- Retained all 30 r10 integration scenarios and added four Debug scenario groups: exact fields/defaults and aliases, persistence/network isolation, pending-retry toggling/history retention, and the three original bug guards with Debug enabled.
+- Byte-compared r9 default and configured STATUS output alongside unchanged commands; compared every r10 status row with r11 Debug ON.
+- Tested real r9-to-r11 and r10-to-r11 binary upgrades, saved settings, and full-restart fallback; ran the integration scenarios with address/undefined-behavior sanitizers.
+- See [TESTING.md](./TESTING.md) and [tests/RESULTS.md](./tests/RESULTS.md) for commands, actual outcomes, and limits.
+
+---
+
+## r10 — 2026-10-03
+
+### Fixed
+
+- WHOIS omissions no longer classify a channel as missing when ZNC currently knows it is joined. Self JOIN/PART/KICK hooks invalidate stale membership evidence.
+- Pending retries rebuild the expected/missing sets and reevaluate the sentinel before invoking perform or sending JOINs. Joining during the wait no longer triggers unnecessary authentication replays.
+- The user-level perform fallback now executes with the originating network/user and no specific client, with exception-safe context restoration. Its commands and confirmation stay on that network. Network-level perform continues to take precedence.
+- Manual runs and disconnects remove pending timer labels, preventing obsolete one-shot timers from blocking a new cycle. Timer callbacks release their labels before calling module code.
+- Pending retries honor current JoinMissing/RetryPerform settings and a lowered retry limit. Retry-delay multiplication cannot wrap; zero RetryStep uses a one-second minimum wait.
+- Numeric 443 is accepted only for the current nick, not another user named by an INVITE error.
+- WHOIS rank stripping follows advertised PREFIX/CHANTYPES, including unusual ranks such as `!`.
+- WHOIS request markers include targets; unrelated 401 errors do not consume them, multi-target client WHOIS is accounted for, 401-only errors are completed, and 401+318 does not pop twice. Raw numeric observation retains ordinary route_replies bookkeeping.
+
+### Added
+
+- A 30-second WHOIS watchdog. Failed/incomplete verification causes no repair action; abandoned replies must drain before starting another check. Client request tracking is bounded, with a 128-entry limit before adding an internal check.
+- Network, phase, attempt, live/WHOIS counts, cached missing channels, last-attempt reason/channels, perform source/time, and perform-call count in STATUS. No secrets or perform command text are recorded.
+- `live` output rows for joined channels omitted from WHOIS.
+- A two-network real-ZNC integration harness, unchanged r9 reproduction baseline, regression cases, differential command comparison, sanitizer support, TESTING.md, and recorded results.
+
+### Compatibility and intentional changes
+
+- All seven settings, defaults, NV keys, network-first perform selection, bounded backoff, channel-key reuse, and sticky per-cycle StopPerformOn behavior are preserved.
+- User-level perform commands that r9 failed to send during fallback **will now actually execute on the originating network**. Review that list if relying on user-level fallback.
+- Overlapping RUN is rejected while verification is outstanding. Reload does not auto-run recovery. After a timed-out WHOIS, wait for its end or reconnect before retrying RUN.
+- STATUS/HELP/VERSION and check reports intentionally change; unchanged SET/SHOW/error responses are compared against r9.
+- Built and tested against ZNC 1.10.3. This does not claim runtime validation of older ZNC versions.
+
+### Testing
+
+See [TESTING.md](./TESTING.md) for coverage and reproduction instructions, and [tests/RESULTS.md](./tests/RESULTS.md) for the actual run record and limits. No claim of testing against the user's live networks is made.
+
+---
+
 ## r9 — 2026-05-21
 
 ### Changed

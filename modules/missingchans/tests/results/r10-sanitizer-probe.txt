@@ -1,0 +1,48 @@
+EXPECTED FAILURE: disposable module with intentional heap use-after-free at load.
+This faulty source/binary is not shipped. Suite exited 1 and detected the sanitizer diagnostic.
+
+  logs: /tmp/missingchans-results/probe/defaults-bechjmo6
+FAIL defaults
+Traceback (most recent call last):
+  File "/workspace/scratch/49d61b2c594d/znc-mods/modules/missingchans/tests/harness.py", line 305, in __enter__
+    wait_for(s.ready.is_set, description="ZNC IRC connection")
+  File "/workspace/scratch/49d61b2c594d/znc-mods/modules/missingchans/tests/harness.py", line 23, in wait_for
+    raise AssertionError("Timed out waiting for " + description)
+AssertionError: Timed out waiting for ZNC IRC connection
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/workspace/scratch/49d61b2c594d/znc-mods/modules/missingchans/tests/suite.py", line 517, in main
+    TESTS[name](module, args.baseline)
+  File "/workspace/scratch/49d61b2c594d/znc-mods/modules/missingchans/tests/suite.py", line 426, in defaults
+    with ZNC(module, 'defaults', denied=('#gate',)) as z:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/49d61b2c594d/znc-mods/modules/missingchans/tests/harness.py", line 312, in __enter__
+    self.__exit__(None, None, None)
+  File "/workspace/scratch/49d61b2c594d/znc-mods/modules/missingchans/tests/harness.py", line 379, in __exit__
+    raise AssertionError(f'{errors}; logs: {self.path}')
+AssertionError: ['sanitizer diagnostic', 'ZNC exited 1']; logs: /tmp/missingchans-results/probe/defaults-bechjmo6
+0/1 passed
+
+ASAN process-log excerpt:
+Checking for list of available modules... 
+Opening config [/tmp/missingchans-results/probe/defaults-bechjmo6/configs/znc.conf]... 
+Binding to port [44007] on host [127.0.0.1] using ipv4... 
+Loading user [tester]
+Loading network [a]
+Loading network module [missingchans]... =================================================================
+==2857==ERROR: AddressSanitizer: heap-use-after-free on address 0x502000001490 at pc 0x7fa032e440ee bp 0x7ffed2010910 sp 0x7ffed2010900
+READ of size 4 at 0x502000001490 thread T0
+    #0 0x7fa032e440ed in CMissingChansMod::OnLoad(CString const&, CString&) /tmp/missingchans-sanitizer-probe/missingchans.cpp:90
+    #1 0x55f27e9e36fd in CModules::LoadModule(CString const&, CString const&, CModInfo::EModuleType, CUser*, CIRCNetwork*, CString&) /workspace/scratch/49d61b2c594d/znc-upstream/src/Modules.cpp:1902
+    #2 0x55f27e933bfe in CIRCNetwork::LoadModule(CString const&, CString const&, CString const&, CString&) /workspace/scratch/49d61b2c594d/znc-upstream/src/IRCNetwork.cpp:1592
+    #3 0x55f27e928de9 in CIRCNetwork::ParseConfig(CConfig*, CString&, bool) /workspace/scratch/49d61b2c594d/znc-upstream/src/IRCNetwork.cpp:457
+    #4 0x55f27eaa7142 in CUser::ParseConfig(CConfig*, CString&) /workspace/scratch/49d61b2c594d/znc-upstream/src/User.cpp:392
+    #5 0x55f27e8ebf32 in CZNC::LoadUsers(CConfig&, CString&) /workspace/scratch/49d61b2c594d/znc-upstream/src/znc.cpp:1280
+    #6 0x55f27e8e82c2 in CZNC::ParseConfig(CString const&, CString&) /workspace/scratch/49d61b2c594d/znc-upstream/src/znc.cpp:1000
+    #7 0x55f27e8c3f8f in main /workspace/scratch/49d61b2c594d/znc-upstream/src/main.cpp:456
+    #8 0x7fa0360441c9  (/lib/x86_64-linux-gnu/libc.so.6+0x2a1c9) (BuildId: 274eec488d230825a136fa9c4d85370fed7a0a5e)
+    #9 0x7fa03604428a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x2a28a) (BuildId: 274eec488d230825a136fa9c4d85370fed7a0a5e)
+    #10 0x55f27e8c2da4 in _start (/tmp/znc-install/bin/znc+0x29cda4) (BuildId: a46a8d67fe731f9eedd1e8e42b29da48e0c7cc77)
+
