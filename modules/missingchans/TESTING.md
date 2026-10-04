@@ -2,7 +2,7 @@
 
 The suite loads the **real compiled module into ZNC 1.10.3**. It runs two fake IRC servers on loopback and attaches one client to each network. The production module is not mocked or rewritten for ordinary tests. Assertions examine actual IRC commands, client messages, module status, the ZNC process's memory mappings, and process exits.
 
-See [tests/RESULTS.md](./tests/RESULTS.md) for the recorded release validation.
+The release notes in [CHANGELOG.md](./CHANGELOG.md) summarize the validation run for each revision.
 
 ## Layout
 
@@ -12,14 +12,12 @@ See [tests/RESULTS.md](./tests/RESULTS.md) for the recorded release validation.
 | `tests/suite.py` | Test runner: 34 integration scenarios, r9 reproductions, comparisons with r9/r10/r11, upgrade checks, and the r12 in-place update scenarios. |
 | `tests/symbols.py` | Static checks of a built `.so`; also runs standalone without ZNC. |
 | `tests/probe_loadorder.py` | Diagnostic, not pass/fail: reports whether `UpdateMod` took effect for a given module load order, and which modules bound symbols into the resident copy. |
-| `tests/baseline/missingchans.cpp` | Unmodified r9 source from repository commit `32f7fe19cdd0e69566e2985b4d7531ed1ccb9c18`; test fixture only. |
-| `tests/baseline/r10/missingchans.cpp` | Unmodified r10 source; comparison and upgrade fixture only. |
-| `tests/baseline/r11/missingchans.cpp` | Unmodified r11 source from repository commit `2a8c760a87ecc4e711ba1ed398f11e459f32b229`; comparison, upgrade, and downgrade fixture only. |
-| `tests/RESULTS.md` | Environment, outcomes, source hashes, and limitations of the recorded run. |
-| `tests/results/*.txt` | Captured suite, build, symbol, probe, and sanitizer output. |
+
+The r9, r10, and r11 builds used for comparison, upgrade, and downgrade checks are not kept in the tree. They are extracted from repository history (see [Build](#build)), so those checks need a git clone rather than a downloaded snapshot.
 
 ## Requirements
 
+- A git clone of the repository, for the older revisions used by the comparison checks.
 - Linux with glibc, Python 3.9+, a C++ compiler, binutils (`readelf`, `c++filt`), and matching ZNC 1.10.3 / `znc-buildmod` development files. Python needs no third-party packages.
 - ZNC's normal `perform` and `route_replies` modules installed for that same ZNC build.
 - Permission to create loopback sockets and start local processes.
@@ -36,6 +34,14 @@ The in-place update tests need two extra builds of the same source:
 - a **variant**, identical except for its build marker (`+r12-variant`), so a test can tell which build is running after an update;
 - a **mismatch** build that claims a different ZNC version, to exercise the loader's version check.
 
+The older revisions come from the commits that last contained them:
+
+| Build | Source |
+|---|---|
+| r9 | `modules/missingchans/src/missingchans.cpp` at commit `32f7fe19cdd0e69566e2985b4d7531ed1ccb9c18` |
+| r10 | `modules/missingchans/tests/baseline/r10/missingchans.cpp` at commit `2a8c760a87ecc4e711ba1ed398f11e459f32b229` |
+| r11 | `modules/missingchans/src/missingchans.cpp` at commit `2a8c760a87ecc4e711ba1ed398f11e459f32b229` |
+
 From the repository root:
 
 ```sh
@@ -49,15 +55,19 @@ sed -e 's/+r12 (/+r12-variant (/' \
     "$src" > "$out/mismatch/missingchans.cpp"
 grep -q '+r12-variant (' "$out/variant/missingchans.cpp" && grep -q '"-mismatch"' "$out/mismatch/missingchans.cpp"
 
-(cd "$out/r9"  && znc-buildmod "$repo/modules/missingchans/tests/baseline/missingchans.cpp")
-(cd "$out/r10" && znc-buildmod "$repo/modules/missingchans/tests/baseline/r10/missingchans.cpp")
-(cd "$out/r11" && znc-buildmod "$repo/modules/missingchans/tests/baseline/r11/missingchans.cpp")
+git show 32f7fe19cdd0e69566e2985b4d7531ed1ccb9c18:modules/missingchans/src/missingchans.cpp > "$out/r9/missingchans.cpp"
+git show 2a8c760a87ecc4e711ba1ed398f11e459f32b229:modules/missingchans/tests/baseline/r10/missingchans.cpp > "$out/r10/missingchans.cpp"
+git show 2a8c760a87ecc4e711ba1ed398f11e459f32b229:modules/missingchans/src/missingchans.cpp > "$out/r11/missingchans.cpp"
+
+(cd "$out/r9"  && znc-buildmod missingchans.cpp)
+(cd "$out/r10" && znc-buildmod missingchans.cpp)
+(cd "$out/r11" && znc-buildmod missingchans.cpp)
 (cd "$out/r12" && CXXFLAGS='-Wall -Wextra -Wpedantic -Werror' znc-buildmod "$src")
 (cd "$out/variant"  && CXXFLAGS='-Wall -Wextra -Wpedantic -Werror' znc-buildmod missingchans.cpp)
 (cd "$out/mismatch" && znc-buildmod missingchans.cpp)
 ```
 
-The `grep` line guards against a source edit silently breaking either `sed` substitution. The mismatch build redefines a ZNC macro, so it is not built with `-Werror`.
+`git show` writes the files byte for byte, which matters because the module's messages contain non-ASCII characters. The `grep` line guards against a source edit silently breaking either `sed` substitution. The mismatch build redefines a ZNC macro, so it is not built with `-Werror`.
 
 ## Run
 
@@ -206,7 +216,7 @@ python3 modules/missingchans/tests/suite.py \
   --variant "$b/san-variant/missingchans.so"
 ```
 
-Use the `gcc` that built the modules for `-print-file-name`. The modules are instrumented; the ZNC core need not be. The harness scans every process log and checks exit codes after termination. The in-place scenarios run the instrumented code both as the resident loader and as a private load. `tests/results/r12-sanitizer-probe.txt` records a check that a fault inside a private load is caught: a disposable variant with a deliberate use-after-free was rejected with an AddressSanitizer report. That faulty source is not part of the release.
+Use the `gcc` that built the modules for `-print-file-name`. The modules are instrumented; the ZNC core need not be. The harness scans every process log and checks exit codes after termination. The in-place scenarios run the instrumented code both as the resident loader and as a private load. During r12 validation, a disposable variant with a deliberate use-after-free was loaded as a private build to confirm that a fault there is caught; the harness reported it with an AddressSanitizer diagnostic. That faulty source is not part of the release.
 
 ## What this does not prove
 

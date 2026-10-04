@@ -46,7 +46,7 @@ Whether this hits `missingchans` depends on load order. Measured with ZNC 1.10.3
 
 ### Testing
 
-- Full integration suite, r9/r10/r11 comparisons, and the new in-place tests on all three toolchains; sanitizer runs on all three. See [TESTING.md](./TESTING.md) and [tests/RESULTS.md](./tests/RESULTS.md).
+- Full integration suite with r9/r10/r11 comparisons and the new in-place tests: 48/48 on GCC 13.3 and GCC 11.5 (glibc 2.39) and on GCC 11.2 (Ubuntu 22.04, glibc 2.35). Address/undefined-behavior sanitizer runs: 44/44 on all three. See [TESTING.md](./TESTING.md).
 
 ---
 
@@ -66,7 +66,7 @@ Whether this hits `missingchans` depends on load order. Measured with ZNC 1.10.3
 - Retained all 30 r10 integration scenarios and added four Debug scenario groups: exact fields/defaults and aliases, persistence/network isolation, pending-retry toggling/history retention, and the three original bug guards with Debug enabled.
 - Byte-compared r9 default and configured STATUS output alongside unchanged commands; compared every r10 status row with r11 Debug ON.
 - Tested real r9-to-r11 and r10-to-r11 binary upgrades, saved settings, and full-restart fallback; ran the integration scenarios with address/undefined-behavior sanitizers.
-- See [TESTING.md](./TESTING.md) and [tests/RESULTS.md](./tests/RESULTS.md) for commands, actual outcomes, and limits.
+- See [TESTING.md](./TESTING.md) for commands and limits.
 
 ---
 
@@ -100,7 +100,7 @@ Whether this hits `missingchans` depends on load order. Measured with ZNC 1.10.3
 
 ### Testing
 
-See [TESTING.md](./TESTING.md) for coverage and reproduction instructions, and [tests/RESULTS.md](./tests/RESULTS.md) for the actual run record and limits. No claim of testing against the user's live networks is made.
+See [TESTING.md](./TESTING.md) for coverage and reproduction instructions. No claim of testing against the user's live networks is made.
 
 ---
 
