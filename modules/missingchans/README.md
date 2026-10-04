@@ -190,8 +190,52 @@ What r12 changes about loading:
 - Every time an instance is created — by `UpdateMod`, `ReloadMod`, or `LoadMod` — the module runs **the build currently installed on disk**, not whichever copy happens to be in memory.
 - `ReloadMod missingchans` on one network therefore gives that network the installed build while other networks keep theirs until they are reloaded. `UpdateMod` keeps all networks on the same build.
 - A replacement must be a module built for the running ZNC version; anything else is refused with a warning, as above.
-- Loading a replacement briefly creates a hidden hard link, `.missingchans-load-<pid>-<n>`, next to the installed file and removes it straight away. The ZNC account needs write access to that directory, which `~/.znc/modules` normally gives. Without it the update is refused with a `cannot create a temporary link` warning.
+- Loading a replacement briefly creates a hidden hard link, `.missingchans-load-<pid>-<n>`, next to the installed file and removes it straight away. The ZNC process needs permission to do that; see [Permissions for in-place updates](#permissions-for-in-place-updates). Without it the update is refused with a `cannot create a temporary link` warning.
 - The loader logic itself is the one from the first r12-or-later build loaded since ZNC started. A later fix to the loader takes effect after the next ZNC restart; fixes anywhere else in the module apply in place.
+
+### Permissions for in-place updates
+
+To load a replaced build, the ZNC process must be able to do three things to the temporary link in the module directory:
+
+1. create it as a hard link to `missingchans.so` (`link()`);
+2. read and map it (`dlopen()`);
+3. delete it (`unlink()`).
+
+Ordinary file permissions allow this when ZNC runs as the account that owns its module directory, which is normal for `~/.znc/modules`. A shared, root-owned module directory such as ZNC's system-wide one usually does not allow it.
+
+A mandatory access control system can block it even when file permissions allow it. **AppArmor** is the common case: creating a hard link needs the `l` (link) permission, separate from read and write, and profiles written for ZNC rarely grant it. The `link()` call then fails with `Permission denied`, and `VERSION` shows:
+
+```text
+Loader: WARNING: the installed missingchans.so was not loaded (cannot create a temporary link next to /home/<user>/.znc/modules/missingchans.so: Permission denied). Still running <build>. Fix the file and run UpdateMod again, or restart ZNC.
+```
+
+Nothing is lost when this happens: every network keeps running the build that ran before.
+
+Not every refusal is logged. An explicit `deny` rule is silent unless the profile audits it. A logged denial may appear in `/var/log/audit/audit.log` (when `auditd` is running) or in `journalctl -k`, rather than in `dmesg`.
+
+To allow in-place updates without granting anything wider, add rules like these inside the profile that confines ZNC. Use the profile's `local/` include file if it has one, so package updates don't overwrite the change.
+
+```text
+  owner @{HOME}/.znc/modules/.missingchans-load-* mrw,
+  owner link @{HOME}/.znc/modules/.missingchans-load-* -> @{HOME}/.znc/modules/missingchans.so,
+```
+
+- The first rule lets ZNC map and then delete the temporary link (`m` and `r` for loading, `w` for deletion).
+- The second allows creating the link, and only when the target is `missingchans.so`. No other module or file gains link permission.
+- Adjust the paths if ZNC's data directory is not `~/.znc` (`--datadir`), or if the profile does not use the `@{HOME}` tunable.
+- If the profile has a `deny` rule covering the module directory, it takes precedence over these rules and has to be narrowed for these paths.
+
+Check the syntax and reload the profile. The running ZNC process picks up the reloaded profile without a restart:
+
+```sh
+sudo apparmor_parser -QT -K /etc/apparmor.d/<znc-profile>   # syntax check only
+sudo apparmor_parser -r /etc/apparmor.d/<znc-profile>        # reload
+sudo aa-status | grep -i znc                                 # still in enforce mode?
+```
+
+Then run `UpdateMod missingchans` again and check `VERSION`. Changing the profile is optional: restarting ZNC always loads the installed build.
+
+Other confinement mechanisms can have the same effect. Examples are SELinux policies, and systemd sandboxing that makes the module directory read-only (`ProtectHome=read-only`, `ReadOnlyPaths=`). The requirement is the same: link, map, and delete within the module directory. If granting that is not acceptable, update by restarting ZNC.
 
 ### Rollback
 
@@ -855,7 +899,7 @@ Tune from there based on how quickly the network, helper bot, or cloak system no
 - A poorly chosen `Delay` that is too short can make retries start before your normal auth flow has had time to succeed.
 - WHOIS correlation relies on the server answering requests in order; IRCv3 labeled responses are not used. A module that intercepts, reorders, or injects overlapping WHOIS traffic can interfere. Ordinary `route_replies` use is tested; overlapping route_replies routing may expose internal replies to a client before this module can hide them. If attribution fails, the watchdog stops recovery rather than assuming membership is missing.
 - Channel comparison is ASCII case-insensitive, not full IRC `CASEMAPPING`.
-- In-place updates rely on Linux/glibc dynamic-loader behavior and were tested with glibc 2.35 and 2.39. Upgrading **to** r12 from an older build may still need one restart. A crash backtrace from a build loaded in place names the temporary file `.missingchans-load-<pid>-<n>` instead of `missingchans.so`.
+- In-place updates rely on Linux/glibc dynamic-loader behavior and were tested with glibc 2.35 and 2.39. They need permission to create a hard link in the module directory, which an AppArmor profile or other confinement may withhold; see [Permissions for in-place updates](#permissions-for-in-place-updates). Upgrading **to** r12 from an older build may still need one restart. A crash backtrace from a build loaded in place names the temporary file `.missingchans-load-<pid>-<n>` instead of `missingchans.so`.
 - Tests do not cover every IRCd, service bot, TLS/SASL deployment, or arbitrary third-party module. See [TESTING.md](./TESTING.md) for exactly what is and is not covered.
 
 ---
