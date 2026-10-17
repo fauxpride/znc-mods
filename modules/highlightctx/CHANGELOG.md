@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.13.0] — 2026-10-17
+
+Fixes highlights that were missed when the nick was touched by a symbol or wrapped in colour codes.
+
+### Fixed
+
+* **A nick followed or preceded by symbol characters is now a highlight.** A mention was rejected whenever any nick character touched the nick, and that set includes ``- _ [ ] \ ` ^ { } |``. So `fauxpride- i` was treated as a mention of a different nick, `fauxpride-`, and dropped, as were `nick_`, `nick^^`, `[nick]` and `_nick_`.
+
+  The module now looks at the whole run of nick characters touching the nick. If the run contains a letter or digit, the nick is part of a longer word or nick (`timothy`, `tim_2`, `tim-tam`, `tim|away`) and does not match, as before. If it is symbols only, it is decoration and matches — unless that exact decorated spelling is the nick of someone currently in the channel, in which case the line is addressed to them. That check uses ZNC's live nick list, so it follows joins, parts, quits and nick changes, and it is per channel.
+
+  Verified on ZNC 1.10.3 with identical traffic: the reported line produced 0 events on 0.12.0 and 1 on 0.13.0; 20 decorated forms went from 0 matches to 20.
+
+* **Mentions wrapped in IRC colour codes are now highlights.** In `\x0312nick\x03: hi` the colour number's digits sit directly against the nick and read as part of a word, so coloured mentions — common with scripted nick completion — were missed. Matching now runs on the text with formatting removed: `\x03` colours, `\x04` hex colours, bold, italics, underline, reverse, strikethrough, monospace and reset. This predates 0.12.0; it surfaced while testing the fix above.
+
+### Changed
+
+* **`reg_nick_boundaries` uses `tim_x` and `[tim]x`** instead of `tim_` and `[tim]`, so it stays a byte-identical regression across versions. The inputs whose result changed are covered with explicit deltas in the new `nb_*` scenarios.
+* **`reg_commands` checks the command surface against a version table.** It previously hard-coded the 0.10 → 0.11 output changes and skipped them for a 0.11.x baseline, so 5 of its assertions failed against every other baseline, 0.12.0 included, and the suite exited non-zero against them. A new `SURFACE_CHANGES` table records each change to command output by release. The scenario applies the entries between the two builds' versions, so the comparison is exact for any baseline from 0.8.0 on. Repeated commands are now compared at each position instead of only the last. See [TESTING](./TESTING.md#command-surface-reg_commands).
+* **Version marker bumped** from `highlightctx 0.12.0` to `highlightctx 0.13.0`.
+
+### Added
+
+* **Nick-boundary tests** (`tests/boundary.py`, group `nb`): decorated, embedded, plain and formatted mentions; someone else's nick present in the channel, including case-equivalent spellings and membership changes; notices, actions, exclusions, self lines and window extension with decorated mentions; own nicks that contain symbols, including alternate nicks such as `tim-` and `tim_` after a server-side rename, checked against the baseline for lost hits; and the reported line itself. See [TESTING](./TESTING.md#nb_--nick-boundaries-and-formatting).
+
+### Security
+
+* **Slightly wider matching by design.** Decorated forms of your nick and coloured mentions now start events. Nothing about what is captured, stored or replayed changes otherwise. The stored line is the original text, formatting included; only the comparison uses the stripped form.
+* **Bounded extra work.** Formatting is stripped once per line in a single pass. The nick-list lookup runs only for a decorated occurrence, never for ordinary traffic or ordinary mentions, and compares lengths before folding, so a line crafted with many decorated copies of your nick costs one pass over the channel's nick list per copy.
+
+### Compatibility
+
+* **No format, setting, or command changes.** Existing journals and NV settings load unchanged; downgrading to 0.12.0 restores the old matching.
+* **ZNC compatibility.** Uses `CChan::GetNicks()`, available in every ZNC version the module supports. Built with plain `znc-buildmod` and tested against ZNC 1.10.3 built from the upstream `znc-1.10.3` tag (SSL and IPv6 on; charset, i18n and Argon2 off).
+
+---
+
 ## [0.12.0] — 2026-09-18
 
 Correctness and performance work, with no new features.

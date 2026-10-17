@@ -2,7 +2,7 @@
 
 Detached-only highlight context capture for ZNC, with its own live per-channel history, durable active-event journaling, replay into `*highlightctx`, and optional `ignore_drop` integration.
 
-Current module version in source: **0.12.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes and [TESTING](./TESTING.md) for the test suite.
+Current module version in source: **0.13.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes and [TESTING](./TESTING.md) for the test suite.
 
 ---
 
@@ -54,7 +54,7 @@ At a high level, the module behaves like this:
 1. The network becomes detached.
 2. `highlightctx` starts observing live channel messages, notices, and actions.
 3. For each channel, it keeps a rolling in-memory ring of recent lines.
-4. If a line contains your current nick as a proper nick-like highlight boundary match, the module starts a highlight event.
+4. If a line mentions your current nick (see [Nick matching](#nick-matching)), the module starts a highlight event.
 5. It snapshots up to `before` earlier lines from that channel’s private ring.
 6. It stores the trigger line.
 7. It collects up to `after` later lines from that same channel. If another qualifying highlight arrives in that channel during this step, it does **not** start a second, overlapping event: it is marked as an additional trigger inside the open event and extends the collection window (see [Overlapping highlights (extension)](#overlapping-highlights-extension)).
@@ -118,7 +118,23 @@ A highlight event starts when:
 - an incoming channel line contains your **current network nick**
 - the line is **not** from your own nick
 
-Nick matching is case-insensitive and uses nick-style boundary logic, so it tries to detect proper nick mentions rather than arbitrary substring matches embedded in larger nick-like tokens.
+### Nick matching
+
+A line mentions you when your nick appears in it as a word of its own, not as part of a longer word or someone else's nick. Matching is case-insensitive under RFC 1459 casemapping (see [Case handling](#case-handling)) and ignores IRC colour and formatting codes, so it sees the text as your client displays it.
+
+What counts as "part of a longer word" is decided by the run of nick characters (letters, digits, and ``- _ [ ] \ ` ^ { } |``) touching your nick on either side:
+
+| Touching characters | Example (nick `tim`) | Result |
+|---|---|---|
+| none | `tim: hi`, `tim, hi`, `tim's`, `<tim>`, `@tim` | mention |
+| symbols only | `tim- hi`, `tim_`, `tim^^`, `[tim]`, `_tim_` | mention, unless that exact spelling is someone else's nick in the channel |
+| includes a letter or digit | `timothy`, `xtim`, `tim2`, `tim_2`, `tim-tam`, `tim\|away` | not a mention |
+
+The middle row's exception follows the channel's live nick list: if `tim_` is in the channel, `tim_: hi` is addressed to them and does not trigger; once they part, quit, or change nick, it does. A line containing several occurrences triggers if any one of them qualifies.
+
+Colour codes are removed before matching because their digits would otherwise touch the nick: in `\x0312tim\x03: hi` the `12` reads as part of the word. Both `\x03` and `\x04` (hex) colours are handled, along with bold, italics, underline, reverse, strikethrough, monospace and reset. Replayed lines keep their original formatting; only the comparison uses the stripped text.
+
+Before 0.13.0 any adjacent nick character rejected a mention, so the symbols-only row and coloured mentions were missed.
 
 ---
 

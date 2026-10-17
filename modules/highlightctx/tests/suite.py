@@ -281,11 +281,14 @@ def reg_nick_boundaries(so, tag):
     d = z.ircd
     d.say("#a", "bob", "N1 timothy is not me")
     d.say("#a", "bob", "N2 xtim nor this")
-    d.say("#a", "bob", "N3 tim_ neither")
+    d.say("#a", "bob", "N3 tim_x neither")
     filler(d, "#a", ["F1", "F2"])
     d.say("#a", "bob", "N4 tim's yes")
     filler(d, "#a", ["F3", "F4"])
-    d.say("#a", "bob", "N5 [tim] also not (pre-existing: [ ] are nick chars)")
+    # Inputs whose result intentionally changed in 0.13.0 (tim_, [tim]) are
+    # covered with explicit deltas in boundary.py, so this scenario stays a
+    # byte-identical regression across versions.
+    d.say("#a", "bob", "N5 [tim]x not either")
     filler(d, "#a", ["F5", "F6"])
     d.sync()
     c = z.client()
@@ -386,6 +389,129 @@ def norm_version(s):
     return _VER_RE.sub("X.Y.Z", s).replace("_v080/", "_vX/").replace("_v090/", "_vX/")
 
 
+# Every change to the output of the commands reg_commands runs, keyed by the
+# release that made it. reg_commands applies the entries newer than the
+# baseline and no newer than the build under test, so the comparison is exact
+# for any baseline from 0.8.0 on. Lines are identified by a stable prefix:
+#   reworded - a line with this prefix exists in both versions, with new text
+#   added    - a line with this prefix exists only in the newer version
+# Any difference not listed here fails the scenario, as does a listed change
+# that did not happen. When a release changes command output, add it here.
+SURFACE_CHANGES = [
+    ("0.9.0", {
+        "Help": {"reworded": ["\x02SetAfter "]},
+        "Overview": {"added": ["Overlapping highlights:"]},
+    }),
+    ("0.10.0", {
+        "Help": {"reworded": ["\x02Compact\x0f"]},
+        "Overview": {"added": ["Journaling can be turned off"]},
+        "Status": {"added": ["journal: "]},
+        "Reset": {"added": ["The journal setting was left unchanged"]},
+    }),
+    ("0.11.0", {
+        "Help": {"reworded": ["\x02SetAfter "], "added": ["\x02SetMaxEventLines ", "\x02SetMaxEventAge "]},
+        "Overview": {"added": ["Growth controls:"]},
+        "Status": {"reworded": ["max_events: "],
+                   "added": ["max_event_lines: ", "max_event_age: ", "events dropped since last replay: "]},
+        "Reset": {"reworded": ["All settings reset to defaults:"]},
+    }),
+]
+OLDEST_COMMAND_BASELINE = "0.8.0"
+
+
+def ver_tuple(v):
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return None
+
+
+def version_marker(commands):
+    """The 'Version marker' a build reports in its Status output, or None."""
+    for cmd, lines in commands:
+        if cmd == "Status":
+            for x in lines:
+                m = re.match(r"Version marker: highlightctx (\S+)$", x)
+                if m:
+                    return m.group(1)
+    return None
+
+
+def expected_surface_changes(base_ver, new_ver):
+    """Merge the SURFACE_CHANGES entries in (base_ver, new_ver]."""
+    lo, hi = ver_tuple(base_ver), ver_tuple(new_ver)
+    out, applied = {}, []
+    for ver, changes in SURFACE_CHANGES:
+        if lo < ver_tuple(ver) <= hi:
+            applied.append(ver)
+            for cmd, kinds in changes.items():
+                slot = out.setdefault(cmd, {"reworded": set(), "added": set()})
+                for kind, prefixes in kinds.items():
+                    slot[kind].update(prefixes)
+    # A line reworded in one release and added in a later one cannot exist in
+    # the baseline, so it counts as added only.
+    for slot in out.values():
+        slot["reworded"] -= slot["added"]
+    return out, applied
+
+
+def check_command_surface(scn, a_cmds, b_cmds):
+    """Compare the reg_commands transcripts of the baseline (a) and the build
+    under test (b), command by command and in order, allowing exactly the
+    changes SURFACE_CHANGES records between their two versions."""
+    base_ver, new_ver = version_marker(a_cmds), version_marker(b_cmds)
+    ok_vers = (ver_tuple(base_ver or "") is not None and ver_tuple(new_ver or "") is not None)
+    check(scn, "both builds report a version marker", ok_vers, "base=%r new=%r" % (base_ver, new_ver))
+    if not ok_vers:
+        return
+    check(scn, "baseline is %s or newer" % OLDEST_COMMAND_BASELINE,
+          ver_tuple(base_ver) >= ver_tuple(OLDEST_COMMAND_BASELINE), base_ver)
+    check(scn, "build under test is not older than the baseline",
+          ver_tuple(new_ver) >= ver_tuple(base_ver), "base=%s new=%s" % (base_ver, new_ver))
+    expected, applied = expected_surface_changes(base_ver, new_ver)
+    print("    info: command surface %s -> %s, expected changes from: %s"
+          % (base_ver, new_ver, ", ".join(applied) or "none"))
+    check(scn, "both transcripts ran the same commands",
+          [c for c, _ in a_cmds] == [c for c, _ in b_cmds], "")
+
+    seen = {}
+    for (cmd, la_raw), (_, lb_raw) in zip(a_cmds, b_cmds):
+        seen[cmd] = seen.get(cmd, 0) + 1
+        label = cmd if seen[cmd] == 1 else "%s (#%d)" % (cmd, seen[cmd])
+        la = [norm_version(x) for x in la_raw]
+        lb = [norm_version(x) for x in lb_raw]
+        exp = expected.get(cmd)
+        if not exp:
+            check(scn, "'%s' output identical" % label, la == lb,
+                  "\nbase=%r\nnew =%r" % ([x for x in la if x not in lb], [x for x in lb if x not in la]))
+            continue
+        removed = [x for x in la if x not in lb]
+        added = [x for x in lb if x not in la]
+        reworded, new_only = sorted(exp["reworded"]), sorted(exp["added"])
+
+        def owner(line, prefixes):
+            hits = [p for p in prefixes if line.startswith(p)]
+            return hits[0] if len(hits) == 1 else None
+
+        bad_removed = [x for x in removed if owner(x, reworded) is None]
+        bad_added = [x for x in added if owner(x, reworded + new_only) is None]
+        missing_reword = [p for p in reworded
+                          if sum(1 for x in removed if x.startswith(p)) != 1
+                          or sum(1 for x in added if x.startswith(p)) != 1]
+        missing_add = [p for p in new_only if sum(1 for x in added if x.startswith(p)) != 1]
+        # Lines common to both must keep their relative order.
+        common_a = [x for x in la if x in lb]
+        common_b = [x for x in lb if x in la]
+        check(scn, "'%s' differs exactly by the recorded changes since %s" % (label, base_ver),
+              not (bad_removed or bad_added or missing_reword or missing_add) and common_a == common_b,
+              "\nunexpected removed=%r\nunexpected added=%r\nreworded prefixes not reworded once=%r"
+              "\nadded prefixes not added once=%r\norder preserved=%r"
+              % (bad_removed, bad_added, missing_reword, missing_add, common_a == common_b))
+    # Content check independent of the baseline: extension is documented.
+    help_b = next((lines for c, lines in b_cmds if c == "Help"), [])
+    check(scn, "Help SetAfter row mentions extension", any("extends that event" in x for x in help_b), "")
+
+
 def run_regressions():
     for fn in REGRESSIONS:
         scn = fn.__name__
@@ -395,53 +521,7 @@ def run_regressions():
         a = fn(V080, "v080")
         b = fn(V090, "v090")
         if scn == "reg_commands":
-            ca = dict(a["commands"])
-            cb = dict(b["commands"])
-            for cmd, _ in a["commands"]:
-                la = [norm_version(x) for x in ca[cmd]]
-                lb = [norm_version(x) for x in cb[cmd]]
-                # Which deltas are expected depends on the baseline. Against a
-                # same-minor baseline the command surface must be identical.
-                if baseline_version().rsplit(".", 1)[0] == "0.11":
-                    check(scn, "'%s' output identical (no command-surface change)" % cmd, la == lb,
-                          "\nbase=%r\nnew =%r" % ([x for x in la if x not in lb], [x for x in lb if x not in la]))
-                    continue
-                if cmd == "Reset":
-                    extra = [x for x in lb if x not in la]
-                    check(scn, "Reset differs only in the defaults line",
-                          len(extra) == 1 and extra[0].startswith("All settings reset to defaults") and
-                          "max_events=100" in extra[0] and "max_event_lines=100" in extra[0], repr(extra))
-                    continue
-                if cmd == "Overview":
-                    extra = [x for x in lb if x not in la]
-                    check(scn, "Overview identical except one added growth-controls paragraph",
-                          [x for x in lb if x not in extra] == la and len(extra) == 1 and
-                          extra[0].startswith("Growth controls:"), repr(extra))
-                    continue
-                if cmd == "Status":
-                    extra = [x for x in lb if x not in la]
-                    missing = [x for x in la if x not in lb]
-                    want_extra = ["max_events: 100", "max_event_lines: 100", "max_event_age: disabled",
-                                  "events dropped since last replay: 0 by max_events, 0 by max_event_age"]
-                    check(scn, "Status: only the growth-control lines added and the max_events default changed",
-                          extra == want_extra and missing == ["max_events: disabled"],
-                          "extra=%r missing=%r" % (extra, missing))
-                    continue
-                if cmd == "Help":
-                    # Only the SetAfter row's description is expected to change.
-                    da = [x for x in la if x not in lb]
-                    db = [x for x in lb if x not in la]
-                    # Expected: two new commands, plus the reworded SetAfter row.
-                    added = [x for x in db if x not in la]
-                    new_cmds = [x for x in added if "SetMaxEventLines" in x or "SetMaxEventAge" in x]
-                    reworded = [x for x in added if x not in new_cmds]
-                    ok = (len(new_cmds) == 2 and len(reworded) <= 1 and
-                          all("SetAfter" in x for x in reworded) and
-                          all("SetAfter" in x for x in da))
-                    check(scn, "Help identical except SetAfter description", ok, "%r / %r" % (da, db))
-                    check(scn, "Help SetAfter row mentions extension", any("extends that event" in x for x in lb), "")
-                else:
-                    check(scn, "'%s' output identical" % cmd, la == lb, "\n080=%r\n090=%r" % (la, lb))
+            check_command_surface(scn, a["commands"], b["commands"])
             continue
         check(scn, "replay events identical 0.8.0 vs 0.9.0", a["events"] == b["events"],
               "\n080=%r\n090=%r" % (a["events"], b["events"]))
@@ -454,7 +534,7 @@ def run_regressions():
             check(scn, "raw fallback bodies identical (modulo nothing)", a["raw"] == b["raw"], "")
         if scn == "reg_nick_boundaries":
             got = [labels(e)[e["lines"].index(next(l for l in e["lines"] if l["marked"]))].lstrip("*") for e in b["events"]]
-            check(scn, "only N4 triggers (timothy/xtim/tim_/[tim] do not)", got == ["N4"], repr(got))
+            check(scn, "only N4 triggers (timothy/xtim/tim_x/[tim]x do not)", got == ["N4"], repr(got))
         if scn == "reg_excluded_in_window":
             ev = b["events"]
             check(scn, "excluded senders never marked", all(not l["marked"] for e in ev for l in e["lines"] if "spam" in l["text"] or "evil" in l["text"]), "")
@@ -1080,17 +1160,33 @@ import growth  # noqa: E402
 import compaction  # noqa: E402
 import symbols  # noqa: E402
 import casemap  # noqa: E402
+import boundary  # noqa: E402
 
 journal_off.install(globals())
 growth.install(globals())
 compaction.install(globals())
 symbols.install(globals())
 casemap.install(globals())
+boundary.install(globals())
 
 
 def run_casemap():
     for fn in CASEMAP:
         if ONLY and fn.__name__ not in ONLY and "cm" not in ONLY:
+            continue
+        print("  running", fn.__name__)
+        try:
+            fn()
+        except Exception:
+            check(fn.__name__, "no exception", False, traceback.format_exc())
+        finally:
+            for z in list(open_zncs):
+                finish(z)
+
+
+def run_boundary():
+    for fn in BOUNDARY:
+        if ONLY and fn.__name__ not in ONLY and "nb" not in ONLY:
             continue
         print("  running", fn.__name__)
         try:
@@ -1183,6 +1279,7 @@ if __name__ == "__main__":
     run_compaction()
     run_symbols()
     run_casemap()
+    run_boundary()
     by = {}
     for scn, name, ok, det in results:
         by.setdefault(scn.split("_v0")[0], [0, 0])
