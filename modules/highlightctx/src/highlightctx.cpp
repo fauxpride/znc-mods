@@ -114,7 +114,7 @@
 
 namespace {
 
-static const char* kModVersion = "highlightctx 0.12.0";
+static const char* kModVersion = "highlightctx 0.13.0";
 static const char* kJournalName = "highlightctx.journal";
 // Floor for the compaction trigger. The effective trigger point is derived
 // from what the last compaction actually achieved (see m_compact_at), because
@@ -388,21 +388,109 @@ static bool wildmatch_folded(const std::string& pattern, const std::string& text
     return p == pattern.size();
 }
 
-static bool contains_nick_highlight(const CString& text, const CString& nick) {
-    // Fold both sides with RFC 1459 casemapping so a nick containing
-    // [ ] \ ~ matches the { } | ^ forms the server may present, consistently
-    // with the self-check and with nick/mask exclusions. Boundary detection is
-    // unaffected: both sets are nick characters.
-    std::string hay = rfc1459_fold(text);
+static bool is_hex_digit(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+// Remove IRC formatting so highlight matching sees the text as displayed.
+// Handles \x03 colour (\x03[N[N]][,N[N]]) and \x04 hex colour
+// (\x04[RRGGBB][,RRGGBB]) as the de-facto IRC formatting spec defines them
+// (a background is only parsed after a foreground), and drops
+// every other C0 control and DEL (bold, italics, underline, reverse, reset,
+// monospace, strikethrough). A comma after a colour code that is not followed
+// by a colour is literal text and is kept. Without this, the digits of a
+// colour code such as \x0304 touch the nick and read as part of a word.
+static std::string strip_irc_formatting(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    const size_t n = in.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c == 0x03 || c == 0x04) {
+            const bool hex = (c == 0x04);
+            const size_t maxd = hex ? 6 : 2;
+            auto digit = [&](size_t k) {
+                const unsigned char d = static_cast<unsigned char>(in[k]);
+                return hex ? is_hex_digit(d) : (d >= '0' && d <= '9');
+            };
+            ++i;
+            size_t d = 0;
+            while (i < n && d < maxd && digit(i)) { ++i; ++d; }
+            if (d > 0 && i + 1 < n && in[i] == ',' && digit(i + 1)) {
+                ++i;
+                d = 0;
+                while (i < n && d < maxd && digit(i)) { ++i; ++d; }
+            }
+            continue;
+        }
+        if (c < 0x20 || c == 0x7F) { ++i; continue; }
+        out.push_back(static_cast<char>(c));
+        ++i;
+    }
+    return out;
+}
+
+static bool has_alnum(const std::string& s, size_t from, size_t to) {
+    for (size_t i = from; i < to; ++i) {
+        if (std::isalnum(static_cast<unsigned char>(s[i]))) return true;
+    }
+    return false;
+}
+
+// Highlight detection. Matches against the text with IRC formatting removed
+// (see strip_irc_formatting), and folds both sides with RFC 1459 casemapping
+// so a nick containing [ ] \ ~ matches the { } | ^ forms the server may
+// present, consistently with the self-check and with nick/mask exclusions.
+//
+// Boundary rule (0.13.0): for each occurrence of the nick, take the run of
+// nick characters touching it on each side.
+//   - If either run contains a letter or digit, the nick is embedded in a
+//     different word or nick (timothy, xtim, tim_2, tim-tam, tim|away): no
+//     match.
+//   - If both runs are empty (tim, tim:, tim's, <tim>): match.
+//   - Otherwise the runs are symbol-only decoration (tim-, tim_, tim^^,
+//     [tim], _tim_): match, unless the whole decorated token is the nick of
+//     someone else currently in the channel, in which case the line is
+//     addressed to them. `is_other_nick` receives that token, already folded.
+// Before 0.13.0 any adjacent nick character rejected the occurrence, so a
+// line like "tim- hi" was missed.
+template <typename IsOtherNick>
+static bool contains_nick_highlight(const CString& text, const CString& nick, IsOtherNick&& is_other_nick) {
+    std::string hay = rfc1459_fold(strip_irc_formatting(std::string(text.c_str(), text.size())));
     std::string needle = rfc1459_fold(nick);
     if (needle.empty()) return false;
 
     size_t pos = 0;
     while ((pos = hay.find(needle, pos)) != std::string::npos) {
-        bool left_ok = (pos == 0) || !is_nick_char(hay[pos - 1]);
-        bool right_ok = (pos + needle.size() >= hay.size()) || !is_nick_char(hay[pos + needle.size()]);
-        if (left_ok && right_ok) return true;
+        const size_t end = pos + needle.size();
+        size_t left = pos;
+        while (left > 0 && is_nick_char(hay[left - 1])) --left;
+        size_t right = end;
+        while (right < hay.size() && is_nick_char(hay[right])) ++right;
+
+        if (left == pos && right == end) return true;
+        if (!has_alnum(hay, left, pos) && !has_alnum(hay, end, right) &&
+            !is_other_nick(hay.substr(left, right - left))) {
+            return true;
+        }
         ++pos;
+    }
+    return false;
+}
+
+// True if `folded` (already RFC 1459-folded) equals, under the same folding,
+// the nick of anyone in `chan` other than `self`. Used only for decorated
+// candidates, so it never runs for an ordinary mention. ZNC keys its nick map
+// case-sensitively, hence the folded scan instead of FindNick().
+static bool is_other_nick_in_chan(const CChan* chan, const CString& self, const std::string& folded) {
+    if (!chan) return false;
+    const std::string self_folded = rfc1459_fold(self);
+    for (const auto& it : chan->GetNicks()) {
+        const CString& n = it.first;
+        if (n.size() != folded.size()) continue;
+        std::string nf = rfc1459_fold(n);
+        if (nf == folded && nf != self_folded) return true;
     }
     return false;
 }
@@ -1760,7 +1848,9 @@ class CHighlightCtx : public CModule {
 // RFC 1459 casemapping: [ ] \ fold to { } | on the networks this module
         // targets, so self-detection must fold rather than ASCII-lowercase.
         bool is_self = (rfc1459_fold(line.nick) == rfc1459_fold(mynick));
-        bool is_trigger = !is_self && contains_nick_highlight(line.text, mynick) &&
+        bool is_trigger = !is_self &&
+                          contains_nick_highlight(line.text, mynick,
+                              [&](const std::string& token) { return is_other_nick_in_chan(pChan, mynick, token); }) &&
                           !IsSenderExcluded(Message, line.nick);
 
         // Feed already-open events: excluded-nick messages are STILL valid
