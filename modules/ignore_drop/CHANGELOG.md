@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.1.1] — 2026-10-19
+
+Makes the module network-only as documented, fixes a ZNC crash in `SetScope`, and makes `/znc updatemod` able to replace a GCC 11 build. Tested on ZNC 1.10.3 built with GCC 13 and with GCC 11.
+
+### Fixed
+
+* **The module could be loaded at user scope.** It was declared with `USERMODULEDEFS`, which makes *user* the default type and only added *network* as a second supported type. So a plain `/msg *status LoadMod ignore_drop` (no `--type`) created a user-scope instance, and `--type=user` was accepted, contrary to the network-only design described in the README. A user-scope instance shares one rule list and one NV store across all of that user's networks, and [`highlightctx`](../highlightctx/README.md) 0.13.0 and earlier cannot see it. The module is now declared with `NETWORKMODULEDEFS`: plain `LoadMod ignore_drop` loads it for the current network, and `--type=user` and `--type=global` are refused.
+
+* **`SetScope 0 <scope>` crashed ZNC.** Index 0 passed the range check for the first bucket and read element `[-1]` of a vector, taking down every user and network on the bouncer. The same happened for any index `CString::ToUInt` wraps to 0, such as `4294967296`, and an index that wraps to 1, such as `4294967297`, acted on entry #1. `SetScope` and `Del` now parse the index strictly and reply `Index out of range.` / `Not found.` for 0 and for anything longer than nine digits.
+
+* **`/znc updatemod ignore_drop` did nothing on GCC 11 builds.** `std::to_string` pulls in `std::__detail::__to_chars_10_impl`, whose digit table GCC 11 emits as an `STB_GNU_UNIQUE` symbol. glibc never unloads a library that defines one, so `UpdateMod` reported success while the old code stayed in memory until a full ZNC restart. The two uses are replaced by a module-local `dec_str()`, and the module now defines no such symbol on GCC 11 or GCC 13. This is the same fix `highlightctx` received in 0.11.2.
+
+### Changed
+
+* **`IGNORE_DROP_VERSION` bumped** to `1.1.1`. The version also appears in the module description that `ListAvailMods` shows.
+
+### Added
+
+* **Test suite** under [`tests/`](./tests/), driving a real ZNC against fake IRC servers. See [TESTING](./TESTING.md).
+
+### Compatibility
+
+* **Storage format, commands and filtering are unchanged.** The only command whose output changes is `SetScope` or `Del` with an index of 0 or more than nine digits, which used to crash ZNC or act on the wrong entry.
+
+* **A user-level `LoadModule = ignore_drop` line in `znc.conf` keeps working.** ZNC treats such a line for a network-only module as "load it on every network of this user": it logs `NOTICE: Module [ignore_drop] is a network module, loading module for all networks in user.`, and copies the user-level NV (your rules) into each network that has none of its own. A network that already has its own `ignore_drop` NV keeps it. The next config write records network-level lines instead.
+
+* **A user-scope instance cannot be upgraded with `UpdateMod`.** ZNC reloads each instance with its existing type, and 1.1.1 refuses the user type, so ZNC replies `Done, but there were errors, module ignore_drop could not be reloaded everywhere.` and that instance is gone until the next restart, which migrates it as above. `/msg *status ListMods` shows whether you have one: look for `ignore_drop` under `User modules:`. If you loaded the module with `--type=network`, as the README says, this does not apply.
+
+* **Upgrading a GCC 11 build of 1.1.0 in place needs one restart.** The old build is the one glibc cannot unload, so `UpdateMod` keeps running 1.1.0. `/msg *ignore_drop Version` after the update shows which version is running. From 1.1.1 on, `UpdateMod` replaces the code, with one exception that has nothing to do with this release; see [Upgrading in place](./README.md#upgrading-in-place).
+
+* **Reloading `ignore_drop` moves it behind `highlightctx`.** `ReloadMod` and `UpdateMod` re-add a module at the end of the network's module list. Since `ignore_drop` only protects `highlightctx` while it comes first, run `UpdateMod highlightctx` after updating `ignore_drop`. `highlightctx` 0.14.0 detects the reversal and pauses capture until you do; 0.13.0 and earlier silently capture and replay messages from ignored senders.
+
+---
+
 ## [1.1.0] — 2026-04-21
 
 This release addresses four issues identified in a security review of 1.0.0: a trivial RFC 1459-based mask bypass, an IRCv3-tag blind spot in the fallback playback parser, a per-message heap allocation in the wildcard matcher, and a fragile on-disk storage format. Built and runtime-tested against ZNC 1.9.1.

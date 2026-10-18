@@ -6,6 +6,79 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.14.1] — 2026-10-19
+
+Numbers too large for a count or an index were silently wrapped around instead of rejected.
+
+### Fixed
+
+* **Oversized numbers wrapped modulo 2³².** Counts, caps and indexes were parsed with `CString::ToUInt`, which keeps only the low 32 bits. So `SetBefore 4294967304` set a cap of 8, `SetMaxEvents 4294967396` set 100, and `DelExclude 4294967297` removed exclusion #1. The same applied to `SetAfter`, `SetMaxEventLines`, and the `before`, `after`, `max_events` and `max_event_lines` load arguments. Anything above `4294967295` is now rejected with the reply or load error each command already gave for invalid input, and the setting is left unchanged. Nothing could crash: `DelExclude` already refused index 0.
+
+* **`DelExclude 0` was looked up as a nick.** An argument made only of digits is now always an index, so `0`, and a number too large to be one, get `Index <n> is out of range.` like an index past the end of the list. Before, `0` fell through to the nick/mask lookup and replied `That nick/mask is not currently excluded.`
+
+* **The `SetMaxEventLines` note could be wrong.** The note that the cap is below `before + 1 + after` added the three in 32 bits, so with a very large `before` the sum wrapped and the note was missing or showed the wrong total. The sum is now computed in 64 bits.
+
+### Added
+
+* **Numeric input tests** (`tests/numeric.py`, group `num`). See [TESTING](./TESTING.md#num_--numeric-input).
+
+### Changed
+
+* **`tests/coupling.py`** gates its contrasts with the baseline on the baseline's version, so the suite also passes with a 0.14.0 baseline.
+* **Version marker bumped** from `highlightctx 0.14.0` to `highlightctx 0.14.1`.
+
+### Compatibility
+
+* **No journal, NV or command changes** beyond the replies above. Values the module wrote itself are always in range.
+* **A wrapping value in `znc.conf` now stops ZNC from starting.** A load argument like `before=4294967304` used to load as `before=8`; it now fails the load, and ZNC treats a network module that fails to load from `znc.conf` as fatal. Any value up to `4294967295` is unaffected.
+
+---
+
+## [0.14.0] — 2026-10-19
+
+Closes a gap in the `ignore_drop` protection: after `ignore_drop` was reloaded, messages from ignored senders were captured and replayed even in strict mode. Also stops `require_ignore_drop=on` from aborting ZNC startup.
+
+### Fixed
+
+* **Reloading `ignore_drop` silently disabled the protection.** ZNC adds a module to the end of the network's module list whenever it loads it, and `ReloadMod` and `UpdateMod` unload and load again. So `UpdateMod ignore_drop`, which is how a new `ignore_drop` build is deployed, leaves `ignore_drop` behind `highlightctx`, and `highlightctx` sees every message first. The live gate in `ShouldCaptureNow()` only checked that `ignore_drop` was loaded, so armed `auto` mode and `on` mode kept capturing: an ignored sender who mentioned you started an event, and replay delivered their line. `Status` kept showing the position from the last check, `ahead ...: yes`.
+
+  The gate now checks, on every message, whether `ignore_drop` actually runs before `highlightctx`, and pauses capture when the requirement is in force and it does not. `Status` reads presence and position live, and adds a note while capture is paused that names the cause and the fix: `UpdateMod highlightctx` to move `highlightctx` behind `ignore_drop` again, then `SaveConfig`.
+
+  Verified on ZNC 1.10.3 with identical traffic after `UpdateMod ignore_drop`, and again after `ReloadMod`: 0.13.0 replayed the ignored sender's line; 0.14.0 captured nothing and reported two missed highlights.
+
+* **`require_ignore_drop=on` could stop ZNC from starting.** With `on`, the module refused to load unless `ignore_drop` was already loaded. During `znc.conf` parsing ZNC treats a network module that refuses to load as fatal, so with `highlightctx` listed before `ignore_drop` ZNC exited with `Unrecoverable config error`. That order is what webadmin produces (it loads modules alphabetically), and what ZNC itself writes after `ignore_drop` has been reloaded. `on` now always loads; the requirement is enforced by the live gate instead, and the load message ends with a note when capture starts out paused. `SetRequireIgnoreDrop on` is likewise accepted when `ignore_drop` is absent, and says that capture is paused.
+
+* **A restart could silently disarm `auto` mode.** After `ignore_drop` is reloaded, any config write records the reversed order, since ZNC saves modules in list order. On the next restart `OnBoot` found `ignore_drop` behind `highlightctx` and left `auto` unarmed, so capture ran unprotected. The armed state is now stored in NV and restored before `OnLoad`'s check, so it stays armed, and capture pauses until the order is fixed. `Rearm`, `SetRequireIgnoreDrop` and `Reset` still re-check from scratch and can disarm.
+
+* **A user-scope `ignore_drop` was not recognised.** `ignore_drop` 1.1.0 and earlier could be loaded at user scope, where it runs before every network module and protects `highlightctx` fully. `highlightctx` only searched the network's module list, so it reported `ignore_drop` as not loaded, `auto` never armed, and `on` aborted ZNC startup. A user-scope instance now counts as ahead, and `Status` labels it.
+
+### Added
+
+* **Missed highlights are reported.** While capture is paused for `ignore_drop`, a line that would have started or extended an event is counted instead. The next replay starts with a note giving the count and where `ignore_drop` is now, and `Status` shows the running count in a new line, `highlights missed while capture was paused for ignore_drop, since last replay:`. The count is stored in NV as `missed_while_paused`, so it survives a restart, and is cleared once reported. Before, a pause for a missing `ignore_drop` was silent.
+* **`ignore_drop` coupling tests** (`tests/coupling.py`, group `idc`). See [TESTING](./TESTING.md#idc_--ignore_drop-coupling).
+
+### Changed
+
+* **`OnLoad` checks the actual position.** The module is already in the network's list when its `OnLoad` runs, so the presence heuristic it used is replaced by the same position check `OnBoot` and `Rearm` use.
+* **`SetRequireIgnoreDrop` and `Reset` re-check the position** instead of reusing the result of the last check.
+* **`Rearm`** says when disarming leaves capture unprotected, lists `UpdateMod highlightctx` among the ways to fix the order, and in `on` mode says when capture is paused.
+* **Help, Overview and the `SetRequireIgnoreDrop` reply** describe the new behaviour of `on`.
+* **`reg_commands`** records this release's command-output changes in `SURFACE_CHANGES`, which gains a `removed` kind for the line `SetRequireIgnoreDrop on` no longer prints. The 0.13.0-specific contrast checks in `tests/boundary.py` now gate on the baseline's version, so they also pass against a 0.13.0 baseline.
+* **Version marker bumped** from `highlightctx 0.13.0` to `highlightctx 0.14.0`.
+
+### Security
+
+* **Restores the `ignore_drop` protection after a reload or a reordered restart.** Without it, a user you ignore could have their messages appear in your highlight replay whenever `ignore_drop` had been updated in place. The fix fails closed: when protection cannot be guaranteed, capture pauses and says so, rather than capturing unfiltered.
+* **Bounded extra work.** The position check only runs while the requirement is in force: one lookup in the user's module list and one pass over the network's, per incoming channel line while detached. While paused, the trigger check runs as it would during capture.
+
+### Compatibility
+
+* **No journal or command changes.** Existing journals and NV settings load unchanged. Two NV keys are added, `auto_ignore_drop_armed` and `missed_while_paused`; earlier versions ignore them, so downgrading to 0.13.0 works and restores the old behaviour.
+* **Behaviour that changes on upgrade.** With `on`, if `ignore_drop` sits behind `highlightctx` on a network, capture pauses where 0.13.0 kept capturing, and `Status` says so. In `auto` mode nothing changes at the moment of upgrade: 0.13.0 stored no armed state, so 0.14.0 arms exactly when `ignore_drop` is ahead, as before. Deploying with `UpdateMod highlightctx` moves `highlightctx` behind `ignore_drop` on every network anyway; run `SaveConfig` afterwards to keep that order.
+* **Deploy `ignore_drop` 1.1.1 first, then this release.** `UpdateMod ignore_drop` moves `ignore_drop` behind `highlightctx`; `UpdateMod highlightctx` afterwards restores the order.
+
+---
+
 ## [0.13.0] — 2026-10-17
 
 Fixes highlights that were missed when the nick was touched by a symbol or wrapped in colour codes.

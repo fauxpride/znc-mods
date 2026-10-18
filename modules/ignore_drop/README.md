@@ -17,7 +17,7 @@ This makes `ignore_drop` well suited to use cases such as:
 - centralizing ignore behavior in ZNC rather than reproducing it across multiple IRC clients
 - applying ignores on a **per-network** basis instead of globally
 
-Current version: **1.1.0**. See [CHANGELOG](./CHANGELOG.md) for per-release notes.
+Current version: **1.1.1**. See [CHANGELOG](./CHANGELOG.md) for per-release notes and [TESTING](./TESTING.md) for the test suite.
 
 ---
 
@@ -79,7 +79,7 @@ It is especially appropriate for users who:
 
 ## Feature summary
 
-- network module, not a global/user module
+- network module only: it cannot be loaded at user or global scope (enforced since 1.1.1)
 - per-network storage using ZNC NV
 - case-insensitive wildcard masks with **RFC 1459 case folding**
 - separate semantics for **always** and **detached** rules
@@ -89,6 +89,7 @@ It is especially appropriate for users who:
 - `Version` command for identifying the running build
 - allocation-free iterative wildcard matcher
 - contains fallback playback-line hooks for older ZNC playback paths, with IRCv3 message-tag awareness
+- replaceable in place with `/znc updatemod` (see [Upgrading in place](#upgrading-in-place))
 
 ---
 
@@ -206,11 +207,40 @@ This compiles the module into a loadable `.so` file for ZNC.
 
 ### Load
 
-Because this module is explicitly a **network module**, load it on the target IRC network with:
+This is a **network module**. Load it on the target IRC network with:
 
 ```text
 /msg *status LoadMod --type=network ignore_drop
 ```
+
+Since 1.1.1, `LoadMod ignore_drop` without `--type` does the same. `--type=user` and `--type=global` are refused with `Module ignore_drop does not support module type ...`. Up to 1.1.0 the module's default type was *user*, so a plain `LoadMod ignore_drop` created a user-scope instance; see the [CHANGELOG](./CHANGELOG.md) for what happens to such an instance on upgrade.
+
+If you also run [`highlightctx`](../highlightctx/README.md), `ignore_drop` must come **before** it in the network's module list, so its hooks run first and dropped messages never reach `highlightctx`. List `LoadModule = ignore_drop` before `LoadModule = highlightctx` in `znc.conf`, and see the next section for what reloading does to that order.
+
+### Upgrading in place
+
+The usual sequence works:
+
+```text
+cp ignore_drop.so ~/.znc/modules/ignore_drop.so.new
+mv -f ~/.znc/modules/ignore_drop.so.new ~/.znc/modules/ignore_drop.so
+/msg *status UpdateMod ignore_drop
+/msg *ignore_drop Version
+```
+
+Check the `Version` reply. `UpdateMod` reports `Done` even when glibc could not unload the old code, and the version is the only way to tell from IRC. There are two situations where that happens:
+
+- **The running build is a GCC 11 build of 1.1.0 or earlier.** Those define an `STB_GNU_UNIQUE` symbol, which makes glibc keep the library mapped for the life of the process. Upgrading *from* such a build needs one ZNC restart; 1.1.1 does not have the symbol, so later updates are not affected.
+- **No global module is loaded and another module was loaded after `ignore_drop`.** ZNC loads modules into the global symbol scope, and every module built against ZNC's headers carries the same small pieces of template code. A module loaded later binds to the first copy loaded, and while it does, glibc cannot unload that library. A global module such as `webadmin` or `corecaps`, loaded at startup, normally provides that first copy; without one, `ignore_drop`'s copy is used and the later module keeps the old `ignore_drop` mapped. Restart ZNC, or unload the later modules, update, and load them again.
+
+Reloading moves the module: `ReloadMod` and `UpdateMod` both remove it and add it back at the **end** of each network's module list. If you run `highlightctx`, it is now ahead of `ignore_drop`, so restore the order straight away:
+
+```text
+/msg *status UpdateMod highlightctx
+/msg *status SaveConfig
+```
+
+`UpdateMod highlightctx` moves `highlightctx` to the end, behind `ignore_drop` again. `SaveConfig` writes that order to `znc.conf`. ZNC saves modules in list order, and if any config write happened while the order was reversed, the file lists `highlightctx` first until it is written again, which is what the next restart would use. `highlightctx` 0.14.0 and later pause capture while the order is reversed and report it; earlier versions keep capturing, including messages from ignored senders.
 
 ### Help
 
@@ -373,6 +403,7 @@ Deletes an entry by index or by exact mask.
 
 Behavior details:
 
+- the index is the one `List` prints; `0`, and any number longer than nine digits, is reported as `Not found.`
 - deleting by mask is case-insensitive because the input is folded before comparison
 - if duplicates exist, deleting by exact mask removes the first matching stored entry encountered internally
 
@@ -402,6 +433,7 @@ Moves an existing entry to the requested scope.
 
 Behavior details:
 
+- the index is the one `List` prints; `0`, and any number longer than nine digits or past the end of the list, is reported as `Index out of range.` (Up to 1.1.0, `SetScope 0` crashed ZNC.)
 - the entry is removed from its current internal bucket and appended to the target bucket
 - this can change numbering/order shown by `List`
 
@@ -440,13 +472,15 @@ This section describes how the module works internally, based directly on the so
 
 ### Module type
 
-The module registers itself as a **network module**:
+The module registers itself as a **network module**, and only as one:
 
 ```text
-Info.AddType(CModInfo::NetworkModule);
+NETWORKMODULEDEFS(CIgnoreDrop, ...)
 ```
 
-That is important because:
+`NETWORKMODULEDEFS` makes *network* both the default type and the only supported type. Up to 1.1.0 the module used `USERMODULEDEFS` plus `Info.AddType(CModInfo::NetworkModule)`, which made *user* the default and *network* an extra option, so it could be loaded at user scope.
+
+Network scope is important because:
 
 - each IRC network gets its own module instance
 - rules are stored per network
@@ -517,6 +551,8 @@ In addition to modern buffer-play message hooks, the source also contains fallba
 - `OnPrivBufferPlayLine`
 
 These parse the line prefix into a temporary `CNick` and then reuse the same playback decision logic. As of 1.1.0, the line parser skips IRCv3 message tags (a leading `@tag=value;...` block up to the first space) before looking for the `:prefix`, so tagged playback lines are filtered correctly.
+
+In practice these methods are never called. ZNC's hooks of the same names take the channel and client as well (`OnChanBufferPlayLine(CChan&, CClient&, CString&)`, `OnPrivBufferPlayLine(CClient&, CString&)` in ZNC 1.9 and 1.10), so the module's one-argument versions do not override them. Playback filtering is done entirely by the `OnChanBufferPlayMessage` and `OnPrivBufferPlayMessage` overrides above.
 
 ### Wildcard engine
 
@@ -629,12 +665,21 @@ A few details are worth knowing before you rely on the module heavily:
 - nick-only masks do **not** match ident/host; they only match nicknames
 - full masks are matched against `nick!ident@host`
 - masks cannot begin with `A|` or `D|` (reserved for storage); use a wildcard such as `?|*` if you need to match such a nick
+- only messages are filtered: `PRIVMSG`, `NOTICE` and CTCP `ACTION`. Other CTCP requests (such as `VERSION`), `JOIN`, `PART`, `QUIT`, `NICK` and IRCv3 `TAGMSG` (typing notifications, reactions) from an ignored sender still reach the client
 
 ---
 
 ## ZNC compatibility
 
-Built and tested against **ZNC 1.9.1**. The module-facing headers (`Modules.h`, `Nick.h`, `Message.h`, `IRCNetwork.h`, `User.h`, `Chan.h`, `znc.h`) are byte-identical between ZNC 1.9.0 and 1.9.1, so a `.so` produced with `znc-buildmod` from either release is interchangeable.
+1.1.1 is tested against **ZNC 1.10.3**, built from source with GCC 13.3 and, separately, with GCC 11.5 (the compiler generation on Ubuntu 22.04), with the module built by the same compiler each time. Build the module with `znc-buildmod` from the ZNC it will be loaded into.
+
+1.1.0 was built and tested against ZNC 1.9.1. The module-facing headers (`Modules.h`, `Nick.h`, `Message.h`, `IRCNetwork.h`, `User.h`, `Chan.h`, `znc.h`) are byte-identical between ZNC 1.9.0 and 1.9.1.
+
+---
+
+## Testing
+
+The test suite runs a real ZNC against fake IRC servers and checks what reaches the client. It covers filtering, scopes, playback, every command, persistence, module type and `znc.conf` migration, in-place updates, and symbol hygiene. See [TESTING](./TESTING.md).
 
 ---
 
