@@ -17,6 +17,7 @@ number's digits touch the nick and read as part of a word.
 
 Imported by suite.py; every function follows the suite's check() convention.
 """
+import re
 
 
 def install(ns):
@@ -29,6 +30,15 @@ def install(ns):
     L = ns["L"]
     V090 = ns["V090"]
     V080 = ns["V080"]          # baseline, for the differential checks
+    baseline_version = ns["baseline_version"]
+
+    def baseline_has_013_matching():
+        """A baseline from 0.13.0 on already has these matching rules, so the
+        contrast assertions become no-regression assertions."""
+        try:
+            return tuple(int(x) for x in baseline_version().split(".")) >= (0, 13, 0)
+        except ValueError:
+            return False
 
     def triggers_of(ev):
         """Labels of every marked (trigger) line, in replay order."""
@@ -144,7 +154,10 @@ def install(ns):
         base = per_channel(V080, scn + "_baseline", DECORATED)
         got = per_channel(V090, scn + "_under_test", DECORATED)
         check(scn, "all decorated forms trigger", got == want, "missing=%r" % sorted(want - got))
-        check(scn, "baseline missed all of them", base == set(), repr(sorted(base)))
+        if baseline_has_013_matching():
+            check(scn, "baseline %s matches the same forms" % baseline_version(), base == got, repr(sorted(base ^ got)))
+        else:
+            check(scn, "baseline missed all of them", base == set(), repr(sorted(base)))
 
     def nb_embedded_still_rejected():
         """A letter or digit in the touching run still means a different word."""
@@ -190,8 +203,11 @@ def install(ns):
         base = per_channel(V080, scn + "_baseline", FORMATTED)
         got = per_channel(V090, scn + "_under_test", FORMATTED)
         check(scn, "all formatted mentions trigger", got == want, "missing=%r" % sorted(want - got))
-        check(scn, "baseline missed the colour-digit cases",
-              not (base & {"F1", "F2", "F3", "F4", "F5", "F8"}), repr(sorted(base)))
+        if baseline_has_013_matching():
+            check(scn, "baseline %s matches the same forms" % baseline_version(), base == got, repr(sorted(base ^ got)))
+        else:
+            check(scn, "baseline missed the colour-digit cases",
+                  not (base & {"F1", "F2", "F3", "F4", "F5", "F8"}), repr(sorted(base)))
         neg = per_channel(V090, scn + "_negative", FORMATTED_NOT)
         check(scn, "formatting inside a word does not trigger", neg == set(), repr(sorted(neg)))
 
@@ -324,13 +340,16 @@ def install(ns):
               repr([(e["raw_header"], labels(e)) for e in ev]))
 
     def nb_version_marker():
-        """The module reports 0.13.0."""
+        """The module reports 0.13.0 or later, the release that introduced
+        these matching rules. (idc_version_marker pins the current release.)"""
         scn = "nb_version_marker"
         z = mk(scn, V090, load="before=1 after=1")
         c = z.client()
         out = [b for (t, b) in c.command("Version")]
         c.quit(); finish(z)
-        check(scn, "Version reports 0.13.0", any("highlightctx 0.13.0" in b for b in out), repr(out))
+        vers = [tuple(int(x) for x in m.group(1).split(".")) for b in out
+                for m in [re.search(r"highlightctx (\d+\.\d+\.\d+)", b)] if m]
+        check(scn, "Version reports 0.13.0 or later", vers and vers[0] >= (0, 13, 0), repr(out))
 
     ns["BOUNDARY"] = [nb_reported_line, nb_decorated_mentions_match, nb_embedded_still_rejected,
                       nb_plain_mentions_unchanged, nb_formatting_is_ignored, nb_other_nick_present, nb_other_nick_tracks_membership,

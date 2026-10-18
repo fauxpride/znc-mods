@@ -395,6 +395,7 @@ def norm_version(s):
 # for any baseline from 0.8.0 on. Lines are identified by a stable prefix:
 #   reworded - a line with this prefix exists in both versions, with new text
 #   added    - a line with this prefix exists only in the newer version
+#   removed  - a line with this prefix exists only in the older version
 # Any difference not listed here fails the scenario, as does a listed change
 # that did not happen. When a release changes command output, add it here.
 SURFACE_CHANGES = [
@@ -414,6 +415,14 @@ SURFACE_CHANGES = [
         "Status": {"reworded": ["max_events: "],
                    "added": ["max_event_lines: ", "max_event_age: ", "events dropped since last replay: "]},
         "Reset": {"reworded": ["All settings reset to defaults:"]},
+    }),
+    ("0.14.0", {
+        "Help": {"reworded": ["\x02SetRequireIgnoreDrop "]},
+        "Overview": {"reworded": ["ignore_drop modes:"]},
+        "Status": {"added": ["highlights missed while capture was paused for ignore_drop"]},
+        # 'on' is no longer refused when ignore_drop is absent; capture pauses.
+        "SetRequireIgnoreDrop on": {"removed": ["Cannot set require_ignore_drop to on"],
+                                    "added": ["require_ignore_drop mode set to on"]},
     }),
 ]
 OLDEST_COMMAND_BASELINE = "0.8.0"
@@ -445,13 +454,17 @@ def expected_surface_changes(base_ver, new_ver):
         if lo < ver_tuple(ver) <= hi:
             applied.append(ver)
             for cmd, kinds in changes.items():
-                slot = out.setdefault(cmd, {"reworded": set(), "added": set()})
+                slot = out.setdefault(cmd, {"reworded": set(), "added": set(), "removed": set()})
                 for kind, prefixes in kinds.items():
                     slot[kind].update(prefixes)
     # A line reworded in one release and added in a later one cannot exist in
     # the baseline, so it counts as added only.
     for slot in out.values():
         slot["reworded"] -= slot["added"]
+        # A line added in one release and removed in a later one never shows.
+        both = slot["added"] & slot["removed"]
+        slot["added"] -= both
+        slot["removed"] -= both
     return out, applied
 
 
@@ -487,25 +500,28 @@ def check_command_surface(scn, a_cmds, b_cmds):
             continue
         removed = [x for x in la if x not in lb]
         added = [x for x in lb if x not in la]
-        reworded, new_only = sorted(exp["reworded"]), sorted(exp["added"])
+        reworded, new_only, gone = sorted(exp["reworded"]), sorted(exp["added"]), sorted(exp["removed"])
 
         def owner(line, prefixes):
             hits = [p for p in prefixes if line.startswith(p)]
             return hits[0] if len(hits) == 1 else None
 
-        bad_removed = [x for x in removed if owner(x, reworded) is None]
+        bad_removed = [x for x in removed if owner(x, reworded + gone) is None]
         bad_added = [x for x in added if owner(x, reworded + new_only) is None]
         missing_reword = [p for p in reworded
                           if sum(1 for x in removed if x.startswith(p)) != 1
                           or sum(1 for x in added if x.startswith(p)) != 1]
         missing_add = [p for p in new_only if sum(1 for x in added if x.startswith(p)) != 1]
+        missing_add += [p for p in gone
+                        if sum(1 for x in removed if x.startswith(p)) != 1
+                        or any(x.startswith(p) for x in added)]
         # Lines common to both must keep their relative order.
         common_a = [x for x in la if x in lb]
         common_b = [x for x in lb if x in la]
         check(scn, "'%s' differs exactly by the recorded changes since %s" % (label, base_ver),
               not (bad_removed or bad_added or missing_reword or missing_add) and common_a == common_b,
               "\nunexpected removed=%r\nunexpected added=%r\nreworded prefixes not reworded once=%r"
-              "\nadded prefixes not added once=%r\norder preserved=%r"
+              "\nadded/removed prefixes not added/removed once=%r\norder preserved=%r"
               % (bad_removed, bad_added, missing_reword, missing_add, common_a == common_b))
     # Content check independent of the baseline: extension is documented.
     help_b = next((lines for c, lines in b_cmds if c == "Help"), [])
@@ -1161,6 +1177,8 @@ import compaction  # noqa: E402
 import symbols  # noqa: E402
 import casemap  # noqa: E402
 import boundary  # noqa: E402
+import coupling  # noqa: E402
+import numeric  # noqa: E402
 
 journal_off.install(globals())
 growth.install(globals())
@@ -1168,6 +1186,8 @@ compaction.install(globals())
 symbols.install(globals())
 casemap.install(globals())
 boundary.install(globals())
+coupling.install(globals())
+numeric.install(globals())
 
 
 def run_casemap():
@@ -1187,6 +1207,34 @@ def run_casemap():
 def run_boundary():
     for fn in BOUNDARY:
         if ONLY and fn.__name__ not in ONLY and "nb" not in ONLY:
+            continue
+        print("  running", fn.__name__)
+        try:
+            fn()
+        except Exception:
+            check(fn.__name__, "no exception", False, traceback.format_exc())
+        finally:
+            for z in list(open_zncs):
+                finish(z)
+
+
+def run_coupling():
+    for fn in COUPLING:
+        if ONLY and fn.__name__ not in ONLY and "idc" not in ONLY:
+            continue
+        print("  running", fn.__name__)
+        try:
+            fn()
+        except Exception:
+            check(fn.__name__, "no exception", False, traceback.format_exc())
+        finally:
+            for z in list(open_zncs):
+                finish(z)
+
+
+def run_numeric():
+    for fn in NUMERIC:
+        if ONLY and fn.__name__ not in ONLY and "num" not in ONLY:
             continue
         print("  running", fn.__name__)
         try:
@@ -1280,6 +1328,8 @@ if __name__ == "__main__":
     run_symbols()
     run_casemap()
     run_boundary()
+    run_coupling()
+    run_numeric()
     by = {}
     for scn, name, ok, det in results:
         by.setdefault(scn.split("_v0")[0], [0, 0])
