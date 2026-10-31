@@ -1,6 +1,6 @@
 # keepnick_instant
 
-See [CHANGELOG.md](./CHANGELOG.md) for version history and release notes.
+See [CHANGELOG.md](./CHANGELOG.md) for version history and release notes, and [TESTING.md](./TESTING.md) for the test suite.
 
 [`keepnick_instant`](./src/keepnick_instant.cpp) is a ZNC network module that quickly regains your preferred nickname on networks without nick registration services.
 
@@ -638,7 +638,7 @@ The module tracks outbound client activity via:
 EModRet OnUserRaw(CString& /*line*/) override
 ```
 
-Every user-sent line updates `LastUserActivity`.
+Every user-sent line updates `LastUserActivity`, including keepalive `PING`s from the client. A client that sends keepalives more often than `IdleGapSec` therefore suppresses every backend tick.
 
 When the backend timer fires, the module checks whether the last user activity was within `IdleGapSec`. If yes, it skips this backend tick and reschedules.
 
@@ -650,7 +650,7 @@ This is a subtle but important design decision: it helps keep ordinary reclaim c
 
 On both initial load and `OnIRCConnected()`, the module arms the first backend action with `StartDelaySec`.
 
-The one exception is hot-swapped already-live reloads: in that case, the module may send a one-time live `MONITOR` probe immediately so backend detection can become accurate without waiting for the server to replay registration numerics. That probe is for backend discovery, not because the normal join-safe scheduler changed. Outside that hot-reload discovery case, the join-safe post-connect delay remains intact.
+The one exception is hot-swapped already-live reloads: in that case, the first backend tick runs one `IntervalSec` after the load rather than after `StartDelaySec`, and it sends a one-time live `MONITOR` probe so backend detection can become accurate without waiting for the server to replay registration numerics. That probe is for backend discovery, not because the normal join-safe scheduler changed. Outside that hot-reload discovery case, the join-safe post-connect delay remains intact.
 
 That means the module intentionally stays quiet during the early phase after connection, which is typically the busiest period for:
 
@@ -682,7 +682,7 @@ In addition to `303` processing and `MONITOR` numerics, `OnRaw()` watches visibl
 - `NICK`
 - `QUIT`
 
-If the nick currently held by someone else changes away from the primary nick, or if that nick quits and the event is visible to you, the module attempts reclaim immediately via `TryReclaim()`. The existing `CRearmTimer` then ensures the backend scheduler re-arms if that reclaim attempt was rejected, so the loop continues without waiting for the next coincidental tick.
+If the nick currently held by someone else changes away from the primary nick, or if that nick quits and the event is visible to you, the module attempts reclaim immediately via `TryReclaim()`. The existing `CRearmTimer` then ensures the backend scheduler re-arms if that reclaim attempt was rejected and no backend tick is already pending, so the loop continues without waiting for the next coincidental tick. If a tick is pending (for example the `StartDelaySec` one), the scheduler keeps that tick.
 
 This can reduce the time-to-reclaim compared with waiting for the next scheduled backend action.
 
@@ -723,10 +723,13 @@ This makes it suitable for users who want reliable reclaim behavior without a no
 - `NICK`/`QUIT` opportunism only works when those events are visible to you.
 - `MONITOR` is only used when the current server connection advertises it or when a hot-swapped already-live session confirms it with a one-time probe. On a hot reload, that probe happens at the first backend tick after `IntervalSec` and fires unconditionally — even if you already own your primary nick — so MONITOR support is established before it is ever needed.
 - The “instant” part is still bounded by startup delay, idle suppression, rate spacing, server behavior, and network visibility.
+- A server that advertises `MONITOR` in `005` but never answers `MONITOR` commands leaves the module waiting: it sends one `MONITOR +` and does not fall back to `ISON`, so a nick that frees up without a visible `NICK`/`QUIT` is not reclaimed. `Poke` does not change this; `Backend Ison` does, and on such a network it is the setting to use. Servers that answer with `421` or `734` are handled.
+- A backend tick does not check that registration has finished. With a very small `StartDelay` (0 in particular), the tick armed when the module loads can fire while ZNC is still registering and send `ISON` before `NICK`/`USER`; the server rejects it and the module carries on normally after connect. With the default 90 seconds this only happens if registration takes that long.
+- Setting values are read as 32-bit numbers, and non-numeric input reads as 0: `IdleGap abc` sets 0, and `Interval 4294967301` sets 5.
 
 Those trade-offs are intentional.
 
-One deliberate side effect of the `433`, `437`, `303`, and `421` swallows: client-side scripts that monitor for `433` to display a "nick in use" notification will not see failures caused by the module's own reclaim attempts; `437` "Nick/channel is temporarily unavailable" responses from the module's own NICK attempts (common on EFnet and other `ratbox`-family networks during their post-netsplit nick-delay window) will not appear in the client; `303` ISON replies from the module's own polls will not appear in the client status window; and `421` responses to the module's own MONITOR probes will not appear as "Server does not recognize MONITOR command" noise. All are intentional — those responses are noise when ZNC is handling reclaim automatically. Manual nick changes, manual `/ison` commands, manual `MONITOR` commands, `437` for channel targets (juped channels), and any 433/437 for a nick other than `Primary` are always unaffected.
+One deliberate side effect of the `433`, `437`, `303`, and `421` swallows: client-side scripts that monitor for `433` to display a "nick in use" notification will not see failures caused by the module's own reclaim attempts; `437` "Nick/channel is temporarily unavailable" responses from the module's own NICK attempts (common on EFnet and other `ratbox`-family networks during their post-netsplit nick-delay window) will not appear in the client; `303` ISON replies from the module's own polls will not appear in the client status window; and `421` responses to the module's own MONITOR probes will not appear as "Server does not recognize MONITOR command" noise. All are intentional — those responses are noise when ZNC is handling reclaim automatically. Manual nick changes, manual `/ison` commands, manual `MONITOR` commands, `437` for channel targets (juped channels), and any 433/437 for a nick other than `Primary` are passed through to the client. One side effect remains: a reply to a manual `/ison` that does not list `Primary` is taken to mean the nick is free, so the module sends one `NICK <Primary>` attempt (subject to `MinGap`), whose `433` is swallowed.
 
 ---
 
@@ -805,6 +808,10 @@ From the source header:
 - **Description:** Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available, otherwise ISON; OnRaw pre-filter, consistent MONITOR subscription guards, hot-reload MONITOR detect, 433/437/303/421 swallow, timer cleanup, ISON counter, nick validation, match-gated MONITOR state)
 
 ---
+
+## Testing
+
+The module ships with a test suite under [`tests/`](./tests/) that runs a real ZNC against fake IRC servers simulating other users, `ISON`, and four kinds of `MONITOR` support, and checks what ZNC sends and when. It covers both backends from connect to reclaim, refused attempts (`433`/`437`), visible `NICK`/`QUIT`, `MinGap`, `IdleGap`, every command and setting, primary-nick resolution, persistence, hot loading, reconnects, `Poke`, jitter, module type, and `/znc updatemod`. See [`TESTING.md`](./TESTING.md).
 
 ## License
 
