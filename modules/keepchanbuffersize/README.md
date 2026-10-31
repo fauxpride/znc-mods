@@ -2,7 +2,7 @@
 
 Preserve per-channel `BufferSize` across quick `PART`/`JOIN` cycles.
 
-**Current version:** 1.2.0 — see [`CHANGELOG.md`](./CHANGELOG.md).
+**Current version:** 1.2.0 — see [`CHANGELOG.md`](./CHANGELOG.md), and [`TESTING.md`](./TESTING.md) for the test suite.
 
 ## Overview
 
@@ -87,6 +87,7 @@ The module’s own comments explicitly call out fast `/cycle` handling and robus
 
 - **Module type:** network module
 - **Target ZNC version:** 1.9.1
+- **Tested against:** ZNC 1.10.3, built with GCC 13.3 and with GCC 11.5 (see [`TESTING.md`](./TESTING.md))
 
 Because this is a network module, load it on each network where you want this behavior.
 
@@ -243,6 +244,8 @@ The `Set` command validates input before it writes anything to NV storage:
 - the line count must be greater than zero
 - the line count must not exceed ZNC's configured global `MaxBufferSize`
 
+The line count is read as a 32-bit number, so digits beyond that range wrap instead of being rejected: `4294967296` is reported as zero, and `4294967297` is stored as `1`.
+
 The `Forget` command applies the same channel-prefix validation.
 
 ### Existing channels on load
@@ -276,8 +279,8 @@ One subtle but important design choice is that the module only stores a channel�
 ## Limitations
 
 - The module can only restore values that were explicitly stored or manually set.
-- If ZNC refuses an attempted buffer size because of limits or policy, the module warns but cannot force the apply.
-- The module is targeted at ZNC 1.9.1; other versions may require small adjustments depending on API differences.
+- Restore forces the stored size, so ZNC's `MaxBufferSize` does not block it. If ZNC still refuses a size, the module prints a warning in its window.
+- The module is targeted at ZNC 1.9.1 and tested against ZNC 1.10.3; other versions may require small adjustments depending on API differences.
 
 ## Why this module exists
 
@@ -298,6 +301,10 @@ The module implements:
 - NV-backed per-channel remembered state keyed by RFC 1459 casemap-normalized channel name, with one-time migration from the legacy ASCII-lowercase form
 - one-time cleanup of the legacy `Enabled` NV key on load (no-op for installs that never had it)
 - deprecation notice for the legacy `enabled=0|1` load argument
+
+## Testing
+
+The module ships with a test suite under [`tests/`](./tests/) that runs a real ZNC against fake IRC servers and checks the buffer size ZNC reports and the number of lines it actually plays back. It covers fast and multi-channel cycles, `JOIN 0`, server-initiated `PART`, `KICK`, sizes above `MaxBufferSize`, RFC 1459 folding, every command, persistence and legacy-registry migration, loading and unloading, module type, and `/znc updatemod`, with a control run that shows the size being lost without the module. See [`TESTING.md`](./TESTING.md).
 
 ## License
 

@@ -6,7 +6,7 @@ It is designed for the cases where a normal `perform`-style burst is too aggress
 
 This makes it especially useful in situations where sending too many messages at once via `perform` can cause throttling, particularly when you need to rejoin many channels after reconnecting.
 
-Current version: **1.1.3** — see [`CHANGELOG.md`](./CHANGELOG.md).
+Current version: **1.1.3** — see [`CHANGELOG.md`](./CHANGELOG.md), and [`TESTING.md`](./TESTING.md) for the test suite.
 
 ---
 
@@ -202,6 +202,7 @@ Adds a delayed command.
 
 - If `seconds` is supplied, that entry uses its own delay.
 - If `seconds` is omitted, the current global default delay is used.
+- `seconds` must be a plain non-negative number. Anything else, such as `-3`, is taken as the start of the command (`Add -3 JOIN #x` stores the command `-3 JOIN #x`), and a number above 4294967295 wraps (`4294967296` becomes `0`).
 - Commands can be raw IRC lines or supported slash-style shorthands.
 - The command text is rejected if it contains CR, LF, or NUL.
 
@@ -301,6 +302,8 @@ Supported shorthands include:
   - `/os` → `OperServ`
   - `/bs` → `BotServ`
 
+A supported shorthand that is missing a required argument, such as `/msg bob` with no text, `/me waves` without a target, or `/ns` on its own, is neither converted nor rejected: it is stored and later sent exactly as typed, slash included, and the server will reject it. The `Added` echo shows the stored form, so check it after adding.
+
 Unknown slash commands fall back to a generic conversion:
 
 - the leading `/` is removed
@@ -358,6 +361,8 @@ Each command's delay is measured from the moment the IRC connection comes up.
 - a command with delay `3` runs about 3 seconds after connect
 - a command with delay `10` runs about 10 seconds after connect
 - commands that share the same delay are scheduled for roughly the same moment
+
+The schedule is built when the connection comes up. Loading the module while the network is already connected schedules nothing; stored commands run at the next connect.
 
 ### This is not an automatic sequential queue
 
@@ -600,6 +605,12 @@ So the pacing is explicit and manual: you decide which commands run when.
 - Keep passwords, tokens, and other credentials out of this module. Authenticate with SASL or a server-password login instead; see [Credentials and secrets](#credentials-and-secrets).
 - Prefer service aliases or slash shorthands when that makes maintenance easier.
 - Revisit your timings if the network changes its flood policy or your channel count grows.
+
+---
+
+## Testing
+
+The module ships with a test suite under [`tests/`](./tests/) that runs a real ZNC against fake IRC servers and checks the exact lines ZNC sends after it connects, and when. It covers delays and ordering, reconnects and unloads with timers pending, every slash shorthand, `%nick%` expansion and its nick check, control-character filtering, secret masking, every command, legacy and hand-edited stores, persistence, module type, and `/znc updatemod`. See [`TESTING.md`](./TESTING.md).
 
 ---
 
