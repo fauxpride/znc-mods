@@ -2,7 +2,7 @@
 
 Preserve per-channel `BufferSize` across quick `PART`/`JOIN` cycles.
 
-**Current version:** 1.2.0 — see [`CHANGELOG.md`](./CHANGELOG.md), and [`TESTING.md`](./TESTING.md) for the test suite.
+**Current version:** 1.2.1 — see [`CHANGELOG.md`](./CHANGELOG.md), and [`TESTING.md`](./TESTING.md) for the test suite.
 
 ## Overview
 
@@ -111,7 +111,7 @@ Shows how many channels have a remembered buffer size in this network's module s
 
 ### `Version`
 
-Prints the module version (for example, `keepchanbuffersize version 1.2.0`). Useful for confirming which build is loaded.
+Prints the module version (for example, `keepchanbuffersize version 1.2.1`). Useful for confirming which build is loaded.
 
 ### `List`
 
@@ -124,6 +124,8 @@ Manually stores a buffer size for a channel. The channel name must begin with a 
 ### `Forget <#chan>`
 
 Removes the stored remembered buffer size for that channel. As with `Set`, the channel name must begin with a valid channel prefix.
+
+`Forget` clears what is stored now; it does not change the channel itself. If the channel still has an explicit buffer size in ZNC, the module stores that size again the next time you part the channel, as it does for any channel with an explicit size. To stop a channel's size from being preserved, also clear its explicit size in ZNC (in webadmin, empty the channel's buffer size field and save), or unload the module.
 
 ## Usage examples
 
@@ -242,9 +244,9 @@ The `Set` command validates input before it writes anything to NV storage:
 - the channel argument must begin with a valid channel prefix (server-advertised `CHANTYPES` if available, otherwise `#`, `&`, `+`, `!`)
 - the line count must be digits only — a leading sign or any non-digit character is rejected
 - the line count must be greater than zero
-- the line count must not exceed ZNC's configured global `MaxBufferSize`
+- the line count must not exceed ZNC's configured global `MaxBufferSize`, exactly as ZNC's own `SetBuffer` requires
 
-The line count is read as a 32-bit number, so digits beyond that range wrap instead of being rejected: `4294967296` is reported as zero, and `4294967297` is stored as `1`.
+Numbers beyond 4294967295 are rejected as exceeding `MaxBufferSize`; they are never wrapped into a smaller value. A `MaxBufferSize` of `0` is not "unlimited": ZNC then refuses every size through `SetBuffer`, and `Set` refuses every size too.
 
 The `Forget` command applies the same channel-prefix validation.
 
@@ -263,7 +265,7 @@ It also handles `JOIN 0` as a special case by snapshotting all current channels 
 
 ### Restore safety and forcing
 
-If a remembered value is empty or resolves to `0`, the module does nothing. If a channel already has the correct explicit buffer count, it also does nothing. When applying a remembered value, the module passes `bForce = true` to `CChan::SetBufferCount()` — matching how webadmin and the config loader set per-channel buffers — so that values above `MaxBufferSize` (which are legally configurable through webadmin) are still restorable after a channel object is torn down. The up-front validation in `Set` ensures that any value the module persists has already cleared the `MaxBufferSize` check, so forcing on restore only ever re-applies values that were previously accepted by ZNC.
+If a remembered value is not a number from 1 to 4294967295 (only possible by editing the registry), the module does not apply it, and the next `PART` of that channel deletes it. If a channel already has the correct explicit buffer count, it also does nothing. When applying a remembered value, the module passes `bForce = true` to `CChan::SetBufferCount()` — matching how webadmin and the config loader set per-channel buffers — so that values above `MaxBufferSize` (which are legally configurable through webadmin) are still restorable after a channel object is torn down. The up-front validation in `Set` ensures that any value the module persists has already cleared the `MaxBufferSize` check, so forcing on restore only ever re-applies values that were previously accepted by ZNC.
 
 ### “Explicit setting only” policy
 
@@ -279,7 +281,7 @@ One subtle but important design choice is that the module only stores a channel�
 ## Limitations
 
 - The module can only restore values that were explicitly stored or manually set.
-- Restore forces the stored size, so ZNC's `MaxBufferSize` does not block it. If ZNC still refuses a size, the module prints a warning in its window.
+- Restore forces the stored size, so ZNC's `MaxBufferSize` does not block it: a size set in `znc.conf` or webadmin above `MaxBufferSize` is preserved. Sizes stored with `Set` are checked against `MaxBufferSize` when you set them. If ZNC still refuses a size, the module prints a warning in its window.
 - The module is targeted at ZNC 1.9.1 and tested against ZNC 1.10.3; other versions may require small adjustments depending on API differences.
 
 ## Why this module exists
@@ -304,7 +306,7 @@ The module implements:
 
 ## Testing
 
-The module ships with a test suite under [`tests/`](./tests/) that runs a real ZNC against fake IRC servers and checks the buffer size ZNC reports and the number of lines it actually plays back. It covers fast and multi-channel cycles, `JOIN 0`, server-initiated `PART`, `KICK`, sizes above `MaxBufferSize`, RFC 1459 folding, every command, persistence and legacy-registry migration, loading and unloading, module type, and `/znc updatemod`, with a control run that shows the size being lost without the module. See [`TESTING.md`](./TESTING.md).
+The module ships with a test suite under [`tests/`](./tests/) that runs a real ZNC against fake IRC servers and checks the buffer size ZNC reports and the number of lines it actually plays back. It covers fast and multi-channel cycles, `JOIN 0`, server-initiated `PART`, `KICK`, sizes above `MaxBufferSize` and `MaxBufferSize = 0`, RFC 1459 folding, every command and its limits, invalid stored values, persistence and legacy-registry migration, loading and unloading, module type, and `/znc updatemod`, with a control run that shows the size being lost without the module. See [`TESTING.md`](./TESTING.md).
 
 ## License
 

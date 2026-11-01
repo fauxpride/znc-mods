@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.2.1] — 2026-11-01
+
+This release fixes number handling in `Set` and in restored values, and makes `Set` honour `MaxBufferSize = 0` as ZNC does. Built with `-Wall -Wextra -Werror` against ZNC 1.10.3 with GCC 13.3 and GCC 11.5, and runtime-tested against ZNC 1.10.3.
+
+### Fixed
+
+* **`Set` wrapped numbers beyond 32 bits.** The digits-only check ran before `CString::ToUInt()`, which truncates to 32 bits, so `Set #chan 4294967297` stored `1`, `4294967296` was reported as "must be greater than zero", and `99999999999999999999` was reported as `4294967295`. The line count is now parsed with a range check. Any number beyond 4294967295 is rejected with `Invalid buffer size: <what you typed> exceeds ZNC's MaxBufferSize of <n>.` and nothing is stored.
+* **`MaxBufferSize = 0` was treated as "unlimited".** `Set` skipped its upper-bound check when `MaxBufferSize` was 0, on the assumption (stated in the 1.1.0 entry below) that 0 means unlimited. In ZNC it does not: `CBuffer::SetLineCount()` refuses every unforced size above `MaxBufferSize`, so with 0 ZNC's own `SetBuffer` refuses every size. Because the module applies sizes with `bForce = true`, `Set` could store and immediately apply any size, up to a buffer of 4294967295 lines. `Set` now enforces `MaxBufferSize` in every case, exactly as `SetBuffer` does.
+* **Stored values were read with the same wrap.** Restore read the stored value with `CString::ToUInt()`. A value edited into the registry was therefore applied wrongly: `4294967297` as a 1-line buffer, `-5` as a 4294967291-line buffer. A stored value that is not a number from 1 to 4294967295 is now never applied. As before for `0`, the next `PART` of that channel deletes it.
+
+### Changed
+
+* **`OnLoad`'s unused `sErrorMsg` parameter is unnamed,** so the module builds without warnings under `-Wall -Wextra`.
+* **README.**
+  * Documents the number and `MaxBufferSize` rules.
+  * Explains that `Forget` clears only the stored entry. A channel that still has an explicit size in ZNC is stored again at its next `PART`.
+  * States which sizes restore preserves.
+
+### Compatibility
+
+* **NV storage format is unchanged,** and values stored by 1.2.0 within range load and restore exactly as before.
+* **`Set` refuses more input.** It now refuses numbers beyond 4294967295, and every size when `MaxBufferSize` is 0. Sizes that ZNC accepted by other routes (`znc.conf`, webadmin) or that are already stored are still restored when `MaxBufferSize` is 0, since restore forces the size.
+* **ZNC compatibility.** Built and runtime-tested against ZNC 1.10.3. No ZNC API changes were required.
+
+---
+
 ## [1.2.0] — 2026-04-22
 
 This release removes the `Enable`/`Disable` toggle and all related machinery. The toggle was a foot-gun: a loaded-but-disabled module is visually indistinguishable from a bug, and at least one real user tripped over it (setting a per-channel buffer, running `/cycle`, and reporting the module as broken when the actual cause was `Disable` having been invoked at some earlier point). The standard ZNC idiom for "I do not want this module running right now" is `UnloadMod`, which already preserved the module's NV data the same way `Disable` did, so the toggle was covering no case `UnloadMod` did not already cover. Built and runtime-tested against ZNC 1.9.1 with zero warnings.

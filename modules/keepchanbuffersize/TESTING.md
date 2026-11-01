@@ -130,11 +130,12 @@ After each scenario the suite scans that ZNC instance's log for sanitizer output
 
 - **Server-initiated `PART`** (`fb_server_part`). No client `PART`: the size is stored from the server's `PART` and restored on the next `JOIN`.
 - **`KICK`** (`fb_kick_then_part`). ZNC keeps a kicked channel's object and size; the module stores the size. A client `PART` of the kicked channel makes ZNC remove it locally without asking the server, and a later `JOIN` restores the size.
-- **Stored zero** (`fb_zero_value`). A stored `0`, possible only by editing the registry, is never applied, and the next `PART` of that channel deletes the entry.
+- **Invalid stored values** (`fb_invalid_values`). Stored values that are not a number from 1 to 4294967295, possible only by editing the registry, are never applied: `0`, `4294967297` (which would wrap to 1), `abc` and `-5` (which would wrap to 4294967291). The next `PART` of each channel deletes its entry.
 
 ### `cmd_*` — commands
 
-- **Command surface** (`cmd_surface`). 27 commands, valid and invalid, compared reply by reply: `Status`, `List` (empty and as a table), `Version`, `Set` with missing arguments, a name without a channel prefix, a prefix the server does not advertise (`&`), `-1`, `+5`, `10abc`, `0`, a value one above `MaxBufferSize`, values that overflow 32 bits, leading zeros, and a name needing RFC 1459 folding; `Forget` in the same ways; and the removed `Enable` and `Disable`, which must answer `Unknown command!`. `Help` must list every command, and the NV store must match the sequence.
+- **Command surface** (`cmd_surface`). 29 commands, valid and invalid, compared reply by reply: `Status`, `List` (empty and as a table), `Version`, `Set` with missing arguments, a name without a channel prefix, a prefix the server does not advertise (`&`), `-1`, `+5`, `10abc`, `0`, a value one above `MaxBufferSize`, `4294967295`, `4294967296`, `4294967297` and a 20-digit number (each rejected as exceeding `MaxBufferSize`, with the reply echoing what was typed, and nothing stored), leading zeros including a 24-digit `000…012`, and a name needing RFC 1459 folding; `Forget` in the same ways; and the removed `Enable` and `Disable`, which must answer `Unknown command!`. `Help` must list every command, and the NV store must match the sequence.
+- **`MaxBufferSize = 0`** (`cmd_max_zero`). ZNC's own `SetBuffer` refuses every size, and `Set` must refuse `5` and `1` in the same way and store nothing. A size of 450 from `znc.conf` is still restored after a cycle, and a stored size is still applied on `JOIN`, because restore forces the size as the config loader does.
 - **Immediate apply** (`cmd_set_applies`). `Set` on a joined channel applies at once (in `ListChans` and in playback) and survives a cycle.
 - **Set before joining** (`cmd_set_then_join`). The value is applied when the channel is joined later.
 - **`Forget` and a live explicit size** (`cmd_forget_stops_restore`). `Forget` clears the stored entry, but a channel that still has an explicit size is stored again at its next `PART`. This is recorded so the interaction stays visible.
@@ -174,16 +175,15 @@ Assertions state an expected value rather than a property that happens to hold: 
 
 Behaviour that is arguably wrong but current is asserted as it is and marked **characterised** in the scenario's description, so that a change shows up as a failure and is then a deliberate decision.
 
-The suite was checked against mutated builds to confirm that it discriminates: restore without forcing (the bug fixed in 1.1.1), ASCII-only case folding, the server-`PART` hook disabled, the digits-only check on `Set` removed, and the `KICK` hook disabled. Each one failed the scenarios aimed at it.
+The suite was checked against mutated builds to confirm that it discriminates. For 1.2.1: the 32-bit range check removed from parsing, restore reading stored values with `CString::ToUInt`, and `MaxBufferSize = 0` treated as unlimited again. Carried over from 1.2.0: restore without forcing (the bug fixed in 1.1.1), ASCII-only case folding, the server-`PART` hook disabled, the digits-only check on `Set` removed, and the `KICK` hook disabled. Each one failed the scenarios aimed at it. The suite as it stood for 1.2.0 was also run against 1.2.1: it failed only on the three `Set` replies 1.2.1 changes and on the `Status`, `List` and NV checks that follow from them.
 
 ---
 
 ## Known gaps
 
-- **32-bit wrap in `Set`** (characterised in `cmd_surface`). `CString::ToUInt` truncates to 32 bits, so `Set #w 4294967297` stores `1` instead of rejecting the value, and `4294967296` is reported as zero.
 - **`JOIN 0` and ZNC.** When a client sends `JOIN 0`, ZNC itself creates a channel object for the literal target, listed as `#0`. `cy_join0` records this as information and asserts only on the real channels.
 - **Before `ISUPPORT`.** `Set` and `Forget` fall back to the RFC channel prefixes (`#&+!`) when the server has not yet advertised `CHANTYPES`. The fake server always advertises it before a client can send commands, so the fallback is not exercised.
-- **Webadmin.** Explicit sizes are set with `*status SetBuffer`, the module's `Set`, and `znc.conf`. Webadmin is not loaded, so clearing an explicit size there (which would make the next `PART` delete the stored entry) is not exercised.
+- **Webadmin.** Explicit sizes are set with `*status SetBuffer`, the module's `Set`, and `znc.conf`. Webadmin is not loaded, so clearing an explicit size there (an empty buffer size field, which resets the channel to the default and makes the next `PART` delete the stored entry) is not exercised.
 - **Detached channels.** Cycles are run on attached channels only.
 - **Single user.** Several networks are exercised, several users are not.
 - **Timing.** Nothing is measured. The fake servers feed lines serially, so any timing figure would describe the harness.

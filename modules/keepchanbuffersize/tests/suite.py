@@ -369,20 +369,24 @@ def fb_kick_then_part():
     check(scn, "restored on JOIN", after == (True, 31), repr(after))
 
 
-def fb_zero_value():
-    """A stored value of 0 (only possible by editing the registry) is never
-    applied, and the next PART of that channel, which has no explicit size,
-    deletes the entry."""
-    scn = "fb_zero_value"
-    z = mk(scn, NEW, registries={"n1": {MOD: {"buf:#a": "0"}}})
+def fb_invalid_values():
+    """Stored values that are not a number from 1 to 4294967295 (possible
+    only by editing the registry) are never applied: 0, a number beyond 32
+    bits that would wrap to 1, text, and a negative number. The next PART
+    of each channel, which then has no explicit size, deletes its entry."""
+    scn = "fb_invalid_values"
+    chans = ["#a", "#b", "#c", "#d"]
+    seed = {"buf:#a": "0", "buf:#b": "4294967297", "buf:#c": "abc", "buf:#d": "-5"}
+    z = mk(scn, NEW, networks=[Network("n1", chans=chans, load_lines=[MOD])], registries={"n1": {MOD: seed}})
     c = z.client()
-    before = buf(c, "#a")
-    part(c, "#a")
+    before = listchans(c)
+    for ch in chans:
+        part(c, ch)
     nv = store(z)
     c.quit()
     finish(z)
-    check(scn, "zero not applied", before == (False, DEFAULT_BUF), repr(before))
-    check(scn, "entry removed when the default channel is parted", nv == {}, repr(nv))
+    check(scn, "none applied", before == {ch: (False, DEFAULT_BUF) for ch in chans}, repr(before))
+    check(scn, "entries removed when the default channels are parted", nv == {}, repr(nv))
 
 
 # --------------------------------------------------------------------------
@@ -402,17 +406,19 @@ CMD_CASES = [
     ("Set #c +5", ["Invalid buffer size: +5 (must be a positive integer, digits only)."]),
     ("Set #c 0", ["Invalid buffer size (must be greater than zero)."]),
     ("Set #c 301", ["Invalid buffer size: 301 exceeds ZNC's MaxBufferSize of 300."]),
-    ("Set #c 99999999999999999999", ["Invalid buffer size: 4294967295 exceeds ZNC's MaxBufferSize of 300."]),
-    ("Set #c 4294967296", ["Invalid buffer size (must be greater than zero)."]),
-    # Characterised: CString::ToUInt truncates to 32 bits, so 2^32+1 is
-    # stored as 1 rather than rejected. See TESTING.md, Known gaps.
-    ("Set #w 4294967297", ["Remembered: #w => 1"]),
+    # Numbers beyond 32 bits are rejected, never wrapped; the reply echoes
+    # what was typed.
+    ("Set #c 4294967295", ["Invalid buffer size: 4294967295 exceeds ZNC's MaxBufferSize of 300."]),
+    ("Set #c 4294967296", ["Invalid buffer size: 4294967296 exceeds ZNC's MaxBufferSize of 300."]),
+    ("Set #w 4294967297", ["Invalid buffer size: 4294967297 exceeds ZNC's MaxBufferSize of 300."]),
+    ("Set #c 99999999999999999999", ["Invalid buffer size: 99999999999999999999 exceeds ZNC's MaxBufferSize of 300."]),
     ("Set #c 300", ["Remembered: #c => 300"]),
     ("Set #c 00012", ["Remembered: #c => 12"]),
+    ("Set #c 000000000000000000000012", ["Remembered: #c => 12"]),
     ("Set #C[X] 5", ["Remembered: #c{x} => 5"]),
-    ("Status", ["Remembered channels: 3"]),
+    ("Status", ["Remembered channels: 2"]),
     ("List", ["+---------+--------+", "| Channel | Buffer |", "+---------+--------+",
-              "| #c      | 12     |", "| #c{x}   | 5      |", "| #w      | 1      |", "+---------+--------+"]),
+              "| #c      | 12     |", "| #c{x}   | 5      |", "+---------+--------+"]),
     ("Forget", ["Usage: Forget <#chan>"]),
     ("Forget c", ["Invalid channel name: c (must begin with a channel prefix such as '#')."]),
     ("Forget #nope", ["Nothing stored for #nope"]),
@@ -439,7 +445,36 @@ def cmd_surface():
     finish(z)
     names = [re.sub(r"\x02|\x0f", "", h).split(" ")[0].split(":")[0] for h in help_]
     check(scn, "Help lists every command", sorted(names) == ["Forget", "Help", "List", "Set", "Status", "Version"], repr(help_))
-    check(scn, "NV after the sequence", nv == {"buf:#c": "12", "buf:#w": "1"}, repr(nv))
+    check(scn, "NV after the sequence", nv == {"buf:#c": "12"}, repr(nv))
+
+
+def cmd_max_zero():
+    """MaxBufferSize = 0 allows no buffer size at all in ZNC: its own
+    SetBuffer refuses every size. Set refuses in the same way and stores
+    nothing. Sizes that ZNC accepted by other routes (znc.conf, a stored
+    value) are still restored, because restore forces the size as the
+    config loader does."""
+    scn = "cmd_max_zero"
+    z = mk(scn, NEW, global_settings={"MaxBufferSize": "0"},
+           networks=[Network("n1", chans=["#a", "#big"], load_lines=[MOD], chan_settings={"#big": {"Buffer": "450"}})],
+           registries={"n1": {MOD: {"buf:#later": "40"}}})
+    c = z.client()
+    zsb = c.cmd("*status", "SetBuffer #a 5")
+    set1 = c.cmd("*" + MOD, "Set #a 5")
+    set2 = c.cmd("*" + MOD, "Set #a 1")
+    nv0 = store(z)
+    cycle(c, "#big")
+    big = buf(c, "#big")
+    join(c, "#later")
+    later = buf(c, "#later")
+    c.quit()
+    finish(z)
+    check(scn, "ZNC's own SetBuffer refuses", zsb == ["Setting buffer size failed for 1 buffer", "Maximum buffer size is 0 lines"], repr(zsb))
+    check(scn, "Set refuses", set1 == ["Invalid buffer size: 5 exceeds ZNC's MaxBufferSize of 0."] and
+          set2 == ["Invalid buffer size: 1 exceeds ZNC's MaxBufferSize of 0."], repr((set1, set2)))
+    check(scn, "nothing stored by Set", "buf:#a" not in nv0, repr(nv0))
+    check(scn, "size from znc.conf still restored after a cycle", big == (True, 450), repr(big))
+    check(scn, "stored size still applied on JOIN", later == (True, 40), repr(later))
 
 
 def cmd_set_applies():
@@ -710,7 +745,7 @@ def sym_unique():
 
 
 SCENARIOS = [ctl_without_module, cy_part_join, cy_fast_cycle, cy_multi_target, cy_join0, cy_over_max, cy_casefold,
-             fb_server_part, fb_kick_then_part, fb_zero_value, cmd_surface, cmd_set_applies, cmd_set_then_join,
+             fb_server_part, fb_kick_then_part, fb_invalid_values, cmd_surface, cmd_max_zero, cmd_set_applies, cmd_set_then_join,
              cmd_forget_stops_restore, ps_restart, ps_legacy, ps_load_args, ld_apply_existing, ld_startup_apply,
              ld_unload_keeps, ty_runtime_load, ty_isolation, up_inplace, sym_unique]
 

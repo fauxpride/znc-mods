@@ -1,8 +1,8 @@
 /*
  * keepchanbuffersize.cpp - Preserve per-channel BufferSize across PART/JOIN
  *
- * Version: 1.2.0
- * Target:  ZNC 1.9.1 (network module)
+ * Version: 1.2.1
+ * Target:  ZNC 1.9.1 (network module); tested against ZNC 1.10.3
  *
  * Design goals:
  *  - Preserve per-channel buffer (SetBuffer/BufferSize) across fast /cycle.
@@ -36,10 +36,11 @@
 #include <znc/Utils.h>
 #include <znc/znc.h>
 
+#include <climits>
 #include <utility>
 #include <vector>
 
-#define KEEPCHANBUFFERSIZE_VERSION "1.2.0"
+#define KEEPCHANBUFFERSIZE_VERSION "1.2.1"
 
 class CKeepChanBufferSize : public CModule {
 public:
@@ -61,7 +62,7 @@ public:
                    "<#chan>", "Forget a remembered buffer size for a channel.");
     }
 
-    bool OnLoad(const CString& sArgs, CString& sErrorMsg) override {
+    bool OnLoad(const CString& sArgs, CString& /*sErrorMsg*/) override {
         // 1.2.0 migration: the Enable/Disable toggle was removed, so the
         // "Enabled" NV key from 1.0.x - 1.1.x is dead state. Clean it up
         // silently on load; this is idempotent (DelNV is a no-op on a missing
@@ -232,6 +233,23 @@ private:
         return IRCLower(sChan);
     }
 
+    // Digits only, within unsigned int. CString::ToUInt would truncate larger
+    // values to 32 bits, so "4294967297" would read as 1.
+    static bool ParseLines(const CString& s, unsigned int& out) {
+        if (s.empty())
+            return false;
+        unsigned long long v = 0;
+        for (char c : s) {
+            if (c < '0' || c > '9')
+                return false;
+            v = v * 10 + static_cast<unsigned>(c - '0');
+            if (v > UINT_MAX)
+                return false;
+        }
+        out = static_cast<unsigned int>(v);
+        return true;
+    }
+
     static CString KeyForChan(const CString& sChan) {
         return "buf:" + NormChan(sChan);
     }
@@ -350,8 +368,10 @@ private:
         if (sVal.empty())
             return;
 
-        const unsigned int uWanted = sVal.ToUInt();
-        if (uWanted == 0)
+        // A stored value that is not a number from 1 to 4294967295 (only
+        // possible by editing the registry) is never applied.
+        unsigned int uWanted = 0;
+        if (!ParseLines(sVal, uWanted) || uWanted == 0)
             return;
 
         if (Chan.HasBufferCountSet() && Chan.GetBufferCount() == uWanted)
@@ -478,26 +498,33 @@ private:
             return;
         }
 
-        // Reject non-digit input (so '-1' can't wrap into UINT_MAX via ToUInt()).
+        // Reject non-digit input (signs, decimals, text).
         if (sBufArg.find_first_not_of("0123456789") != CString::npos) {
             PutModule("Invalid buffer size: " + sBufArg +
                       " (must be a positive integer, digits only).");
             return;
         }
 
-        const unsigned int uWanted = sBufArg.ToUInt();
+        // Enforce ZNC's global MaxBufferSize as the upper bound before
+        // persisting, exactly as ZNC's own SetBuffer does: CBuffer::SetLineCount
+        // refuses any unforced size above it, and a MaxBufferSize of 0 is not
+        // "unlimited" but allows no size at all. Restore forces the stored
+        // value, so this check is the only one a value from Set ever meets.
+        const unsigned int uMax = CZNC::Get().GetMaxBufferSize();
+
+        unsigned int uWanted = 0;
+        if (!ParseLines(sBufArg, uWanted)) {
+            // Digits only (checked above), so this is a number beyond
+            // 4294967295, which exceeds any MaxBufferSize.
+            PutModule("Invalid buffer size: " + sBufArg +
+                      " exceeds ZNC's MaxBufferSize of " + CString(uMax) + ".");
+            return;
+        }
         if (uWanted == 0) {
             PutModule("Invalid buffer size (must be greater than zero).");
             return;
         }
-
-        // Enforce ZNC's global MaxBufferSize as the upper bound before
-        // persisting, so we can't stash a value we know will be rejected on
-        // every subsequent JOIN. A value of 0 for MaxBufferSize means
-        // "unlimited" in the ZNC config grammar, so only enforce when it is
-        // non-zero.
-        const unsigned int uMax = CZNC::Get().GetMaxBufferSize();
-        if (uMax > 0 && uWanted > uMax) {
+        if (uWanted > uMax) {
             PutModule("Invalid buffer size: " + CString(uWanted) +
                       " exceeds ZNC's MaxBufferSize of " + CString(uMax) + ".");
             return;

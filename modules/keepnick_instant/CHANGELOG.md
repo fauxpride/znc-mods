@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.0] - 2026-11-01
+
+### Fixed
+- **Stall on servers that advertise `MONITOR` but never answer it.** The module sent one `MONITOR + <Primary>` and then waited indefinitely for a `730`/`731`: it never fell back to `ISON`, and a nick that freed up without a visible `NICK`/`QUIT` was never reclaimed; `Poke` did not help. A probe that is still unanswered at the next scheduled backend tick, and at least two seconds old, is now abandoned for the connection: the module says `MONITOR got no reply on this connection; falling back to ISON.` and polls with `ISON` from that same tick. A late `730`/`731` for the primary nick still re-enables `MONITOR`, and a late `731` reclaims at once.
+- **`303` replies were attributed to the wrong `ISON`.** A counter of outstanding module polls decided which `303` to swallow, and every `303` without the primary nick triggered a reclaim. As a result:
+  - a manual `/ison bob` made the module send `NICK <Primary>`;
+  - a manual `/ison` sent just before a module poll had its reply swallowed, while the module's reply reached the client instead.
+
+  The module now records each `ISON` sent on the connection, its own and the user's, in order, and matches each `303` to its query. Replies to the module's polls are swallowed and decide reclaim. Replies to the user's queries always reach the client, and trigger a reclaim only when that query asked about the primary nick and the reply shows it free.
+- **Backend traffic before registration.** A backend tick did not check that registration had finished. The tick armed at load time could fire while ZNC was still registering and send `ISON` before `CAP`/`NICK`/`USER`, which the server rejects with `451`. With `StartDelay 0` this happened on every start. Ticks and reclaim attempts now do nothing until the connection is registered.
+- **Setting values wrapped or read as 0.** `CString::ToUInt()` read non-numeric text as 0 and truncated to 32 bits. Commands and stored values were both affected: `IdleGap abc` and `Jitter x` set 0, `Interval 4294967301` set 5, and a stored `MinGapSec` of `x` loaded as 0. Values must now be whole numbers within each setting's range. Commands answer anything else with their usage line and leave the setting unchanged; stored values that fail keep the default.
+- **Client keepalives counted as activity.** Every line from the client updated `LastUserActivity`, including keepalive `PING`s. A client that pinged more often than `IdleGap` suppressed every backend tick. `PING` and `PONG` from the client are no longer counted.
+
+### Changed
+- Bumped version from `1.6.9` to `1.7.0`. The version now comes from one `KEEPNICK_INSTANT_VERSION` define used by `Show` and the module description.
+- `TModInfo` description: `ISON counter` is replaced by `per-query ISON reply matching, unanswered-MONITOR fallback`.
+- The unused `sMessage` parameter of `OnLoad` is unnamed, so the module builds without warnings under `-Wall -Wextra`.
+
+### Documentation
+- README:
+  - documents the `MONITOR` fallback, `303` reply matching and keepalive handling;
+  - adds a note on accepted setting values to the command reference;
+  - removes the limitations these fixes resolve;
+  - corrects *How it works at a high level*: the hot-reload probe is sent at the first tick, one `Interval` after the load, not immediately, and the reactive reclaim follows the holder of the nick changing nick or quitting.
+
+### Notes
+- **Input that 1.6.9 accepted is now rejected.** A script that set `IdleGap`, `Jitter`, `MinGap` or `StartDelay` with non-numeric input (which set 0), or used values beyond 32 bits, now gets the usage line. Use explicit numbers in range.
+- **Stored settings that are not valid numbers now load as their defaults** instead of as 0 or a wrapped value. The next settings command rewrites them.
+- **NV storage format is unchanged.** No migration is needed in either direction.
+- Built with `-Wall -Wextra -Werror` against ZNC 1.10.3 with GCC 13.3 and GCC 11.5, and runtime-tested against ZNC 1.10.3.
+
 ## [1.6.9] - 2026-04-30
 
 ### Added
