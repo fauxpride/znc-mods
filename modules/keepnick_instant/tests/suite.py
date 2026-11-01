@@ -344,12 +344,12 @@ def ev_mingap():
 
 def ac_idle_gap():
     """IdleGap 4. While the client sends a channel message every second, no
-    tick runs; once it stops, ticks resume. Client keepalive PINGs count as
-    activity in exactly the same way (characterised: a client that pings
-    more often than IdleGap suppresses every tick)."""
+    tick runs; once it stops, ticks resume. Client keepalives (PING and
+    PONG) are not activity: with one every second, ticks run on schedule
+    (probe at StartDelay, then ISON every Interval)."""
     scn = "ac_idle_gap"
     res = {}
-    for kind in ("PRIVMSG #a :typing", "PING :keepalive"):
+    for kind in ("PRIVMSG #a :typing", "PING :keepalive", "PONG :keepalive"):
         z = mk("%s_%s" % (scn, kind.split()[0].lower()), seed={"IdleGapSec": "4"})
         d = z.net().ircd
         c = z.client()
@@ -362,43 +362,79 @@ def ac_idle_gap():
         idle(10)
         res[kind] = (stop, traffic(d))
         c.quit(); finish(z)
-    for kind, (stop, tr) in res.items():
+    stop, tr = res["PRIVMSG #a :typing"]
+    during = [x for x in tr if x[0] < stop]
+    after = [x for x in tr if x[0] >= stop]
+    check(scn, "PRIVMSG: nothing while active", during == [], repr(tr))
+    check(scn, "PRIVMSG: ticks resume once idle", len(after) >= 1 and after[0][0] - stop <= 5 + 4 + TOL, repr(tr))
+    for kind in ("PING :keepalive", "PONG :keepalive"):
+        stop, tr = res[kind]
         during = [x for x in tr if x[0] < stop]
-        after = [x for x in tr if x[0] >= stop]
-        check(scn, "%s: nothing while active" % kind.split()[0], during == [], repr(tr))
-        check(scn, "%s: ticks resume once idle" % kind.split()[0], len(after) >= 1 and after[0][0] - stop <= 5 + 4 + TOL, repr(tr))
+        isons = times(during, "ISON tim")
+        check(scn, "%s: ticks run on schedule" % kind.split()[0],
+              kinds(during)[:1] == ["MONITOR + tim"] and abs(during[0][0] - 2) <= TOL and
+              len(isons) == 2 and abs(isons[0] - 7) <= TOL and spaced(isons, 5), repr(tr))
 
 
 def ac_user_traffic():
-    """The client's own ISON and NICK. A user ISON reply passes through to
-    the client. Characterised: because the module treats any 303 without its
-    nick as 'nick free', a user ISON for other nicks also fires a NICK tim
-    attempt (its 433 swallowed). A user ISON that includes tim does not. A
+    """The client's own ISON and NICK. Every reply to a user's ISON reaches
+    the client. A user ISON that does not ask about the primary nick never
+    triggers a reclaim; one that asks about it and finds it free does. A
     manual NICK tim that fails shows its 433 to the client."""
     scn = "ac_user_traffic"
     z = mk(scn, seed={"StartDelaySec": "600"})
     d = z.net().ircd
     c = z.client()
     base = d.welcomes[-1]
-    m0 = time.monotonic() - base
-    c.send("ISON tim")
-    r1 = c.wait_for(lambda l: " 303 " in l, 3)
-    idle(0.5)
-    a = [x for x in traffic(d) if x[0] > m0]
-    m1 = time.monotonic() - base
-    c.send("ISON bob")
-    r2 = c.wait_for(lambda l: " 303 " in l, 3)
-    idle(0.5)
-    b = [x for x in traffic(d) if x[0] > m1]
-    c.sync()
+
+    def ask(q, release=False):
+        m = time.monotonic() - base
+        if release:
+            d.release("tim")
+        c.send("ISON " + q)
+        r = c.wait_for(lambda l: " 303 " in l, 3)
+        idle(0.5)
+        c.sync()
+        return r, [x for x in traffic(d) if x[0] > m]
+
+    r1, a = ask("tim")
+    r2, b = ask("bob")
+    r3, e = ask("bob carol")
     c.send("NICK tim")
-    r3 = c.wait_for(lambda l: " 433 " in l, 3)
+    r4 = c.wait_for(lambda l: " 433 " in l, 3)
+    r5, f = ask("bob tim", release=True)
+    c.wait_for(lambda l: re.search(r" NICK :tim$", l), 3)
     c.quit(); finish(z)
-    check(scn, "user ISON tim: reply reaches the client", r1 is not None and r1.endswith(":tim"), repr(r1))
-    check(scn, "user ISON tim: module does nothing", a == [(a[0][0], "ISON tim")] if a else False, repr(a))
-    check(scn, "user ISON bob: reply reaches the client", r2 is not None and r2.endswith(":"), repr(r2))
-    check(scn, "user ISON bob: module fires NICK tim (characterised)", kinds(b) == ["ISON bob", "NICK tim"], repr(b))
-    check(scn, "manual NICK tim: 433 reaches the client", r3 is not None and " 433 tim_ tim " in r3, repr(r3))
+    check(scn, "user ISON tim (held): reply reaches the client, nothing else", r1 is not None and r1.endswith(":tim") and kinds(a) == ["ISON tim"], repr((r1, a)))
+    check(scn, "user ISON bob: reply reaches the client, no reclaim", r2 is not None and r2.endswith(":") and kinds(b) == ["ISON bob"], repr((r2, b)))
+    check(scn, "user ISON bob carol: no reclaim", r3 is not None and kinds(e) == ["ISON bob carol"], repr((r3, e)))
+    check(scn, "manual NICK tim: 433 reaches the client", r4 is not None and " 433 tim_ tim " in r4, repr(r4))
+    check(scn, "user ISON bob tim (tim free): reply reaches the client and the module reclaims",
+          r5 is not None and r5.endswith(":") and kinds(f) == ["ISON bob tim", "NICK tim"] and d.nick == "tim", repr((r5, f)))
+
+
+def ac_ison_order():
+    """Replies are matched to queries in order. With the user's ISON sent
+    just before a module ISON (Poke, Backend Ison), the user gets the reply
+    to their own query and the module's reply is swallowed. The module's
+    reply lists tim (held), so no NICK is sent."""
+    scn = "ac_ison_order"
+    z = mk(scn, seed={"StartDelaySec": "600", "BackendMode": "Ison"})
+    d = z.net().ircd
+    c = z.client()
+    base = d.welcomes[-1]
+    c.sync()
+    m = time.monotonic() - base
+    c.send_many(["ISON bob", "PRIVMSG *%s :Poke" % MOD])
+    c.wait_for(lambda l: "Poke: forcing" in l, 3)
+    idle(0.8)
+    c.sync()
+    got = numerics(c.lines, "303")
+    tr = [x for x in traffic(d) if x[0] > m]
+    c.quit(); finish(z)
+    check(scn, "server saw the user's ISON first", kinds(tr)[:2] == ["ISON bob", "ISON tim"], repr(tr))
+    check(scn, "client got exactly its own (empty) reply", got == [":irc.test 303 tim_ :"], repr(got))
+    check(scn, "no NICK attempt", "NICK tim" not in kinds(tr), repr(tr))
 
 
 # --------------------------------------------------------------------------
@@ -406,11 +442,10 @@ def ac_user_traffic():
 # --------------------------------------------------------------------------
 
 def cfg_commands():
-    """Every setting command at its bounds, out of range, and with
-    non-numeric input; Backend; unknown commands; the NV store afterwards.
-    Characterised: non-numeric input reads as 0, which the 0-based settings
-    accept, and values that wrap past 2^32 are accepted as their wrapped
-    value."""
+    """Every setting command at its bounds, out of range, with non-numeric
+    and signed input, without a value, and with values beyond 32 bits, all
+    of which must be rejected with the usage line; Backend; unknown
+    commands; the NV store afterwards."""
     scn = "cfg_commands"
     z = mk(scn, held=(), seed={"StartDelaySec": "600"})
     c = z.client()
@@ -419,16 +454,24 @@ def cfg_commands():
         ("Interval 301", ["Usage: Interval <seconds 5-300> — Default 5s."]),
         ("Interval abc", ["Usage: Interval <seconds 5-300> — Default 5s."]),
         ("Interval 300", ["Interval set to 300s (ISON frequency when backend resolves to ISON and you don't own the nick)."]),
-        ("Interval 4294967301", ["Interval set to 5s (ISON frequency when backend resolves to ISON and you don't own the nick)."]),
+        ("Interval 4294967301", ["Usage: Interval <seconds 5-300> — Default 5s."]),
+        ("Interval +6", ["Usage: Interval <seconds 5-300> — Default 5s."]),
+        ("Interval 5", ["Interval set to 5s (ISON frequency when backend resolves to ISON and you don't own the nick)."]),
         ("IdleGap 31", ["Usage: IdleGap <seconds 0-30> — Default 2s."]),
         ("IdleGap 30", ["IdleGap set to 30s. Skip a backend tick if you've sent anything in the last IdleGap seconds."]),
-        ("IdleGap abc", ["IdleGap set to 0s. Skip a backend tick if you've sent anything in the last IdleGap seconds."]),
+        ("IdleGap abc", ["Usage: IdleGap <seconds 0-30> — Default 2s."]),
+        ("IdleGap 4294967297", ["Usage: IdleGap <seconds 0-30> — Default 2s."]),
+        ("IdleGap", ["Usage: IdleGap <seconds 0-30> — Default 2s."]),
+        ("IdleGap 0", ["IdleGap set to 0s. Skip a backend tick if you've sent anything in the last IdleGap seconds."]),
         ("StartDelay 601", ["Usage: StartDelay <seconds 0-600> — Default 90s."]),
+        ("StartDelay x", ["Usage: StartDelay <seconds 0-600> — Default 90s."]),
         ("StartDelay 600", ["StartDelay set to 600s. First backend action after connect (join-safe). Effective next connect."]),
         ("Jitter 11", ["Usage: Jitter <seconds 0-10> — Default 0s."]),
         ("Jitter 10", ["Jitter set to 0..10s. Random extra wait added to each scheduled backend tick."]),
-        ("Jitter x", ["Jitter set to 0..0s. Random extra wait added to each scheduled backend tick."]),
+        ("Jitter x", ["Usage: Jitter <seconds 0-10> — Default 0s."]),
+        ("Jitter 0", ["Jitter set to 0..0s. Random extra wait added to each scheduled backend tick."]),
         ("MinGap 31", ["Usage: MinGap <seconds 0-30> — Default 3s."]),
+        ("MinGap -1", ["Usage: MinGap <seconds 0-30> — Default 3s."]),
         ("MinGap 30", ["MinGap set to 30s. Minimum spacing between NICK attempts (dedupe)."]),
         ("Backend bogus", ["Usage: Backend <Auto|Ison|Monitor> — Default Auto."]),
         ("Backend ISON", ["Backend mode set to Ison. Effective backend now: ISON."]),
@@ -571,6 +614,23 @@ def cfg_persist():
         check(scn, want.strip().split(":")[0], want in sh, repr(sh))
 
 
+def cfg_stored_values():
+    """Settings read from the NV store that are not numbers in range keep
+    their defaults: non-numeric, negative, too large, and beyond 32 bits
+    (which would otherwise wrap into range)."""
+    scn = "cfg_stored_values"
+    z = mk(scn, held=(), use_fast=False,
+           seed={"IntervalSec": "abc", "IdleGapSec": "4294967297", "StartDelaySec": "-1",
+                 "JitterSec": "11", "MinGapSec": "x"})
+    c = z.client()
+    sh = show(c)
+    c.quit(); finish(z)
+    for want in ("  Interval: 5s   (default 5s)", "  IdleGap: 2s     (default 2s)",
+                 "  StartDelay: 90s (default 90s; first backend action after connect)",
+                 "  Jitter: 0..0s      (default 0s; random extra wait)", "  MinGap: 3s        (default 3s; dedupe NICK attempts)"):
+        check(scn, want.strip().split(":")[0] + " keeps its default", want in sh, repr(sh))
+
+
 # --------------------------------------------------------------------------
 # be_* - backend selection and MONITOR edge cases
 # --------------------------------------------------------------------------
@@ -619,31 +679,60 @@ def be_monitor_full():
 
 
 def be_monitor_silent():
-    """Characterised: a server that advertises MONITOR but never answers it.
-    The module sends one MONITOR + tim, then waits for a 730/731 that never
-    comes: it never falls back to ISON and never reclaims a nick that frees
-    up silently. Poke does not get it out of that state; Backend Ison does.
-    See TESTING.md, Known gaps."""
+    """A server that advertises MONITOR but never answers it. The module
+    sends one MONITOR + tim at StartDelay; a Poke before the next tick sends
+    nothing more (the probe is still outstanding) and re-arms the schedule;
+    at the next scheduled tick, one Interval later, the module says MONITOR got no reply, switches to ISON in that same
+    tick, and keeps polling, so a nick that frees up silently is reclaimed
+    at the following ISON."""
     scn = "be_monitor_silent"
     z = mk(scn, monitor="silent")
     d = z.net().ircd
     c = z.client()
-    idle(9)
-    d.release("tim")
-    idle(8)
-    stalled = traffic(d)
+    idle(3)
     m = time.monotonic() - d.welcomes[-1]
     c.cmd("*" + MOD, "Poke")
+    idle(0.5)
+    after_poke = [x for x in traffic(d) if x[0] > m and not x[1].startswith("ISON")]
+    msg = c.wait_for(lambda l: "*%s!" % MOD in l and "no reply" in l, 6)
     idle(1)
-    after_poke = [x for x in traffic(d) if x[0] > m]
-    m = time.monotonic() - d.welcomes[-1]
-    c.cmd("*" + MOD, "Backend Ison")
-    c.wait_for(lambda l: re.search(r" NICK :tim$", l), 3)
-    after_ison = [x for x in traffic(d) if x[0] > m]
+    eff = show_field(c, "Effective")
+    t_rel = time.monotonic() - d.welcomes[-1]
+    d.release("tim")
+    c.wait_for(lambda l: re.search(r" NICK :tim$", l), 7)
+    tr = traffic(d)
     c.quit(); finish(z)
-    check(scn, "one probe, then nothing (no ISON fallback, no reclaim)", kinds(stalled) == ["MONITOR + tim"], repr(stalled))
-    check(scn, "Poke sends nothing", after_poke == [], repr(after_poke))
-    check(scn, "Backend Ison polls and reclaims at once", kinds(after_ison) == ["ISON tim", "NICK tim"] and d.nick == "tim", repr(after_ison))
+    probe = times(tr, "MONITOR + tim")
+    isons = times(tr, "ISON tim")
+    nicks = times(tr, "NICK tim")
+    check(scn, "one probe at StartDelay", len(probe) == 1 and abs(probe[0] - 2) <= TOL, repr(tr))
+    check(scn, "Poke while the probe is outstanding sends nothing", after_poke == [], repr(after_poke))
+    check(scn, "fallback announced", msg is not None and msg.endswith(":MONITOR got no reply on this connection; falling back to ISON."), repr(msg))
+    # Poke re-arms the schedule, so the next tick is one Interval after it.
+    check(scn, "ISON from the next tick, every Interval", isons and abs(isons[0] - (m + 5)) <= TOL and spaced(isons, 5) and eff == "ISON", repr((m, tr, eff)))
+    check(scn, "reclaimed at the first ISON after the release", len(nicks) == 1 and nicks[0] - t_rel <= 5 + TOL and d.nick == "tim", repr((t_rel, tr)))
+
+
+def be_monitor_late():
+    """After the module has fallen back from an unanswered MONITOR to ISON,
+    a 731 for the primary nick that the server sends late still counts:
+    MONITOR is in use again and the module reclaims at once, without
+    waiting for the next ISON."""
+    scn = "be_monitor_late"
+    z = mk(scn, monitor="silent")
+    d = z.net().ircd
+    c = z.client()
+    c.wait_for(lambda l: "no reply" in l, 9)
+    idle(1)
+    d.online.discard("tim")
+    m = time.monotonic() - d.welcomes[-1]
+    d.note(":irc.test 731 tim_ :tim")
+    c.wait_for(lambda l: re.search(r" NICK :tim$", l), 3)
+    tr = [x for x in traffic(d) if x[0] > m]
+    eff = show_field(c, "Effective")
+    c.quit(); finish(z)
+    check(scn, "late 731 reclaims at once", kinds(tr)[:1] == ["NICK tim"] and tr[0][0] - m <= 0.5, repr((m, tr)))
+    check(scn, "MONITOR in use again", eff == "MONITOR", repr(eff))
 
 
 def be_monitor_unrelated():
@@ -696,6 +785,17 @@ def lc_hot_load():
     check(scn, "ISON server, nick held: probe after one Interval, ISON after another",
           kinds(tr)[:2] == ["MONITOR + tim", "ISON tim"] and abs(tr[0][0] - m - 5) <= TOL and abs(tr[1][0] - tr[0][0] - 5) <= TOL, repr((m, tr)))
     check(scn, "421 swallowed", numerics(seen, "421") == [], repr(numerics(seen, "421")))
+    z = mk(scn + "_silent", monitor="silent", held=(), load=False, use_fast=False)
+    d = z.net().ircd
+    c = z.client()
+    m = time.monotonic() - d.welcomes[-1]
+    c.cmd("*status", "LoadMod " + MOD)
+    msg = c.wait_for(lambda l: "no reply" in l, 12)
+    idle(0.5)
+    tr = [x for x in traffic(d) if x[0] > m]
+    c.quit(); finish(z)
+    check(scn, "silent MONITOR server, nick owned: one probe, then fallback announced, nothing polled",
+          kinds(tr) == ["MONITOR + tim"] and msg is not None, repr((tr, msg)))
 
 
 def lc_reconnect():
@@ -718,23 +818,21 @@ def lc_reconnect():
 
 
 def lc_startdelay_zero():
-    """StartDelay 0, module loaded from znc.conf. After 001 the first tick
-    runs at once, then one per Interval (no tight loop). Characterised: the
-    tick that OnLoad armed fires while ZNC is still connecting, and because
-    a tick does not check that registration has finished, ISON goes out as
-    the first line on the socket, before CAP/NICK/USER; a real server
-    answers it with 451. See TESTING.md, Known gaps."""
+    """StartDelay 0, module loaded from znc.conf. Nothing is sent before
+    registration has finished (the tick armed at load time finds ZNC still
+    registering and does nothing); after 001 the first tick runs at once,
+    then one per Interval, with no tight loop."""
     scn = "lc_startdelay_zero"
     z = mk(scn, monitor=None, seed={"StartDelaySec": "0", "BackendMode": "Ison"})
     d = z.net().ircd
     idle(6)
     tr = traffic(d)
     with d.lock:
-        first = [l for _, l in d.rx][:2]
+        before = [l for t, l in d.rx if t < d.welcomes[-1] and l.split(" ")[0] in BACKEND and not l.startswith("NICK ")]
     finish(z)
     isons = times(tr, "ISON")
     check(scn, "ISON at once after 001, then after Interval", len(isons) == 2 and isons[0] <= 0.5 and abs(isons[1] - isons[0] - 5) <= TOL, repr(tr))
-    check(scn, "stray ISON before registration (characterised)", first == ["ISON tim", "CAP LS 302"], repr(first))
+    check(scn, "nothing before registration", before == [], repr(before))
 
 
 def lc_poke():
@@ -832,8 +930,9 @@ def sym_unique():
 
 
 SCENARIOS = [is_startup, mon_startup, mon_refused, is_refused_437, ev_visible, ev_mingap, ac_idle_gap,
-             ac_user_traffic, cfg_commands, cfg_setnick, cfg_load_args, cfg_enable_disable, cfg_persist,
-             be_modes, be_monitor_full, be_monitor_silent, be_monitor_unrelated, lc_hot_load, lc_reconnect,
+             ac_user_traffic, ac_ison_order, cfg_commands, cfg_setnick, cfg_load_args, cfg_enable_disable, cfg_persist,
+             cfg_stored_values, be_modes, be_monitor_full, be_monitor_silent, be_monitor_late, be_monitor_unrelated,
+             lc_hot_load, lc_reconnect,
              lc_startdelay_zero, lc_poke, lc_jitter, ty_runtime_load, up_inplace, sym_unique]
 
 

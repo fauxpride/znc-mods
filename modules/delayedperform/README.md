@@ -6,7 +6,7 @@ It is designed for the cases where a normal `perform`-style burst is too aggress
 
 This makes it especially useful in situations where sending too many messages at once via `perform` can cause throttling, particularly when you need to rejoin many channels after reconnecting.
 
-Current version: **1.1.3** — see [`CHANGELOG.md`](./CHANGELOG.md), and [`TESTING.md`](./TESTING.md) for the test suite.
+Current version: **1.2.0** — see [`CHANGELOG.md`](./CHANGELOG.md), and [`TESTING.md`](./TESTING.md) for the test suite.
 
 ---
 
@@ -106,9 +106,11 @@ When the IRC network connects:
 
 1. the module clears any previously scheduled timers
 2. it loads all stored command entries for that network
-3. it creates one one-shot timer per command
+3. it creates one one-shot timer per command, skipping entries it cannot read
 4. when a timer fires, the command is sent with `PutIRC()` and the entry is removed from the module's internal tracking
 5. the module logs the action to the module window (secret entries log as `Ran: [hidden]`)
+
+On connect the module reports `Scheduled N delayed command(s).`, followed by `Skipped M unreadable entries; see List.` when the store holds entries it cannot read.
 
 When the IRC network disconnects:
 
@@ -150,7 +152,7 @@ Once loaded, you can check the module's version from IRC in three ways:
 /msg *status ListAvailMods
 ```
 
-`Version` returns a line such as `delayedperform version 1.1.3`. `Help` shows the version in its first line. `ListAvailMods` lists every available module with its description; the `delayedperform` description ends in `v1.1.3`. `ListMods` shows only module names and arguments, so it does not include the version.
+`Version` returns a line such as `delayedperform version 1.2.0`. `Help` shows the version in its first line. `ListAvailMods` lists every available module with its description; the `delayedperform` description ends in `v1.2.0`. `ListMods` shows only module names and arguments, so it does not include the version.
 
 ---
 
@@ -190,7 +192,9 @@ Prints the module version on its own line, for scripting or quick identification
 
 ### `SetDelay <seconds>`
 
-Sets the global default delay used when `Add` or `AddSecret` is called **without** an explicit per-command delay.
+Sets the global default delay used when `Add` or `AddSecret` is called **without** an explicit per-command delay. The value must be a whole number of seconds from 0 to 4294967295; anything larger is rejected.
+
+Changing the global delay does not change entries that already exist: each entry keeps the delay it was added with.
 
 ```text
 /msg *delayedperform SetDelay 5
@@ -202,8 +206,9 @@ Adds a delayed command.
 
 - If `seconds` is supplied, that entry uses its own delay.
 - If `seconds` is omitted, the current global default delay is used.
-- `seconds` must be a plain non-negative number. Anything else, such as `-3`, is taken as the start of the command (`Add -3 JOIN #x` stores the command `-3 JOIN #x`), and a number above 4294967295 wraps (`4294967296` becomes `0`).
+- `seconds` must be a whole number from 0 to 4294967295. A number outside that range, or one with a sign or a decimal point (`-3`, `+5`, `1.5`), is rejected rather than stored as part of the command.
 - Commands can be raw IRC lines or supported slash-style shorthands.
+- A supported shorthand that is missing a required argument is rejected with its usage line; see [Supported slash-command shorthands](#supported-slash-command-shorthands).
 - The command text is rejected if it contains CR, LF, or NUL.
 
 Examples:
@@ -219,6 +224,8 @@ Added entries are echoed to the module window in the form:
 ```text
 Added [2]: delay=5s, cmd=JOIN #znc
 ```
+
+The number in brackets is the entry's index in `List`, which is the index `Del` takes.
 
 ### `AddSecret [seconds] <irc-or-slash-command>`
 
@@ -246,7 +253,9 @@ Shows:
 
 - the current global default delay
 - all configured entries
-- each entry's index, delay, and decoded command text — or `[hidden]` if the entry was added with `AddSecret`, or `[corrupt entry]` if the stored value could not be decoded
+- each entry's index, delay, and decoded command text — or `[hidden]` if the entry was added with `AddSecret`, or `[corrupt entry]` if the stored value cannot be read (its delay is not a valid number, or its payload is empty or not base64). The delay column shows `-` when the delay itself cannot be read.
+
+Corrupt entries only arise from an edited or damaged registry. They are never scheduled, and they can be removed with `Del` like any other entry. CR, LF and NUL in a stored command are shown as `\r`, `\n` and `\0`.
 
 ```text
 /msg *delayedperform List
@@ -254,7 +263,7 @@ Shows:
 
 ### `Del <index|all>`
 
-Deletes a specific stored command by index, or everything if `all` is used. Remaining entries are renumbered to a contiguous `0..N-1` range and the secret flag on each entry is preserved through the rewrite.
+Deletes a specific stored command by its `List` index, or everything if `all` is used. Only the deleted entry is removed from storage; the other entries are left exactly as stored. Their `List` indices close up, because `List` numbers entries by position.
 
 ```text
 /msg *delayedperform Del 2
@@ -302,7 +311,14 @@ Supported shorthands include:
   - `/os` → `OperServ`
   - `/bs` → `BotServ`
 
-A supported shorthand that is missing a required argument, such as `/msg bob` with no text, `/me waves` without a target, or `/ns` on its own, is neither converted nor rejected: it is stored and later sent exactly as typed, slash included, and the server will reject it. The `Added` echo shows the stored form, so check it after adding.
+A supported shorthand that is missing a required argument is rejected, nothing is stored, and the module shows its usage. For example:
+
+```text
+/msg *delayedperform Add 5 /msg bob
+Add: incomplete shorthand. Usage: /msg <target> <text>
+```
+
+This applies to `/msg` and `/notice` without a target and text, `/ctcp` and `/me` without a target and text, `/join`, `/part`, `/topic` and `/mode` without a target, `/nick` without a nick, `/kick` without a channel and nick, `/invite` without a nick and channel, `/whois` without a nick, `/oper` without a name and password, `/raw` and `/quote` without a line, the service aliases without text, and a `/` on its own. `/quit` and `/away` need no argument.
 
 Unknown slash commands fall back to a generic conversion:
 
@@ -362,7 +378,7 @@ Each command's delay is measured from the moment the IRC connection comes up.
 - a command with delay `10` runs about 10 seconds after connect
 - commands that share the same delay are scheduled for roughly the same moment
 
-The schedule is built when the connection comes up. Loading the module while the network is already connected schedules nothing; stored commands run at the next connect.
+The schedule is built when the connection comes up. Loading the module while the network is already connected schedules nothing; stored commands run at the next connect. This is deliberate: if loading the module ran the perform, every `/znc updatemod delayedperform` would send the whole perform again on a live connection.
 
 ### This is not an automatic sequential queue
 
@@ -375,6 +391,8 @@ This is a network module and uses ZNC NV storage, so entries are meant to follow
 ### Control-character filtering
 
 Stored commands are rejected if they contain CR, LF, or NUL. This is enforced at `Add`/`AddSecret` time (before persisting) and re-checked just before the command is sent. In practice, IRC clients strip these before sending to ZNC, but the check gives defense in depth against manually-crafted NV values, imported configs, or future code paths that might accept templated input.
+
+When the module shows such a command (in `List` or in `Skipped (contains control chars): ...`), it prints those bytes as `\r`, `\n` and `\0`, so a stored value can never split or end a line your client receives.
 
 ### `%nick%` substitution is validated, not trusted
 
@@ -466,11 +484,13 @@ For each stored command, the module creates a separate `CTimer` subclass instanc
 Each timer is:
 
 - one-shot
-- labeled with a `dp#<index>` style identifier
+- labeled `dp#<connection>.<index>`, where `<connection>` counts connections since the module was loaded, so a label can never collide with a timer from an earlier connection
 - configured with the stored delay in seconds
 - carries the entry's secret flag so its `RunJob` callback can emit the right module output
 
 When a timer fires, it calls back into the module, executes the stored command, and then calls `ForgetTimer(this)` so the module drops its internal pointer before ZNC deletes the timer. This avoids dangling pointers in the module's timer-tracking vector across disconnect/reconnect cycles.
+
+If ZNC refuses a timer (`CModule::AddTimer` returns false), ZNC has already deleted it; the module reports `Warning: could not schedule entry N` and does not touch the timer again.
 
 ### Persistent storage model
 
@@ -479,7 +499,7 @@ The module uses ZNC NV storage for persistence.
 Keys include:
 
 - `global_delay`
-- `cmd.<index>`
+- `cmd.<n>`, where `<n>` is a number from 0 to 4294967295. Numbers need not be contiguous; keys outside that range, or not numbered, are ignored.
 
 Each command entry is stored in one of two formats:
 
@@ -492,7 +512,7 @@ The `<flags>` segment is a short string of single-character flags. Currently def
 
 - `s` — entry is secret (its text is masked in `List` and module output; the stored value is not encrypted)
 
-Unknown flag characters are preserved through rewrites but otherwise ignored, leaving room to add more flags in future versions without breaking older configurations.
+Unknown flag characters are left as stored and otherwise ignored, leaving room to add more flags in future versions without breaking older configurations.
 
 Examples conceptually look like:
 
@@ -500,16 +520,16 @@ Examples conceptually look like:
 global_delay = 5
 cmd.0 = 3||Sk9JTiAjY2hhbjE=
 cmd.1 = 7|s|UFJJVk1TRyBOaWNrU2VydiA6SURFTlRJRlkgaHVudGVyMg==
-cmd.2 = 9|Sk9JTiAjbGVnYWN5-cm9tZS12MQ==      # legacy v1.0 entry, no flags segment
+cmd.5 = 9|Sk9JTiAjbGVnYWN5      # legacy v1.0 entry, no flags segment
 ```
 
 Commands are base64-encoded before storage so the module can safely persist raw IRC lines without having to worry about embedded spaces or formatting quirks in the NV value. Base64 is an encoding, not encryption, and the secret flag does not change how a value is stored: `cmd.1` above decodes directly to `PRIVMSG NickServ :IDENTIFY hunter2`. See [Credentials and secrets](#credentials-and-secrets).
 
 ### Entry ordering
 
-Stored `cmd.<index>` keys are loaded, index-sorted, and then presented in ascending order.
+Stored `cmd.<n>` keys are loaded and sorted by number. `List` numbers them by position from 0, and `Del` takes that position.
 
-If you delete an entry, the module rewrites the list into a contiguous `0..N-1` index range, preserving each remaining entry's flags.
+A new entry is stored under the highest existing number plus one, so it always sorts last. Deleting an entry removes only its key and leaves gaps, which is why the stored numbers and the `List` indices can differ (in the example above, `cmd.5` is index 2). If the highest key is already `cmd.4294967295`, `Add` refuses until that entry is deleted or the list is cleared.
 
 ### Command normalization
 
@@ -610,7 +630,7 @@ So the pacing is explicit and manual: you decide which commands run when.
 
 ## Testing
 
-The module ships with a test suite under [`tests/`](./tests/) that runs a real ZNC against fake IRC servers and checks the exact lines ZNC sends after it connects, and when. It covers delays and ordering, reconnects and unloads with timers pending, every slash shorthand, `%nick%` expansion and its nick check, control-character filtering, secret masking, every command, legacy and hand-edited stores, persistence, module type, and `/znc updatemod`. See [`TESTING.md`](./TESTING.md).
+The module ships with a test suite under [`tests/`](./tests/) that runs a real ZNC against fake IRC servers and checks the exact lines ZNC sends after it connects, and when. It covers delays and ordering, reconnects and unloads with timers pending, every slash shorthand and every incomplete one, `%nick%` expansion and its nick check, control-character filtering, secret masking, every command and its limits, legacy and hand-edited stores, persistence, module type, `/znc updatemod`, and upgrading from and downgrading to the previous release. See [`TESTING.md`](./TESTING.md).
 
 ---
 

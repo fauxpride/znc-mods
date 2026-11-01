@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.2.0] — 2026-11-01
+
+This release fixes a latent double free in timer scheduling and tightens input handling: numbers no longer wrap, incomplete shorthands and malformed delays are rejected instead of stored, unreadable stored entries are shown and can be deleted, and module output can no longer carry raw CR, LF or NUL. Built with `-Wall -Wextra -Werror` against ZNC 1.10.3 with GCC 13.3 and GCC 11.5, and runtime-tested against ZNC 1.10.3.
+
+### Fixed
+- **Double free when a timer could not be scheduled.** When `CModule::AddTimer()` refuses a timer it deletes it itself, but `OnIRCConnected()` then deleted it a second time, a use-after-free that crashes ZNC. The branch was only reachable if a timer with the same `dp#<index>` label still existed when the next connection came up. The module no longer deletes a refused timer, and timer labels now include a per-connection counter (`dp#<connection>.<index>`), so a label can no longer collide with one from an earlier connection.
+- **Numbers above 4294967295 wrapped.** `CString::ToUInt()` truncates to 32 bits, so `Del 4294967296` deleted entry 0, `Add 4294967296 <cmd>` stored a delay of 0, and `SetDelay 4294967297` set 1. The same wrap applied to the registry: a key `cmd.4294967296` was read as entry 0. All numbers are now range-checked. Out-of-range input is rejected with a message, and out-of-range stored keys and delays are not misread as small numbers.
+- **A signed or decimal delay became part of the command.** `Add -3 JOIN #x` stored the command `-3 JOIN #x` with the global delay. A first argument with a sign or a decimal point (`-3`, `+5`, `1.5`, `.5`) is now rejected: "Add: the delay must be a whole number of seconds from 0 to 4294967295."
+- **Incomplete shorthands were stored as typed.** A supported shorthand missing a required argument, such as `/msg bob`, `/me waves` or `/kick #c`, was stored with its slash and later sent to the server, which rejected it. `/raw` and `/quote` with nothing after them stored an empty entry, which then showed as `[corrupt entry]`. These are now rejected with the shorthand's usage line, for example "Add: incomplete shorthand. Usage: /msg <target> <text>", and nothing is stored.
+- **Control characters reached the client in module output.** `Skipped (contains control chars): ...` printed the stored line itself, so a lone CR reached the client inside a module message, and `List` printed stored CR, LF and NUL as they were. Both now print them as `\r`, `\n` and `\0`. The skip message shows the stored command rather than the expanded one.
+- **Unreadable entries were hidden and could not be deleted.** An entry whose delay was not a number did not appear in `List` and could only be removed with `Clear`; the next `Del` silently discarded it, together with any other `cmd.*` key that was not numbered. Invalid base64 decoded to arbitrary bytes and was listed and sent as such.
+- **`Add` reported the stored key instead of the `List` index.** With gaps in the stored keys, the index in `Added [N]` did not match the index `List` showed or `Del` accepted.
+
+### Changed
+- **`Del` removes only the deleted entry.** It no longer rewrites the whole list into contiguous keys. Other entries keep their keys, values and flags exactly as stored; `List` indices close up because `List` numbers entries by position, as before.
+- **Unreadable entries are listed.** An entry whose delay is not a valid number, or whose payload is empty or not base64, is listed as `[corrupt entry]` (with `-` in the delay column when the delay is the problem), is never scheduled, and can be removed with `Del`. Unpadded base64 is accepted, as ZNC's decoder accepts it.
+- **Connect message.** When the store holds unreadable entries, `Scheduled N delayed command(s).` is followed by `Skipped M unreadable entries; see List.`
+- **`SetDelay` above 4294967295** answers "SetDelay: seconds must be between 0 and 4294967295." instead of storing a wrapped value. Non-numeric input still shows the usage line.
+- **`Add` refuses when no key is free.** If the highest stored key is already `cmd.4294967295`, `Add` says so instead of wrapping to `cmd.0`.
+- **README.** Documents the above, explains why loading the module on a live connection deliberately schedules nothing (otherwise every `/znc updatemod` would re-send the perform), and corrects a storage example whose base64 was invalid.
+
+### Compatibility
+- **Storage format is unchanged.** Entries in the 1.1 format and the 1.0 legacy format load as before, and 1.1.3 reads a store written by 1.2.0, including the gaps `Del` now leaves, so downgrading is safe.
+- **Input that 1.1.3 accepted is now rejected.** A script that adds entries with a signed or decimal delay, an out-of-range number, or an incomplete shorthand gets an error and nothing is stored. Entries stored that way by earlier versions are kept and still sent as before; delete and re-add them.
+- **Output changes.** Anything that parses the connect message or `Skipped (contains control chars)` should expect the additions above.
+- **ZNC compatibility.** Built and runtime-tested against ZNC 1.10.3. No ZNC API changes were required.
+
+---
+
 ## [1.1.3] — 2026-09-11
 
 This release makes the module's own `Help` output reachable and fixes the argument order of two-argument `/whois` shorthands. Built with `-Wall -Wextra` without module warnings and runtime-tested against ZNC 1.9.1; also compiles with `znc-buildmod` against ZNC 1.9.0.

@@ -22,6 +22,7 @@ MOD = "delayedperform"
 ZNC_BIN = os.environ.get("ZNC_BIN", "/usr/bin/znc")
 NEW = os.environ.get("NEW", "")        # delayedperform.so under test
 PROBE = os.environ.get("PROBE", "")    # NEW rebuilt with a different version string
+BASE = os.environ.get("BASE", "")      # previous release, for up_from_baseline
 if not NEW:
     raise SystemExit("set NEW (the .so under test); see TESTING.md")
 EXTRA_ENV = {}
@@ -92,6 +93,7 @@ def version_of(so):
 
 
 NEW_VER = version_of(NEW)
+BASE_VER = version_of(BASE) if BASE else None
 
 
 def unique_syms(path):
@@ -225,8 +227,10 @@ def fire_unload_pending():
 
 
 def fire_hot_load():
-    """Characterised: LoadMod while connected schedules nothing (the module
-    schedules only in OnIRCConnected); the entries run on the next connect."""
+    """LoadMod while connected schedules nothing, by design: the module
+    schedules only when the connection comes up, so reloading it (including
+    /znc updatemod) never re-sends the perform. The entries run on the next
+    connect."""
     scn = "fire_hot_load"
     z = mk(scn, load=False, extra_nv=None)
     z.write_registry("n1", MOD, {"cmd.0": entry(0, "PRIVMSG #a :hot")})
@@ -318,20 +322,42 @@ SHORTHANDS = [
     ("/cap ls", "CAP ls"),
     ("/Who #a", "WHO #a"),
     ("PRIVMSG #a :plain raw", "PRIVMSG #a :plain raw"),
-    # Characterised: a shorthand missing a required argument is not rejected;
-    # the text is stored and later sent exactly as typed, slash included.
-    ("/msg bob", "/msg bob"),
-    ("/me waves", "/me waves"),
-    ("/ns", "/ns"),
-    ("/join", "/join"),
-    ("/kick #c", "/kick #c"),
-    ("/oper name", "/oper name"),
+]
+
+# A supported shorthand missing a required argument is rejected with its
+# usage line, and nothing is stored.
+INCOMPLETE = [
+    ("/msg", "/msg <target> <text>"),
+    ("/msg bob", "/msg <target> <text>"),
+    ("/NOTICE bob", "/notice <target> <text>"),
+    ("/ctcp bob", "/ctcp <target> <command>"),
+    ("/me waves", "/me <target> <action>"),
+    ("/join", "/join <#chan> [key]"),
+    ("/part", "/part <#chan> [reason]"),
+    ("/nick", "/nick <nick>"),
+    ("/topic", "/topic <#chan> [topic]"),
+    ("/mode", "/mode <target> [modes]"),
+    ("/kick #c", "/kick <#chan> <nick> [reason]"),
+    ("/invite bob", "/invite <nick> <#chan>"),
+    ("/whois", "/whois [server] <nick>"),
+    ("/oper name", "/oper <name> <password>"),
+    ("/raw", "/raw <irc-line>"),
+    ("/QUOTE", "/quote <irc-line>"),
+    ("/ns", "/ns <text>"),
+    ("/CS", "/cs <text>"),
+    ("/hs", "/hs <text>"),
+    ("/ms", "/ms <text>"),
+    ("/os", "/os <text>"),
+    ("/bs", "/bs <text>"),
+    ("/", "/<command> [arguments]"),
 ]
 
 
 def sh_normalise():
-    """Each shorthand as stored (the Added echo shows the stored form), and
-    a subset fired to confirm the stored line is what reaches the server."""
+    """Each shorthand as stored (the Added echo shows the stored form), each
+    incomplete shorthand rejected with its usage line through both Add and
+    AddSecret, the NV store holding exactly the valid forms, and a subset
+    fired to confirm the stored line is what reaches the server."""
     scn = "sh_normalise"
     z = mk(scn)
     d = z.net().ircd
@@ -339,6 +365,10 @@ def sh_normalise():
     for i, (typed, want) in enumerate(SHORTHANDS):
         got = c.cmd(M, "Add 0 " + typed)
         check(scn, "%02d %s" % (i, typed), got == ["Added [%d]: delay=0s, cmd=%s" % (i, want)], repr(got))
+    for typed, usage in INCOMPLETE:
+        for verb in ("Add", "AddSecret"):
+            got = c.cmd(M, "%s 3 %s" % (verb, typed))
+            check(scn, "%s %s rejected" % (verb, typed), got == ["%s: incomplete shorthand. Usage: %s" % (verb, usage)], repr(got))
     st = store(z)
     # Keep only entries that are harmless to send, then fire them.
     # Lines that look like ZNC's own connect traffic (MODE #a) are left out,
@@ -352,7 +382,7 @@ def sh_normalise():
     sent = [l for _, l in sent_after_connect(d)]
     finish(z)
     stored = sorted(base64.b64decode(v.split("|")[-1]).decode() for k, v in st.items() if k.startswith("cmd."))
-    check(scn, "NV holds the normalised forms", stored == sorted(w for _, w in SHORTHANDS), repr(stored[:5]))
+    check(scn, "NV holds exactly the normalised forms", stored == sorted(w for _, w in SHORTHANDS), repr(sorted(set(stored) ^ set(w for _, w in SHORTHANDS))))
     check(scn, "fired lines equal the stored lines", sorted(sent) == sorted(fire), repr(sorted(set(sent) ^ set(fire))))
 
 
@@ -409,25 +439,29 @@ def var_nick_invalid():
 
 def sec_control_chars():
     """Stored commands with CR, LF or NUL (only possible by editing the
-    registry) are never sent. The skip message masks secret entries.
-    Characterised: for a non-secret entry the message carries the stored
-    line itself, so a lone CR reaches the client inside a module message
-    line, and an LF splits it into two module lines."""
+    registry) are never sent. Module output shows the stored command with
+    those bytes escaped as \r, \n and \0: in List and in the skip message,
+    one module line per entry, and no raw CR reaches the client. The skip
+    message is masked for secret entries."""
     scn = "sec_control_chars"
     z = mk(scn, entries=[(0, "PRIVMSG #a :x\rQUIT :cr", ""), (0, "PRIVMSG #a :y\nQUIT :lf", ""),
                          (0, "PRIVMSG #a :z\x00nul", ""), (0, "PRIVMSG #a :s\r\nQUIT :secret", "s"),
                          (0, "PRIVMSG #a :ok", "")])
     d = z.net().ircd
     c = z.client()
+    lst = c.cmd(M, "List")
     msgs = reconnect(z, c, 1.5)
     sent = [l for _, l in sent_after_connect(d)]
+    raw_cr = [l for l in c.lines if "\r" in l]
     finish(z)
     check(scn, "only the clean entry is sent", sent == ["PRIVMSG #a :ok"], repr(sent))
-    check(scn, "secret entry masked", "Skipped (contains control chars): [hidden]" in msgs and not any("secret" in m for m in msgs), repr(msgs))
-    check(scn, "lone CR reaches the client inside the message (characterised)",
-          "Skipped (contains control chars): PRIVMSG #a :x\rQUIT :cr" in msgs, repr(msgs))
-    check(scn, "LF splits the message into two module lines (characterised)",
-          "Skipped (contains control chars): PRIVMSG #a :y" in msgs and "QUIT :lf" in msgs, repr(msgs))
+    check(scn, "List escapes the bytes", lst[3:] == ["0     | 0        | PRIVMSG #a :x\\rQUIT :cr", "1     | 0        | PRIVMSG #a :y\\nQUIT :lf",
+                                                    "2     | 0        | PRIVMSG #a :z\\0nul", "3     | 0        | [hidden]",
+                                                    "4     | 0        | PRIVMSG #a :ok"], repr(lst))
+    want = ["Skipped (contains control chars): PRIVMSG #a :x\\rQUIT :cr", "Skipped (contains control chars): PRIVMSG #a :y\\nQUIT :lf",
+            "Skipped (contains control chars): PRIVMSG #a :z\\0nul", "Skipped (contains control chars): [hidden]", "Ran: PRIVMSG #a :ok"]
+    check(scn, "one escaped module line per entry", msgs[:1] == ["Scheduled 5 delayed command(s)."] and sorted(msgs[1:]) == sorted(want), repr(msgs))
+    check(scn, "no raw CR reaches the client", raw_cr == [], repr(raw_cr))
 
 
 def sec_secret():
@@ -479,12 +513,16 @@ HELP = [
 
 def cmd_surface():
     """Every command and its error paths, reply by reply, with the NV store
-    checked at the end. Characterised: CString::ToUInt truncates to 32 bits,
-    so Del 4294967296 deletes entry 0, Add 4294967296 stores delay 0, and
-    SetDelay 4294967297 sets 1."""
+    checked along the way. Numbers are range-checked: delays and indices
+    above 4294967295 are rejected rather than wrapped, and a signed or
+    decimal delay is rejected rather than stored as part of the command.
+    Del removes only the chosen entry's key; the others keep theirs, and
+    Add reports the position List will show."""
     scn = "cmd_surface"
     z = mk(scn)
     c = z.client()
+    bad_delay = "the delay must be a whole number of seconds from 0 to 4294967295."
+    hdr = ["Global delay (default): 9s", "Index | Delay(s) | Command", "------+----------+-----------------------------"]
     cases = [
         ("Version", ["delayedperform version %s" % NEW_VER]),
         ("Help", HELP),
@@ -492,7 +530,9 @@ def cmd_surface():
         ("SetDelay", ["Usage: SetDelay <seconds>"]),
         ("SetDelay x", ["Usage: SetDelay <seconds>"]),
         ("SetDelay -1", ["Usage: SetDelay <seconds>"]),
-        ("SetDelay 4294967297", ["Global delay set to 1s."]),
+        ("SetDelay 4294967296", ["SetDelay: seconds must be between 0 and 4294967295."]),
+        ("SetDelay 4294967297", ["SetDelay: seconds must be between 0 and 4294967295."]),
+        ("SetDelay 4294967295", ["Global delay set to 4294967295s."]),
         ("SetDelay 5", ["Global delay set to 5s."]),
         ("Add", ["Usage: Add [seconds] <irc-or-slash-command>"]),
         ("Add 7", ["Usage: Add [seconds] <irc-or-slash-command>"]),
@@ -500,26 +540,34 @@ def cmd_surface():
         ("Add JOIN #x", ["Added [0]: delay=5s, cmd=JOIN #x"]),
         ("Add 2 JOIN #y", ["Added [1]: delay=2s, cmd=JOIN #y"]),
         ("AddSecret 7 PRIVMSG x :s", ["Added [2]: delay=7s, cmd=[hidden]"]),
-        ("Add -3 JOIN #neg", ["Added [3]: delay=5s, cmd=-3 JOIN #neg"]),
+        ("Add -3 JOIN #neg", ["Add: " + bad_delay]),
+        ("Add +5 JOIN #pos", ["Add: " + bad_delay]),
+        ("AddSecret 1.5 JOIN #dec", ["AddSecret: " + bad_delay]),
+        ("Add .5 JOIN #dec", ["Add: " + bad_delay]),
+        ("Add 4294967296 PRIVMSG #a :wrapped", ["Add: " + bad_delay]),
+        ("Add 99999999999999999999 PRIVMSG #a :huge", ["Add: " + bad_delay]),
+        ("Add 4294967295 PRIVMSG #a :max", ["Added [3]: delay=4294967295s, cmd=PRIVMSG #a :max"]),
+        ("Add 007 PRIVMSG #a :zeros", ["Added [4]: delay=7s, cmd=PRIVMSG #a :zeros"]),
         ("SetDelay 9", ["Global delay set to 9s."]),
-        ("List", ["Global delay (default): 9s", "Index | Delay(s) | Command", "------+----------+-----------------------------",
-                  "0     | 5        | JOIN #x", "1     | 2        | JOIN #y", "2     | 7        | [hidden]", "3     | 5        | -3 JOIN #neg"]),
+        ("List", hdr + ["0     | 5        | JOIN #x", "1     | 2        | JOIN #y", "2     | 7        | [hidden]",
+                        "3     | 4294967295        | PRIVMSG #a :max", "4     | 7        | PRIVMSG #a :zeros"]),
         ("Del", ["Usage: Del <index|all>"]),
         ("Del x", ["Del: index must be a non-negative integer."]),
         ("Del -1", ["Del: index must be a non-negative integer."]),
-        ("Del 4", ["Del: index out of range."]),
+        ("Del 5", ["Del: index out of range."]),
+        ("Del 4294967296", ["Del: index out of range."]),
         ("Del 1", ["Deleted entry 1."]),
-        ("List", ["Global delay (default): 9s", "Index | Delay(s) | Command", "------+----------+-----------------------------",
-                  "0     | 5        | JOIN #x", "1     | 7        | [hidden]", "2     | 5        | -3 JOIN #neg"]),
-        ("Del 4294967296", ["Deleted entry 0."]),
-        ("Add 4294967296 PRIVMSG #a :wrapped", ["Added [2]: delay=0s, cmd=PRIVMSG #a :wrapped"]),
+        ("List", hdr + ["0     | 5        | JOIN #x", "1     | 7        | [hidden]",
+                        "2     | 4294967295        | PRIVMSG #a :max", "3     | 7        | PRIVMSG #a :zeros"]),
+        ("Add 3 JOIN #z", ["Added [4]: delay=3s, cmd=JOIN #z"]),
+        ("Del 0", ["Deleted entry 0."]),
         ("help add", None),
         ("Frobnicate", ["Unknown command!"]),
     ]
     snap = None
     for i, (cmd, exp) in enumerate(cases):
         got = c.cmd(M, cmd)
-        if cmd == "Add 4294967296 PRIVMSG #a :wrapped":
+        if cmd == "Del 0":
             snap = store(z)
         if exp is None:
             text = " ".join(got)
@@ -532,22 +580,24 @@ def cmd_surface():
     dall = c.cmd(M, "Del ALL")
     c.quit()
     finish(z)
-    check(scn, "NV before Clear", snap == {"global_delay": "9", "cmd.0": entry(7, "PRIVMSG x :s", "s"),
-                                           "cmd.1": entry(5, "-3 JOIN #neg"), "cmd.2": entry(0, "PRIVMSG #a :wrapped")}, repr(snap))
+    check(scn, "Del removed only its own keys; the rest keep theirs",
+          snap == {"global_delay": "9", "cmd.2": entry(7, "PRIVMSG x :s", "s"), "cmd.3": entry(4294967295, "PRIVMSG #a :max"),
+                   "cmd.4": entry(7, "PRIVMSG #a :zeros"), "cmd.5": entry(3, "JOIN #z")}, repr(snap))
     check(scn, "Clear", clr == ["All commands deleted."] and after_clear == {"global_delay": "9"}, repr((clr, after_clear)))
     check(scn, "Del ALL (case-insensitive)", dall == ["All commands deleted."], repr(dall))
 
 
 def cmd_legacy_store():
-    """A hand-edited or v1.0 registry. Legacy delay|b64 entries load, unknown
-    flags are kept through a rewrite, an entry with an empty payload shows as
-    [corrupt entry] and is not scheduled, an entry with a non-numeric delay
-    is not listed, keys that are not cmd.<n> are ignored, and a non-numeric
-    global_delay reads as 0. Characterised: with gaps in the keys, Add's
-    reported index follows the highest numeric key (here 9), while List and
-    Del count positions; and Del's rewrite drops the unparsable entry and the
-    non-numeric cmd.foo key from the store."""
+    """A hand-edited or v1.0 registry. A legacy delay|b64 entry loads; an
+    unknown flag is kept; unpadded base64 is accepted. Entries that cannot
+    be read (non-numeric delay, empty payload, payload that is not base64)
+    are listed as [corrupt entry], are not scheduled, are counted in the
+    Scheduled message, and can be deleted. Keys that are not cmd.<n> with n
+    in range are ignored and left alone; a non-numeric global_delay reads
+    as 0. Add reports the position List shows, and Del touches nothing but
+    the entry it removes."""
     scn = "cmd_legacy_store"
+    unpadded = b64("PRIVMSG #a :unpadded").rstrip("=")
     seed = {
         "global_delay": "abc",
         "cmd.0": "1|" + b64("PRIVMSG #a :legacy"),
@@ -555,7 +605,10 @@ def cmd_legacy_store():
         "cmd.5": entry(1, "PRIVMSG #a :flags", "zq"),
         "cmd.7": "x|" + b64("PRIVMSG #a :baddelay"),
         "cmd.8": "1||",
+        "cmd.9": "1||!!!!",
+        "cmd.10": "1||" + unpadded,
         "cmd.foo": entry(1, "PRIVMSG #a :foo"),
+        "cmd.4294967296": entry(1, "PRIVMSG #a :outofrange"),
     }
     z = mk(scn, extra_nv=seed)
     d = z.net().ircd
@@ -564,20 +617,47 @@ def cmd_legacy_store():
     msgs = reconnect(z, c, 2)
     sent = sorted(l for _, l in sent_after_connect(d))
     add = c.cmd(M, "Add 1 PRIVMSG #a :new")
-    dl = c.cmd(M, "Del 0")
+    d1 = c.cmd(M, "Del 3")
+    d2 = c.cmd(M, "Del 3")
+    lst2 = c.cmd(M, "List")
     st = store(z)
     c.quit()
     finish(z)
-    check(scn, "List", lst == ["Global delay (default): 0s", "Index | Delay(s) | Command", "------+----------+-----------------------------",
-                               "0     | 1        | PRIVMSG #a :legacy", "1     | 1        | [hidden]", "2     | 1        | PRIVMSG #a :flags",
-                               "3     | 1        | [corrupt entry]"], repr(lst))
-    check(scn, "scheduled and sent: the three readable entries", msgs[:1] == ["Scheduled 3 delayed command(s)."] and
-          sent == ["PRIVMSG #a :flags", "PRIVMSG #a :legacy", "PRIVMSG #a :secret"], repr((msgs, sent)))
-    check(scn, "Add index follows the highest key (characterised)", add == ["Added [9]: delay=1s, cmd=PRIVMSG #a :new"], repr(add))
-    check(scn, "Del rewrites contiguously, keeps flags, drops unparsable and non-numeric keys (characterised)",
-          dl == ["Deleted entry 0."] and st == {"global_delay": "abc",
-                                                "cmd.0": entry(1, "PRIVMSG #a :secret", "s"), "cmd.1": entry(1, "PRIVMSG #a :flags", "zq"),
-                                                "cmd.2": "1||", "cmd.3": entry(1, "PRIVMSG #a :new")}, repr(st))
+    hdr = ["Global delay (default): 0s", "Index | Delay(s) | Command", "------+----------+-----------------------------"]
+    check(scn, "List shows every numeric entry, unreadable ones as [corrupt entry]",
+          lst == hdr + ["0     | 1        | PRIVMSG #a :legacy", "1     | 1        | [hidden]", "2     | 1        | PRIVMSG #a :flags",
+                        "3     | -        | [corrupt entry]", "4     | 1        | [corrupt entry]", "5     | 1        | [corrupt entry]",
+                        "6     | 1        | PRIVMSG #a :unpadded"], repr(lst))
+    check(scn, "the readable entries are scheduled and sent; the rest are counted",
+          msgs[:1] == ["Scheduled 4 delayed command(s). Skipped 3 unreadable entries; see List."] and
+          sent == ["PRIVMSG #a :flags", "PRIVMSG #a :legacy", "PRIVMSG #a :secret", "PRIVMSG #a :unpadded"], repr((msgs, sent)))
+    check(scn, "Add reports the List position", add == ["Added [7]: delay=1s, cmd=PRIVMSG #a :new"], repr(add))
+    check(scn, "unreadable entries can be deleted", d1 == ["Deleted entry 3."] and d2 == ["Deleted entry 3."] and
+          lst2 == hdr + ["0     | 1        | PRIVMSG #a :legacy", "1     | 1        | [hidden]", "2     | 1        | PRIVMSG #a :flags",
+                         "3     | 1        | [corrupt entry]", "4     | 1        | PRIVMSG #a :unpadded", "5     | 1        | PRIVMSG #a :new"], repr(lst2))
+    expect = dict(seed)
+    del expect["cmd.7"], expect["cmd.8"]
+    expect["cmd.11"] = entry(1, "PRIVMSG #a :new")
+    check(scn, "Del touched only the two deleted keys", st == expect, repr(sorted(set(st.items()) ^ set(expect.items()))))
+
+
+def cmd_key_exhausted():
+    """When the highest key is cmd.4294967295, Add refuses rather than wrap
+    to cmd.0; deleting that entry makes room again."""
+    scn = "cmd_key_exhausted"
+    z = mk(scn, extra_nv={"cmd.4294967295": entry(1, "PRIVMSG #a :last")})
+    c = z.client()
+    a1 = c.cmd(M, "Add 1 JOIN #x")
+    lst = c.cmd(M, "List")
+    dl = c.cmd(M, "Del 0")
+    a2 = c.cmd(M, "Add 1 JOIN #x")
+    st = store(z)
+    c.quit()
+    finish(z)
+    check(scn, "Add refused", a1 == ["Add: no free entry key (cmd.4294967295 is in use). Delete the last entry or use Clear."], repr(a1))
+    check(scn, "the entry is listed", lst[-1:] == ["0     | 1        | PRIVMSG #a :last"], repr(lst))
+    check(scn, "after deleting it, Add works", dl == ["Deleted entry 0."] and a2 == ["Added [0]: delay=1s, cmd=JOIN #x"]
+          and st == {"cmd.0": entry(1, "JOIN #x")}, repr((dl, a2, st)))
 
 
 # --------------------------------------------------------------------------
@@ -613,28 +693,89 @@ def ty_runtime_load():
 
 def up_inplace():
     """UpdateMod to the PROBE build: Version reports the probe's version (or
-    the old one if glibc cannot unload the build, decided with nm); stored
+    the old one if glibc cannot unload the build, decided with nm); an entry
+    that already ran at connect is not sent again by the update; stored
     entries carry over and fire on the next connect."""
     scn = "up_inplace"
     if not PROBE:
         check(scn, "PROBE build provided", False, "set PROBE; see TESTING.md")
         return
-    z = mk(scn)
+    z = mk(scn, entries=[(0, "PRIVMSG #a :kept", "")])
     d = z.net().ircd
     c = z.client()
-    c.cmd(M, "Add 0 PRIVMSG #a :kept")
+    time.sleep(1)
+    at_connect = [l for _, l in sent_after_connect(d)]
+    mark = d.mark()
     z.install_modules({MOD: PROBE})
     upd = c.cmd("*status", "UpdateMod " + MOD)
     v1 = c.cmd(M, "Version")
+    time.sleep(1.5)
+    on_update = [l for _, l in d.lines_since(mark) if not ZNC_OWN.match(l)]
+    check(scn, "entry ran at connect", at_connect == ["PRIVMSG #a :kept"], repr(at_connect))
     reconnect(z, c, 1)
     sent = [l for _, l in sent_after_connect(d)]
     finish(z)
+    check(scn, "UpdateMod does not re-send the perform", on_update == [], repr(on_update))
     stuck = pinned(NEW)
     print("    info: build under test unloadable by glibc in this znc: %s" % ("no (pinned)" if stuck else "yes"))
     exp = NEW_VER if stuck else version_of(PROBE)
     check(scn, "UpdateMod reports Done", upd[-1:] == ["Done"], repr(upd))
     check(scn, "version after UpdateMod is %s" % exp, v1 == ["delayedperform version %s" % exp], repr(v1))
     check(scn, "entries carried over", sent == ["PRIVMSG #a :kept"], repr(sent))
+
+
+def up_from_baseline():
+    """Upgrade and downgrade against the previous release (BASE). A running
+    baseline with entries is updated to the build under test and restarted:
+    the entries are listed and fire unchanged. A store written by the build
+    under test, with a gap left by Del, is read by the baseline: its List
+    shows the remaining entries in order and they fire."""
+    scn = "up_from_baseline"
+    if not BASE:
+        check(scn, "BASE build provided", False, "set BASE; see TESTING.md")
+        return
+    z = mk(scn + "_up", so=BASE)
+    d = z.net().ircd
+    c = z.client()
+    for cmd in ("Add 0 PRIVMSG #a :one", "AddSecret 1 PRIVMSG #a :two", "Add 1 /msg bob three"):
+        c.cmd(M, cmd)
+    lst0 = c.cmd(M, "List")
+    z.install_modules({MOD: NEW})
+    upd = c.cmd("*status", "UpdateMod " + MOD)
+    c.quit()
+    z.stop()
+    z.start()
+    c = z.client()
+    v = c.cmd(M, "Version")
+    lst1 = c.cmd(M, "List")
+    reconnect(z, c, 2)
+    sent = sorted(l for _, l in sent_after_connect(d))
+    finish(z)
+    check(scn, "UpdateMod from %s reports Done" % BASE_VER, upd[-1:] == ["Done"], repr(upd))
+    check(scn, "after restart: new version, same List", v == ["delayedperform version %s" % NEW_VER] and lst1 == lst0, repr((v, lst0, lst1)))
+    check(scn, "entries fire", sent == ["PRIVMSG #a :one", "PRIVMSG #a :two", "PRIVMSG bob :three"], repr(sent))
+
+    z = mk(scn + "_down")
+    d = z.net().ircd
+    c = z.client()
+    for cmd in ("Add 0 PRIVMSG #a :a", "Add 0 PRIVMSG #a :b", "Add 0 PRIVMSG #a :c"):
+        c.cmd(M, cmd)
+    c.cmd(M, "Del 1")
+    st = store(z)
+    c.quit()
+    z.stop()
+    z.install_modules({MOD: BASE})
+    z.start()
+    c = z.client()
+    v = c.cmd(M, "Version")
+    lst = c.cmd(M, "List")
+    reconnect(z, c, 1.5)
+    sent = sorted(l for _, l in sent_after_connect(d))
+    finish(z)
+    check(scn, "store has a gap", sorted(st) == ["cmd.0", "cmd.2"], repr(st))
+    check(scn, "baseline %s reads it" % BASE_VER, v == ["delayedperform version %s" % BASE_VER] and
+          lst[3:] == ["0     | 0        | PRIVMSG #a :a", "1     | 0        | PRIVMSG #a :c"], repr((v, lst)))
+    check(scn, "baseline fires both", sent == ["PRIVMSG #a :a", "PRIVMSG #a :c"], repr(sent))
 
 
 def sym_unique():
@@ -645,7 +786,7 @@ def sym_unique():
 
 SCENARIOS = [fire_order, fire_global_delay, fire_reconnect_cancels, fire_unload_pending, fire_hot_load, fire_restart,
              fire_isolation, sh_normalise, var_nick, var_nick_alt, var_nick_invalid, sec_control_chars, sec_secret,
-             cmd_surface, cmd_legacy_store, ty_runtime_load, up_inplace, sym_unique]
+             cmd_surface, cmd_legacy_store, cmd_key_exhausted, ty_runtime_load, up_inplace, up_from_baseline, sym_unique]
 
 
 def selected(fn):
@@ -656,8 +797,8 @@ def selected(fn):
 
 
 def main():
-    print("ZNC: %s | new: %s (%s) | probe: %s | preload: %s"
-          % (ZNC_BIN, NEW, NEW_VER, PROBE or None, EXTRA_ENV.get("LD_PRELOAD")))
+    print("ZNC: %s | new: %s (%s) | probe: %s | base: %s (%s) | preload: %s"
+          % (ZNC_BIN, NEW, NEW_VER, PROBE or None, BASE or None, BASE_VER, EXTRA_ENV.get("LD_PRELOAD")))
     for fn in SCENARIOS:
         if not selected(fn):
             continue

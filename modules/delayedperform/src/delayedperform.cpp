@@ -1,7 +1,7 @@
 /*
  * delayedperform.cpp — ZNC module to run post-connect commands with delays.
  *
- * Version: 1.1.3  (see DELAYED_PERFORM_VERSION below; also queryable via
+ * Version: 1.2.0  (see DELAYED_PERFORM_VERSION below; also queryable via
  *                  the 'Version' command and shown in 'Help').
  *
  * Features:
@@ -17,6 +17,7 @@
  *   /ctcp, /me (requires explicit target), /whois, /away, /oper, /raw, /quote,
  *   service aliases: /ns /cs /hs /ms /os /bs (NickServ etc.)
  * Unknown /verb → fallback to RAW uppercase verb (e.g. /cap ls → "CAP ls").
+ * A supported shorthand missing a required argument is rejected.
  *
  * Variables expanded at send time:
  *   %nick%  — current IRC nick (after reconnect/fallback). Works inside strings.
@@ -25,9 +26,13 @@
  *            CR, LF, etc.), the command is skipped rather than sent with a
  *            malformed nick spliced in.
  *
- * Storage format (NV value for each cmd.<index> key):
+ * Storage format (NV value for each cmd.<key> key):
  *   "<delay>|<flags>|<base64>"          -- v1.1+ entries (flags may be empty)
  *   "<delay>|<base64>"                  -- v1.0 legacy entries (also loaded)
+ * Keys are ordered by their number and need not be contiguous; the indices
+ * shown by List and accepted by Del are positions in that order. A value that
+ * cannot be read is listed as "[corrupt entry]", is never scheduled, and can be
+ * removed with Del.
  *
  * Recognized flag characters:
  *   's'  — secret: command text is never echoed in module output
@@ -36,13 +41,13 @@
 #include <znc/Modules.h>
 #include <znc/IRCNetwork.h>   // for CIRCNetwork::IsIRCConnected
 #include <algorithm>
+#include <climits>  // UINT_MAX
 #include <vector>
-#include <cctype>   // isdigit
 
 using std::vector;
 
 // --- Version string (queryable; see CmdVersion / TModInfo / MODULEDEFS) ---
-#define DELAYED_PERFORM_VERSION "1.1.3"
+#define DELAYED_PERFORM_VERSION "1.2.0"
 
 class CDelayedPerformModule;
 
@@ -103,19 +108,23 @@ class CDelayedPerformModule final : public CModule {
       LoadAll(entries);
       if (entries.empty()) return;
 
+      // Labels carry a per-connection generation, so a timer left from an
+      // earlier connection can never make AddTimer refuse a new one.
+      ++m_uGeneration;
+
       unsigned idx = 0;
       unsigned scheduled = 0;
+      unsigned unreadable = 0;
       for (const Entry& e : entries) {
-        CString cmd = DecodeB64(e.b64);
-        if (cmd.empty()) { ++idx; continue; } // skip corrupt / empty payload
+        if (!e.bReadable) { ++unreadable; ++idx; continue; }
 
-        const CString label = CString("dp#") + CString(idx);
-        CCmdTimer* pT = new CCmdTimer(this, e.delay, label, cmd, IsSecretFlags(e.flags));
-        // Fix #6: respect AddTimer's return; on failure we own the pointer.
+        const CString label = CString("dp#") + CString(m_uGeneration) + "." + CString(idx);
+        CCmdTimer* pT = new CCmdTimer(this, e.delay, label, e.cmd, IsSecretFlags(e.flags));
+        // CModule::AddTimer deletes the timer itself when it refuses it, so
+        // pT must not be touched after a false return.
         if (!AddTimer(pT)) {
           PutModule("Warning: could not schedule entry " + CString(idx)
                     + " (AddTimer returned false).");
-          delete pT;
         } else {
           m_vTimers.push_back(pT);
           ++scheduled;
@@ -123,7 +132,12 @@ class CDelayedPerformModule final : public CModule {
         ++idx;
       }
 
-      PutModule(CString("Scheduled ") + CString(scheduled) + " delayed command(s).");
+      CString msg = CString("Scheduled ") + CString(scheduled) + " delayed command(s).";
+      if (unreadable) {
+        msg += " Skipped " + CString(unreadable)
+             + (unreadable == 1 ? " unreadable entry" : " unreadable entries") + "; see List.";
+      }
+      PutModule(msg);
     }
 
     void OnIRCDisconnected() override {
@@ -163,11 +177,15 @@ class CDelayedPerformModule final : public CModule {
 
     void CmdSetDelay(const CString& sLine) {
       CString sSec = sLine.Token(1);
-      if (sSec.empty() || !IsUIntStr(sSec)) {
+      unsigned secs = 0;
+      if (sSec.empty() || !IsDigits(sSec)) {
         PutModule("Usage: SetDelay <seconds>");
         return;
       }
-      unsigned secs = sSec.ToUInt();
+      if (!ParseUInt(sSec, secs)) {
+        PutModule("SetDelay: seconds must be between 0 and 4294967295.");
+        return;
+      }
       SetNV("global_delay", CString(secs));
       m_uGlobalDelay = secs;
       PutModule("Global delay set to " + CString(secs) + "s.");
@@ -193,15 +211,17 @@ class CDelayedPerformModule final : public CModule {
       unsigned idx = 0;
       for (const Entry& e : entries) {
         CString displayCmd;
-        if (IsSecretFlags(e.flags)) {
-          // Fix #2: never reveal secret command text here.
+        if (!e.bReadable) {
+          // Surface unreadable entries so they can be seen and deleted.
+          displayCmd = "[corrupt entry]";
+        } else if (IsSecretFlags(e.flags)) {
+          // Never reveal secret command text here.
           displayCmd = "[hidden]";
         } else {
-          // Fix #7: surface corrupt entries instead of silently showing blanks.
-          CString decoded = DecodeB64(e.b64);
-          displayCmd = decoded.empty() ? CString("[corrupt entry]") : decoded;
+          displayCmd = ForDisplay(e.cmd);
         }
-        PutModule(CString(idx) + "     | " + CString(e.delay) + "        | " + displayCmd);
+        CString sDelay = e.bDelayOk ? CString(e.delay) : CString("-");
+        PutModule(CString(idx) + "     | " + sDelay + "        | " + displayCmd);
         ++idx;
       }
     }
@@ -219,26 +239,23 @@ class CDelayedPerformModule final : public CModule {
         return;
       }
 
-      if (!IsUIntStr(what)) {
+      if (!IsDigits(what)) {
         PutModule("Del: index must be a non-negative integer.");
         return;
       }
 
-      unsigned idx = what.ToUInt();
       vector<Entry> entries;
       LoadAll(entries);
 
-      if (idx >= entries.size()) {
+      unsigned idx = 0;
+      if (!ParseUInt(what, idx) || idx >= entries.size()) {
         PutModule("Del: index out of range.");
         return;
       }
 
-      vector<Entry> kept;
-      kept.reserve(entries.size() - 1);
-      for (unsigned i = 0; i < entries.size(); ++i) {
-        if (i != idx) kept.push_back(entries[i]);
-      }
-      RewriteAll(kept);
+      // Remove only this entry's key. The others keep their keys, values and
+      // flags; positions close up because List and Del count positions.
+      DelNV(entries[idx].key);
 
       PutModule("Deleted entry " + CString(idx) + ".");
     }
@@ -250,9 +267,8 @@ class CDelayedPerformModule final : public CModule {
 
     // -------- Called from CCmdTimer --------
 
-    // Fix #1: timers call this just before ZNC deletes them (at end of
-    // RunJob for one-shot timers), so m_vTimers never retains dangling
-    // pointers into freed memory.
+    // Timers call this just before ZNC deletes them (at end of RunJob for
+    // one-shot timers), so m_vTimers never retains dangling pointers.
     void ForgetTimer(CTimer* pT) {
       auto it = std::find(m_vTimers.begin(), m_vTimers.end(), pT);
       if (it != m_vTimers.end()) m_vTimers.erase(it);
@@ -261,30 +277,26 @@ class CDelayedPerformModule final : public CModule {
     void FireCommand(const CString& sCmd, bool bSecret) {
       if (!GetNetwork() || !GetNetwork()->IsIRCConnected()) {
         PutModule(bSecret ? CString("Skipped (not connected): [hidden]")
-                          : CString("Skipped (not connected): ") + sCmd);
+                          : CString("Skipped (not connected): ") + ForDisplay(sCmd));
         return;
       }
 
-      // Fix #4: validate the %nick% substitution source against IRC nick
-      // grammar before splicing it into a line destined for PutIRC(). If
-      // the current nick contains any character outside that grammar
-      // (space, ':', ',', CR, LF, etc.) we refuse to send rather than
-      // risk a malformed/split IRC line.
+      // Validate the %nick% substitution source against IRC nick grammar
+      // before splicing it into a line destined for PutIRC().
       CString toSend;
       if (!ExpandVars(sCmd, toSend)) {
         PutModule(bSecret ? CString("Skipped (invalid nick for expansion): [hidden]")
-                          : CString("Skipped (invalid nick for expansion): ") + sCmd);
+                          : CString("Skipped (invalid nick for expansion): ") + ForDisplay(sCmd));
         return;
       }
 
-      // Fix #3 (defense-in-depth): even if something slipped past CmdAdd's
-      // pre-storage check, refuse to inject CR/LF/NUL into the IRC stream.
-      // Note: with the new ExpandVars, a bad nick is already caught above;
-      // this remaining check covers stored commands whose body contains
-      // control chars from some other source (e.g. imported configs).
+      // Defense in depth: refuse to inject CR/LF/NUL into the IRC stream.
+      // Add rejects them, so this covers stored values from other sources
+      // (e.g. an edited registry). The message shows the stored command with
+      // those bytes escaped, never raw.
       if (HasBadChars(toSend)) {
         PutModule(bSecret ? CString("Skipped (contains control chars): [hidden]")
-                          : CString("Skipped (contains control chars): ") + toSend);
+                          : CString("Skipped (contains control chars): ") + ForDisplay(sCmd));
         return;
       }
 
@@ -296,13 +308,19 @@ class CDelayedPerformModule final : public CModule {
   private:
     // ---- Types ----
     struct Entry {
+      CString  key;               // NV key, e.g. "cmd.7"
+      bool     bReadable = false; // value parsed, payload valid and non-empty
+      bool     bDelayOk  = false; // delay field parsed (shown even if unreadable)
       unsigned delay = 0;
-      CString  flags;   // e.g. "s" for secret, "" for normal; future-extensible
-      CString  b64;     // base64-encoded command text
+      CString  flags;             // e.g. "s" for secret, "" for normal; future-extensible
+      CString  cmd;               // decoded command text (when readable)
     };
+
+    enum ESlash { SLASH_NONE, SLASH_OK, SLASH_INCOMPLETE };
 
     // ---- State ----
     unsigned        m_uGlobalDelay{0};
+    unsigned        m_uGeneration{0};
     vector<CTimer*> m_vTimers;
 
     // ---- Timer cleanup ----
@@ -316,13 +334,41 @@ class CDelayedPerformModule final : public CModule {
     }
 
     // ---- Utilities ----
-    static bool IsUIntStr(const CString& s) {
+    static bool IsDigits(const CString& s) {
       if (s.empty()) return false;
       for (size_t i = 0; i < s.length(); ++i) {
-        unsigned char c = static_cast<unsigned char>(s[i]);
-        if (!std::isdigit(c)) return false;
+        if (s[i] < '0' || s[i] > '9') return false;
       }
       return true;
+    }
+
+    // Digits only, and within unsigned int. CString::ToUInt would silently
+    // truncate larger values to 32 bits (4294967296 -> 0).
+    static bool ParseUInt(const CString& s, unsigned& out) {
+      if (!IsDigits(s)) return false;
+      unsigned long long v = 0;
+      for (size_t i = 0; i < s.length(); ++i) {
+        v = v * 10 + static_cast<unsigned>(s[i] - '0');
+        if (v > UINT_MAX) return false;
+      }
+      out = static_cast<unsigned>(v);
+      return true;
+    }
+
+    // True for tokens that are clearly meant as a number but are not a
+    // plain non-negative integer: a sign, a decimal point, or both
+    // ("-3", "+5", "1.5", ".5"). No IRC command starts like that.
+    static bool LooksNumeric(const CString& s) {
+      size_t i = 0;
+      if (i < s.length() && (s[i] == '+' || s[i] == '-')) ++i;
+      bool digit = false, dot = false;
+      for (; i < s.length(); ++i) {
+        char c = s[i];
+        if (c >= '0' && c <= '9') { digit = true; continue; }
+        if (c == '.' && !dot)     { dot = true;   continue; }
+        return false;
+      }
+      return digit;
     }
 
     // Reject control characters that could let a stored/expanded command
@@ -335,13 +381,42 @@ class CDelayedPerformModule final : public CModule {
       return false;
     }
 
-    // Fix #4: strict IRC-nick grammar check used before splicing %nick%
-    // into a line destined for PutIRC(). We permit letters, digits, and
-    // the "special" characters from RFC 2812 nick grammar (including
-    // hyphen, which is widely accepted in practice). Anything else —
-    // space, ':', ',', '@', '!', CR, LF, NUL, non-ASCII, ... — fails.
-    // A non-conforming nick could split or reframe the IRC line; in that
-    // case the caller should refuse to send rather than splice it in.
+    // Text for module output: CR, LF and NUL are shown as \r, \n and \0, so a
+    // stored value can never split or terminate a line the client receives.
+    static CString ForDisplay(const CString& s) {
+      CString out;
+      out.reserve(s.length());
+      for (size_t i = 0; i < s.length(); ++i) {
+        char c = s[i];
+        if (c == '\r')      out += "\\r";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\0') out += "\\0";
+        else                out += c;
+      }
+      return out;
+    }
+
+    // Base64 as ZNC writes it: alphabet only, '=' only as trailing padding.
+    // Missing padding is tolerated (ZNC's decoder accepts it).
+    static bool IsValidB64(const CString& s) {
+      if (s.empty()) return false;
+      size_t n = s.length();
+      size_t pad = 0;
+      while (pad < n && pad < 2 && s[n - 1 - pad] == '=') ++pad;
+      size_t body = n - pad;
+      for (size_t i = 0; i < body; ++i) {
+        char c = s[i];
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '+' || c == '/';
+        if (!ok) return false;
+      }
+      if (pad) return n % 4 == 0;
+      return body % 4 != 1;   // a single trailing symbol encodes no byte
+    }
+
+    // Strict IRC-nick grammar check used before splicing %nick% into a line
+    // destined for PutIRC(). Letters, digits, the RFC 2812 "special"
+    // characters, and hyphen. Anything else fails.
     static bool IsValidIRCNick(const CString& nick) {
       if (nick.empty()) return false;
       for (size_t i = 0; i < nick.length(); ++i) {
@@ -378,7 +453,7 @@ class CDelayedPerformModule final : public CModule {
 
     // ---- Core Add logic (shared by Add and AddSecret) ----
     void DoAdd(const CString& sLine, bool bSecret) {
-      const char* cmdName = bSecret ? "AddSecret" : "Add";
+      const CString cmdName = bSecret ? "AddSecret" : "Add";
 
       // Syntax:
       //  Add 5 JOIN #znc
@@ -388,140 +463,146 @@ class CDelayedPerformModule final : public CModule {
       unsigned per = m_uGlobalDelay;
       CString cmd;
 
-      if (!tok1.empty() && IsUIntStr(tok1)) {
-        per = tok1.ToUInt();
+      if (IsDigits(tok1)) {
+        if (!ParseUInt(tok1, per)) {
+          PutModule(cmdName + ": the delay must be a whole number of seconds from 0 to 4294967295.");
+          return;
+        }
         cmd = sLine.Token(2, true);
+      } else if (LooksNumeric(tok1)) {
+        PutModule(cmdName + ": the delay must be a whole number of seconds from 0 to 4294967295.");
+        return;
       } else {
         cmd = sLine.Token(1, true);
       }
 
       cmd.TrimLeft();
       if (cmd.empty()) {
-        PutModule(CString("Usage: ") + cmdName + " [seconds] <irc-or-slash-command>");
+        PutModule("Usage: " + cmdName + " [seconds] <irc-or-slash-command>");
         return;
       }
 
       // Normalize client-style '/...' to raw IRC if applicable
-      CString normalized;
-      if (NormalizeSlash(cmd, normalized)) {
-        cmd = normalized;
+      CString normalized, usage;
+      switch (NormalizeSlash(cmd, normalized, usage)) {
+        case SLASH_OK:
+          cmd = normalized;
+          break;
+        case SLASH_INCOMPLETE:
+          PutModule(cmdName + ": incomplete shorthand. Usage: " + usage);
+          return;
+        case SLASH_NONE:
+          break;
       }
 
-      // Fix #3: reject control characters now, before persisting.
-      if (HasBadChars(cmd)) {
-        PutModule(CString(cmdName) + ": command contains CR/LF/NUL; rejected.");
+      if (cmd.Trim_n().empty()) {
+        PutModule("Usage: " + cmdName + " [seconds] <irc-or-slash-command>");
         return;
       }
 
+      // Reject control characters now, before persisting.
+      if (HasBadChars(cmd)) {
+        PutModule(cmdName + ": command contains CR/LF/NUL; rejected.");
+        return;
+      }
+
+      unsigned next = 0;
+      if (!NextKey(next)) {
+        PutModule(cmdName + ": no free entry key (cmd.4294967295 is in use). Delete the last entry or use Clear.");
+        return;
+      }
+
+      // The index reported is the entry's position in List, which is what
+      // Del accepts; with gaps in the stored keys it differs from the key.
+      vector<Entry> entries;
+      LoadAll(entries);
+      const unsigned pos = static_cast<unsigned>(entries.size());
+
       CString enc   = CString(cmd).Base64Encode_n();
       CString value = CString(per) + "|" + MakeFlags(bSecret) + "|" + enc;
-
-      unsigned next = NextIndex();
       SetNV(KeyFor(next), value);
 
       if (bSecret) {
-        // Fix #2: do not echo the stored text of a secret command.
-        PutModule("Added [" + CString(next) + "]: delay=" + CString(per) + "s, cmd=[hidden]");
+        // Do not echo the stored text of a secret command.
+        PutModule("Added [" + CString(pos) + "]: delay=" + CString(per) + "s, cmd=[hidden]");
       } else {
-        PutModule("Added [" + CString(next) + "]: delay=" + CString(per) + "s, cmd=" + cmd);
+        PutModule("Added [" + CString(pos) + "]: delay=" + CString(per) + "s, cmd=" + cmd);
       }
     }
 
     void LoadGlobalDelay() {
-      CString v = GetNV("global_delay");
-      m_uGlobalDelay = IsUIntStr(v) ? v.ToUInt() : 0;
+      unsigned v = 0;
+      m_uGlobalDelay = ParseUInt(GetNV("global_delay"), v) ? v : 0;
     }
 
     static CString KeyFor(unsigned idx) {
       return CString("cmd.") + CString(idx);
     }
 
-    unsigned NextIndex() {
+    // Numeric part of a cmd.<n> key, if it has one within range.
+    static bool KeyNumber(const CString& k, unsigned& n) {
+      if (!k.StartsWith("cmd.")) return false;
+      return ParseUInt(k.substr(4), n);
+    }
+
+    // One above the highest numeric key, so a new entry sorts last. False if
+    // the highest key is already the largest possible.
+    bool NextKey(unsigned& out) {
       unsigned maxIdx = 0;
       bool any = false;
       for (auto it = BeginNV(); it != EndNV(); ++it) {
-        const CString& k = it->first;
-        if (k.StartsWith("cmd.")) {
-          CString sNum = k.substr(4);
-          if (IsUIntStr(sNum)) {
-            unsigned n = sNum.ToUInt();
-            if (!any || n > maxIdx) maxIdx = n;
-            any = true;
-          }
+        unsigned n = 0;
+        if (KeyNumber(it->first, n)) {
+          if (!any || n > maxIdx) maxIdx = n;
+          any = true;
         }
       }
-      return any ? (maxIdx + 1) : 0;
-    }
-
-    // Accepts both the v1.1+ format "delay|flags|b64" and the legacy
-    // v1.0 format "delay|b64" (in which case flagsOut is empty).
-    // Base64 never contains '|', so the split is unambiguous.
-    static bool ParseValue(const CString& val,
-                           unsigned& delayOut,
-                           CString&  flagsOut,
-                           CString&  b64Out) {
-      int pos1 = val.Find("|");
-      if (pos1 < 0) return false;
-      CString sDelay = val.Left(pos1);
-      CString rest   = val.substr(pos1 + 1);
-      if (!IsUIntStr(sDelay)) return false;
-      delayOut = sDelay.ToUInt();
-
-      int pos2 = rest.Find("|");
-      if (pos2 < 0) {
-        // legacy v1.0 entry: no flags segment
-        flagsOut = "";
-        b64Out   = rest;
-      } else {
-        flagsOut = rest.Left(pos2);
-        b64Out   = rest.substr(pos2 + 1);
-      }
+      if (!any) { out = 0; return true; }
+      if (maxIdx == UINT_MAX) return false;
+      out = maxIdx + 1;
       return true;
     }
 
-    static CString DecodeB64(const CString& b64) {
-      if (b64.empty()) return CString();
-      return b64.Base64Decode_n();
+    // Parses one stored value into e. Accepts both the v1.1+ format
+    // "delay|flags|b64" and the legacy v1.0 format "delay|b64". Base64 never
+    // contains '|', so the split is unambiguous.
+    static void ParseValue(const CString& val, Entry& e) {
+      CString::size_type pos1 = val.find('|');
+      if (pos1 == CString::npos) return;
+      e.bDelayOk = ParseUInt(val.substr(0, pos1), e.delay);
+
+      CString rest = val.substr(pos1 + 1);
+      CString b64;
+      CString::size_type pos2 = rest.find('|');
+      if (pos2 == CString::npos) {
+        b64 = rest;                  // legacy v1.0 entry: no flags segment
+      } else {
+        e.flags = rest.substr(0, pos2);
+        b64     = rest.substr(pos2 + 1);
+      }
+
+      if (!e.bDelayOk || !IsValidB64(b64)) return;
+      e.cmd = b64.Base64Decode_n();
+      e.bReadable = !e.cmd.empty();
     }
 
     void LoadAll(vector<Entry>& out) {
       out.clear();
-      vector<std::pair<unsigned, CString>> tmp; // (index, raw NV value)
+      vector<std::pair<unsigned, Entry>> tmp;
       for (auto it = BeginNV(); it != EndNV(); ++it) {
-        const CString& k = it->first;
-        if (!k.StartsWith("cmd.")) continue;
-        CString sNum = k.substr(4);
-        if (!IsUIntStr(sNum)) continue;
-        tmp.emplace_back(sNum.ToUInt(), it->second);
+        unsigned n = 0;
+        if (!KeyNumber(it->first, n)) continue;   // other keys are ignored
+        Entry e;
+        e.key = it->first;
+        ParseValue(it->second, e);
+        tmp.emplace_back(n, std::move(e));
       }
       std::sort(tmp.begin(), tmp.end(),
-                [](const std::pair<unsigned, CString>& a,
-                   const std::pair<unsigned, CString>& b){
+                [](const std::pair<unsigned, Entry>& a,
+                   const std::pair<unsigned, Entry>& b){
                   return a.first < b.first;
                 });
-
-      for (const auto& kv : tmp) {
-        Entry e;
-        if (ParseValue(kv.second, e.delay, e.flags, e.b64)) {
-          out.push_back(std::move(e));
-        }
-      }
-    }
-
-    void RewriteAll(const vector<Entry>& entries) {
-      // Clear existing cmd.* keys
-      vector<CString> toDel;
-      for (auto it = BeginNV(); it != EndNV(); ++it) {
-        if (it->first.StartsWith("cmd.")) toDel.push_back(it->first);
-      }
-      for (const CString& k : toDel) DelNV(k);
-
-      // Write back contiguous indices 0..N-1 in the v1.1 format.
-      unsigned idx = 0;
-      for (const Entry& e : entries) {
-        SetNV(KeyFor(idx), CString(e.delay) + "|" + e.flags + "|" + e.b64);
-        ++idx;
-      }
+      for (auto& kv : tmp) out.push_back(std::move(kv.second));
     }
 
     void ClearAll() {
@@ -533,16 +614,14 @@ class CDelayedPerformModule final : public CModule {
     }
 
     // ---- Variable expansion ----
-    // Fix #4: return false if a required substitution would splice in
-    // an unsafe value (currently: a nick that doesn't conform to IRC
-    // nick grammar). Callers should treat false as "skip this send".
-    // On true, `out` holds the fully-expanded command; on false, `out`
-    // is left unmodified and the caller must not transmit it.
+    // Return false if a required substitution would splice in an unsafe
+    // value (currently: a nick that doesn't conform to IRC nick grammar).
+    // On true, `out` holds the fully-expanded command; on false the caller
+    // must not transmit it.
     bool ExpandVars(const CString& in, CString& out) {
       out = in;
-      // CString::Find returns size_t, so compare against npos (a "< 0" test
-      // is always false). Match case-sensitively, like Replace() below, so
-      // only commands that will actually be substituted are nick-validated.
+      // Match case-sensitively, like Replace() below, so only commands that
+      // will actually be substituted are nick-validated.
       if (out.Find("%nick%", CString::CaseSensitive) == CString::npos)
         return true;                             // no substitution needed
       if (!GetNetwork()) return true;            // nothing we can substitute
@@ -556,170 +635,158 @@ class CDelayedPerformModule final : public CModule {
 
     // ---- Slash-command normalization ----
 
-    // Return true if 'in' starts with '/', placing normalized IRC into 'out'.
-    bool NormalizeSlash(const CString& in, CString& out) {
+    // SLASH_NONE: 'in' is not a slash command; store it as raw IRC.
+    // SLASH_OK: 'out' holds the raw IRC line.
+    // SLASH_INCOMPLETE: a supported shorthand is missing a required
+    //   argument; 'usage' holds its usage line and nothing is stored.
+    ESlash NormalizeSlash(const CString& in, CString& out, CString& usage) {
       CString s = in;
       s.TrimLeft();
-      if (!s.StartsWith("/")) { out = in; return false; }
+      if (!s.StartsWith("/")) { out = in; return SLASH_NONE; }
 
       CString verb = s.Token(0);           // includes leading '/'
       CString rest = s.Token(1, true);     // the remainder (may be empty)
 
-      auto U = [](CString x){ x.MakeUpper(); return x; };
+      auto Is = [&verb](const char* v){ return verb.Equals(v, CString::CaseInsensitive); };
+      auto Incomplete = [&usage](const CString& u){ usage = u; return SLASH_INCOMPLETE; };
 
       // Service aliases
-      if (verb.Equals("/ns", CString::CaseInsensitive) ||
-          verb.Equals("/cs", CString::CaseInsensitive) ||
-          verb.Equals("/hs", CString::CaseInsensitive) ||
-          verb.Equals("/ms", CString::CaseInsensitive) ||
-          verb.Equals("/os", CString::CaseInsensitive) ||
-          verb.Equals("/bs", CString::CaseInsensitive)) {
+      if (Is("/ns") || Is("/cs") || Is("/hs") || Is("/ms") || Is("/os") || Is("/bs")) {
         CString svc;
-        if      (verb.Equals("/ns", CString::CaseInsensitive)) svc = "NickServ";
-        else if (verb.Equals("/cs", CString::CaseInsensitive)) svc = "ChanServ";
-        else if (verb.Equals("/hs", CString::CaseInsensitive)) svc = "HostServ";
-        else if (verb.Equals("/ms", CString::CaseInsensitive)) svc = "MemoServ";
-        else if (verb.Equals("/os", CString::CaseInsensitive)) svc = "OperServ";
-        else                                                   svc = "BotServ";
-        if (rest.empty()) return false;
+        if      (Is("/ns")) svc = "NickServ";
+        else if (Is("/cs")) svc = "ChanServ";
+        else if (Is("/hs")) svc = "HostServ";
+        else if (Is("/ms")) svc = "MemoServ";
+        else if (Is("/os")) svc = "OperServ";
+        else                svc = "BotServ";
+        if (rest.empty()) return Incomplete(verb.AsLower() + " <text>");
         out = "PRIVMSG " + svc + " " + EnsureColon(rest);
-        return true;
+        return SLASH_OK;
       }
 
       // Common shorthands
-      if (verb.Equals("/msg", CString::CaseInsensitive)) {
+      if (Is("/msg") || Is("/notice")) {
         CString target = s.Token(1);
         CString text   = s.Token(2, true);
-        if (target.empty() || text.empty()) return false;
-        out = "PRIVMSG " + target + " " + EnsureColon(text);
-        return true;
+        if (target.empty() || text.empty()) return Incomplete(verb.AsLower() + " <target> <text>");
+        out = CString(Is("/msg") ? "PRIVMSG " : "NOTICE ") + target + " " + EnsureColon(text);
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/notice", CString::CaseInsensitive)) {
-        CString target = s.Token(1);
-        CString text   = s.Token(2, true);
-        if (target.empty() || text.empty()) return false;
-        out = "NOTICE " + target + " " + EnsureColon(text);
-        return true;
-      }
-
-      if (verb.Equals("/ctcp", CString::CaseInsensitive)) {
+      if (Is("/ctcp")) {
         CString target = s.Token(1);
         CString payload = s.Token(2, true);
-        if (target.empty() || payload.empty()) return false;
+        if (target.empty() || payload.empty()) return Incomplete("/ctcp <target> <command>");
         CString ctcp = CString("\x01") + payload + CString("\x01");
         out = "PRIVMSG " + target + " " + EnsureColon(ctcp);
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/me", CString::CaseInsensitive)) {
+      if (Is("/me")) {
         CString target = s.Token(1);
         CString action = s.Token(2, true);
-        if (target.empty() || action.empty()) return false;
+        if (target.empty() || action.empty()) return Incomplete("/me <target> <action>");
         CString ctcp = CString("\x01") + CString("ACTION ") + action + CString("\x01");
         out = "PRIVMSG " + target + " " + EnsureColon(ctcp);
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/join", CString::CaseInsensitive)) {
+      if (Is("/join")) {
         CString chan = s.Token(1);
         CString key  = s.Token(2);
-        if (chan.empty()) return false;
+        if (chan.empty()) return Incomplete("/join <#chan> [key]");
         out = "JOIN " + chan + (key.empty() ? "" : CString(" ") + key);
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/part", CString::CaseInsensitive)) {
+      if (Is("/part")) {
         CString chan = s.Token(1);
         CString msg  = s.Token(2, true);
-        if (chan.empty()) return false;
+        if (chan.empty()) return Incomplete("/part <#chan> [reason]");
         out = "PART " + chan + (msg.empty() ? "" : CString(" ") + EnsureColon(msg));
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/quit", CString::CaseInsensitive)) {
-        CString msg = rest;
-        out = "QUIT" + (msg.empty() ? "" : CString(" ") + EnsureColon(msg));
-        return true;
+      if (Is("/quit")) {
+        out = "QUIT" + (rest.empty() ? "" : CString(" ") + EnsureColon(rest));
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/nick", CString::CaseInsensitive)) {
+      if (Is("/nick")) {
         CString newnick = s.Token(1);
-        if (newnick.empty()) return false;
+        if (newnick.empty()) return Incomplete("/nick <nick>");
         out = "NICK " + newnick;
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/topic", CString::CaseInsensitive)) {
+      if (Is("/topic")) {
         CString chan  = s.Token(1);
         CString topic = s.Token(2, true);
-        if (chan.empty()) return false;
+        if (chan.empty()) return Incomplete("/topic <#chan> [topic]");
         out = "TOPIC " + chan + (topic.empty() ? "" : CString(" ") + EnsureColon(topic));
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/mode", CString::CaseInsensitive)) {
+      if (Is("/mode")) {
         CString target = s.Token(1);
         CString args   = s.Token(2, true);
-        if (target.empty()) return false;
+        if (target.empty()) return Incomplete("/mode <target> [modes]");
         out = "MODE " + target + (args.empty() ? "" : CString(" ") + args);
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/kick", CString::CaseInsensitive)) {
+      if (Is("/kick")) {
         CString chan   = s.Token(1);
         CString nick   = s.Token(2);
         CString reason = s.Token(3, true);
-        if (chan.empty() || nick.empty()) return false;
+        if (chan.empty() || nick.empty()) return Incomplete("/kick <#chan> <nick> [reason]");
         out = "KICK " + chan + " " + nick + (reason.empty() ? "" : CString(" ") + EnsureColon(reason));
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/invite", CString::CaseInsensitive)) {
+      if (Is("/invite")) {
         CString nick = s.Token(1);
         CString chan = s.Token(2);
-        if (nick.empty() || chan.empty()) return false;
+        if (nick.empty() || chan.empty()) return Incomplete("/invite <nick> <#chan>");
         out = "INVITE " + nick + " " + chan;
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/whois", CString::CaseInsensitive)) {
+      if (Is("/whois")) {
         CString a = s.Token(1);
         CString b = s.Token(2);
-        if (a.empty() && b.empty()) return false;
-        if (!a.empty() && b.empty()) { out = "WHOIS " + a; return true; }
+        if (a.empty()) return Incomplete("/whois [server] <nick>");
+        if (b.empty()) { out = "WHOIS " + a; return SLASH_OK; }
         bool bLooksServer = (b.Find(".") != CString::npos) || (b.Find(":") != CString::npos);
         if (bLooksServer) out = "WHOIS " + b + " " + a; else out = "WHOIS " + a + " " + b;
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/away", CString::CaseInsensitive)) {
-        CString msg = rest;
-        out = "AWAY" + (msg.empty() ? "" : CString(" ") + EnsureColon(msg));
-        return true;
+      if (Is("/away")) {
+        out = "AWAY" + (rest.empty() ? "" : CString(" ") + EnsureColon(rest));
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/oper", CString::CaseInsensitive)) {
+      if (Is("/oper")) {
         CString name = s.Token(1);
         CString pass = s.Token(2);
-        if (name.empty() || pass.empty()) return false;
+        if (name.empty() || pass.empty()) return Incomplete("/oper <name> <password>");
         out = "OPER " + name + " " + pass;
-        return true;
+        return SLASH_OK;
       }
 
-      if (verb.Equals("/raw", CString::CaseInsensitive) ||
-          verb.Equals("/quote", CString::CaseInsensitive)) {
+      if (Is("/raw") || Is("/quote")) {
+        if (rest.Trim_n().empty()) return Incomplete(verb.AsLower() + " <irc-line>");
         out = rest; // pass-through
-        return true;
+        return SLASH_OK;
       }
 
       // Generic fallback: strip '/', uppercase verb, keep args
-      {
-        CString bareVerb = verb.substr(1);
-        if (bareVerb.empty()) { out = in; return false; }
-        out = U(bareVerb) + (rest.empty() ? "" : CString(" ") + rest);
-        return true;
-      }
+      CString bareVerb = verb.substr(1);
+      if (bareVerb.empty()) return Incomplete("/<command> [arguments]");
+      bareVerb.MakeUpper();
+      out = bareVerb + (rest.empty() ? "" : CString(" ") + rest);
+      return SLASH_OK;
     }
 };
 
@@ -728,7 +795,7 @@ void CCmdTimer::RunJob() {
   auto* p = dynamic_cast<CDelayedPerformModule*>(GetModule());
   if (!p) return;
   p->FireCommand(m_sCommand, m_bSecret);
-  // Fix #1: drop our pointer from the module's vector before ZNC deletes us.
+  // Drop our pointer from the module's vector before ZNC deletes us.
   p->ForgetTimer(this);
 }
 

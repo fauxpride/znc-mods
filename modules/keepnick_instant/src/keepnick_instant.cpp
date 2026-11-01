@@ -1,5 +1,5 @@
 // keepnick_instant.cpp — auto-backend, idle-aware, join-safe nick reclaim for ZNC
-// Version: 1.6.9
+// Version: 1.7.0
 // Behavior:
 //   • Backend mode: Auto (default) uses MONITOR when advertised via 005, and can also live-probe MONITOR on hot-swapped already-connected sessions; otherwise falls back to ISON
 //   • Polls with ISON every Interval seconds (default 5s) ONLY when backend resolves to ISON and you don't own the Primary nick
@@ -7,15 +7,21 @@
 //   • Idle-aware: skips a backend check if you sent any command in the last IdleGap seconds (default 2s)
 //   • Join-safe: first backend action is delayed StartDelay seconds after connect (default 90s)
 //   • Dedupes: won't send repeated NICK within MinGap seconds (default 3s)
+//   • MONITOR that gets no reply by the next scheduled tick is abandoned for the connection; ISON takes over
+//   • Each 303 is matched to the ISON that asked it (module or user); only the module's are swallowed
 //   • Jitter: adds 0..Jitter seconds (default 0) to each scheduled backend tick so it doesn't align with other timers
 //
 // Build: znc-buildmod keepnick_instant.cpp
 #include <znc/Modules.h>
 #include <znc/IRCNetwork.h>
 #include <znc/User.h>
+#include <climits>
 #include <ctime>
+#include <deque>
 #include <vector>
 #include <cstdlib>
+
+#define KEEPNICK_INSTANT_VERSION "1.7.0"
 
 static unsigned Rand0To(unsigned n) { return n ? (std::rand() % (n + 1)) : 0; }
 
@@ -68,7 +74,19 @@ class CKeepNickInstant : public CModule {
   unsigned MonitorLimit            = 0;            // Optional MONITOR=<n> limit from ISUPPORT
   bool     HotReloadDetectPending   = false;        // Fire a one-time MONITOR probe on hot reload even when HavePrimary() is true
   bool     NickAttemptPending        = false;        // Set when we fire NICK <Primary>; used to swallow the 433/437 response so client scripts don't see it
-  int      ISONQueryPending          = 0;            // Counts outstanding module-sent ISONs; 303 is swallowed while > 0, supporting multiple in-flight responses correctly
+  time_t   MonitorProbeAt            = 0;            // When the outstanding MONITOR + was sent (0 = none outstanding)
+
+  // One record per ISON sent on this connection, in send order. The server
+  // answers ISONs in order, so the front record says who asked the next 303.
+  struct IsonQuery {
+    bool   mine;          // sent by the module (its 303 is swallowed)
+    bool   askedPrimary;  // the query included Primary
+    time_t sent;
+  };
+  std::deque<IsonQuery> PendingIson;
+  static const size_t kMaxPendingIson = 16;      // bound; older records are dropped
+  static const time_t kIsonReplyMaxAge = 60;    // a record this old is assumed unanswered
+  static const time_t kMonitorReplyGrace = 2;   // minimum wait before a MONITOR probe counts as unanswered
   unsigned BackendTimerSerial      = 0;            // Unique backend timer label suffix
   CString  BackendTimerLabel;                      // Currently armed backend timer label
 
@@ -112,6 +130,22 @@ class CKeepNickInstant : public CModule {
       if (c < 0x20 || c == 0x7F) return false;
       if (c == ' ' || c == ',') return false;
     }
+    return true;
+  }
+
+  // Digits only, within [lo, hi]. CString::ToUInt reads non-numeric text as
+  // 0 and truncates to 32 bits, so "abc" would become 0 and 4294967301
+  // would become 5.
+  static bool ParseSetting(const CString& s, unsigned lo, unsigned hi, unsigned& out) {
+    if (s.empty()) return false;
+    unsigned long long v = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (s[i] < '0' || s[i] > '9') return false;
+      v = v * 10 + (unsigned)(s[i] - '0');
+      if (v > UINT_MAX) return false;
+    }
+    if (v < lo || v > hi) return false;
+    out = (unsigned)v;
     return true;
   }
 
@@ -162,11 +196,12 @@ class CKeepNickInstant : public CModule {
         if (ParseBackendMode(r, mode)) BackendMode = mode;
       }
     }
-    { CString r=GetNV("IntervalSec");   if (!r.empty()) { unsigned v=r.ToUInt(); if (v>=5 && v<=300) IntervalSec=v; } }
-    { CString r=GetNV("IdleGapSec");    if (!r.empty()) { unsigned v=r.ToUInt(); if (v<=30)          IdleGapSec=v; } }
-    { CString r=GetNV("StartDelaySec"); if (!r.empty()) { unsigned v=r.ToUInt(); if (v<=600)         StartDelaySec=v; } }
-    { CString r=GetNV("JitterSec");     if (!r.empty()) { unsigned v=r.ToUInt(); if (v<=10)          JitterSec=v; } }
-    { CString r=GetNV("MinGapSec");     if (!r.empty()) { unsigned v=r.ToUInt(); if (v<=30)          MinGapSec=v; } }
+    // A stored value that is not a number in range keeps the default.
+    ParseSetting(GetNV("IntervalSec"),   5, 300, IntervalSec);
+    ParseSetting(GetNV("IdleGapSec"),    0, 30,  IdleGapSec);
+    ParseSetting(GetNV("StartDelaySec"), 0, 600, StartDelaySec);
+    ParseSetting(GetNV("JitterSec"),     0, 10,  JitterSec);
+    ParseSetting(GetNV("MinGapSec"),     0, 30,  MinGapSec);
   }
 
   void SaveNV() {
@@ -225,8 +260,30 @@ class CKeepNickInstant : public CModule {
     ArmBackend(next);
   }
 
-  void RunBackendCheckNow(bool bIgnoreIdle) {
+  // bScheduled is true for the backend timer's own ticks and false for
+  // checks forced by commands (Poke, SetNick, Backend, Enable).
+  void RunBackendCheckNow(bool bIgnoreIdle, bool bScheduled) {
     if (!Enabled) return;
+
+    // Nothing is sent until registration has finished: before 001 the
+    // server would reject ISON/MONITOR/NICK with 451. A tick armed at load
+    // time can fire while ZNC is still registering (StartDelay 0 does).
+    if (!IsConnected()) return;
+
+    time_t now = std::time(nullptr);
+
+    // A MONITOR + that is still unanswered at a later scheduled tick will not
+    // be answered: the server advertised MONITOR but ignores it. Give up on
+    // MONITOR for this connection and let ISON take over in this same tick.
+    // A late 730/731 still re-enables MONITOR (see OnRaw).
+    if (bScheduled && MonitorProbeSent && !MonitorActive && MonitorProbeAt &&
+        now - MonitorProbeAt >= kMonitorReplyGrace) {
+      MonitorUsable = false;
+      MonitorProbeSent = false;
+      MonitorProbeAt = 0;
+      MonitorKnownFree = false;
+      PutModule("MONITOR got no reply on this connection; falling back to ISON.");
+    }
 
     // Hot-reload MONITOR detection: fires once at the first backend tick after a hot
     // reload into an already-live session, regardless of whether we currently own the
@@ -240,6 +297,7 @@ class CKeepNickInstant : public CModule {
           !MonitorProbeSent && !MonitorActive && IsConnected() && !Primary.empty()) {
         PutIRC("MONITOR + " + Primary);
         MonitorProbeSent = true;
+        MonitorProbeAt = now;
         // MonitorActive is not set here; only set on 730/731 server confirmation.
         return; // wait for server response before doing anything else this tick
       }
@@ -251,7 +309,6 @@ class CKeepNickInstant : public CModule {
       return;
     }
 
-    time_t now = std::time(nullptr);
     if (!bIgnoreIdle && LastUserActivity && (now - LastUserActivity) < (time_t)IdleGapSec) return;
 
     if (UseMonitorBackend()) {
@@ -259,14 +316,14 @@ class CKeepNickInstant : public CModule {
       else if (MonitorKnownFree) TryReclaim();
     } else if (!MaybeProbeMonitor()) {
       if (MonitorActive) StopMonitor(Primary);
-      ISONQueryPending++;  // arm 303 swallow for this poll; counter handles multiple in-flight ISONs
+      NoteIson(/*mine=*/true, /*askedPrimary=*/true);
       PutIRC("ISON " + Primary);
     }
   }
 
   void KickBackendNow(bool bIgnoreIdle) {
     if (!Enabled || Primary.empty()) return;
-    RunBackendCheckNow(bIgnoreIdle);
+    RunBackendCheckNow(bIgnoreIdle, /*bScheduled=*/false);
     if (!HavePrimary()) ForceArmBackend(IntervalSec + Rand0To(JitterSec));
   }
 
@@ -278,6 +335,7 @@ class CKeepNickInstant : public CModule {
     if (Primary.empty() || HavePrimary()) return false;
     PutIRC("MONITOR + " + Primary);
     MonitorProbeSent = true;
+    MonitorProbeAt = std::time(nullptr);
     // MonitorActive is intentionally NOT set here — it is only set to true
     // once the server confirms support via a 730/731 response. Setting it
     // prematurely here would cause other code paths to treat an unconfirmed
@@ -291,6 +349,7 @@ class CKeepNickInstant : public CModule {
     PutIRC("MONITOR - " + nick);
     MonitorActive = false;
     MonitorProbeSent = false; // allow EnsureMonitor to re-subscribe if needed
+    MonitorProbeAt = 0;
     MonitorKnownFree = false;
   }
 
@@ -301,6 +360,7 @@ class CKeepNickInstant : public CModule {
     if (MonitorActive || MonitorProbeSent) return; // already active or sent but awaiting server confirmation
     PutIRC("MONITOR + " + Primary);
     MonitorProbeSent = true;
+    MonitorProbeAt = std::time(nullptr);
     // MonitorActive is intentionally NOT set here. Same policy as MaybeProbeMonitor():
     // MonitorActive is only set to true once the server confirms the subscription via
     // a 730 or 731 numeric. Setting it here optimistically would cause the backend
@@ -318,8 +378,15 @@ class CKeepNickInstant : public CModule {
     return false;
   }
 
+  // Records an ISON about to be sent, so its 303 can be matched to it.
+  void NoteIson(bool mine, bool askedPrimary) {
+    if (PendingIson.size() >= kMaxPendingIson) PendingIson.pop_front();
+    PendingIson.push_back(IsonQuery{mine, askedPrimary, std::time(nullptr)});
+  }
+
   void TryReclaim() {
     if (!Enabled) return;
+    if (!IsConnected()) return;
     if (HavePrimary()) return;
     time_t now = std::time(nullptr);
     if (LastAttempt && now - LastAttempt < (time_t)MinGapSec) return; // dedupe
@@ -334,7 +401,7 @@ class CKeepNickInstant : public CModule {
  public:
   MODCONSTRUCTOR(CKeepNickInstant) {}
 
-  bool OnLoad(const CString& sArgs, CString& sMessage) override {
+  bool OnLoad(const CString& sArgs, CString& /*sMessage*/) override {
     std::srand((unsigned)std::time(nullptr) ^ (unsigned)(uintptr_t)this);
     LoadPrimary(sArgs.Trim_n());
     LoadNV();
@@ -365,7 +432,7 @@ class CKeepNickInstant : public CModule {
     // the old timer stays in ZNC's queue even though TimerArmed and BackendTimerLabel
     // are cleared, causing ArmBackend below to arm a second timer. Both then fire
     // independently on their next tick, creating duplicate ISON cycles that race
-    // against each other and defeat the ISONQueryPending swallow.
+    // against each other and desynchronise the ISON reply matching.
     if (!BackendTimerLabel.empty()) RemTimer(BackendTimerLabel);
     TimerArmed = false;
     BackendTimerLabel = "";
@@ -378,7 +445,8 @@ class CKeepNickInstant : public CModule {
     MonitorLimit = 0;
     HotReloadDetectPending = false;
     NickAttemptPending = false;
-    ISONQueryPending = 0;
+    PendingIson.clear();
+    MonitorProbeAt = 0;
     ArmBackend(StartDelaySec); // join-safe start
   }
 
@@ -399,12 +467,31 @@ class CKeepNickInstant : public CModule {
     MonitorLimit = 0;
     HotReloadDetectPending = false;
     NickAttemptPending = false;
-    ISONQueryPending = 0;
+    PendingIson.clear();
+    MonitorProbeAt = 0;
   }
 
-  // Track user activity: any outbound line from your client through ZNC
-  EModRet OnUserRaw(CString& /*line*/) override {
+  // Track user activity: any outbound line from your client through ZNC,
+  // except keepalive PING/PONG, which clients send on their own. Also note
+  // the user's ISONs so their 303 replies are recognised as theirs.
+  EModRet OnUserRaw(CString& line) override {
+    CString l = line;
+    if (l.StartsWith("@")) l = l.Token(1, true);   // skip IRCv3 tags
+    CString cmd = l.Token(0);
+    if (cmd.Equals("PING", false) || cmd.Equals("PONG", false)) return CONTINUE;
     LastUserActivity = std::time(nullptr);
+
+    if (cmd.Equals("ISON", false) && IsConnected()) {
+      CString params = l.Token(1, true);
+      params.TrimLeft(CString(":"));
+      VCString nicks; params.Split(" ", nicks, false);
+      bool asked = false;
+      for (const auto& n : nicks) {
+        CString x = n; x.TrimLeft(CString(":"));
+        if (!x.empty() && x.Equals(Primary, false)) { asked = true; break; }
+      }
+      if (!nicks.empty()) NoteIson(/*mine=*/false, asked);
+    }
     return CONTINUE;
   }
 
@@ -433,33 +520,37 @@ class CKeepNickInstant : public CModule {
         if (key.Equals("MONITOR", false)) {
           MonitorSupported = true;
           CString val = tok.Token(1, false, "=");
-          if (!val.empty()) MonitorLimit = val.ToUInt();
+          if (!ParseSetting(val, 0, UINT_MAX, MonitorLimit)) MonitorLimit = 0;  // display only
         }
       }
       return CONTINUE;
     }
 
     // ISON result: 303 <me> :nick1 nick2 ...
+    // Matched to the ISON it answers (the server replies in order). The
+    // module's own 303s are swallowed and decide reclaim; a user's 303 is
+    // passed through, and triggers reclaim only if that ISON asked about
+    // Primary and Primary is absent. A 303 nobody is known to have asked
+    // for is passed through and ignored.
     if (cmd == "303") {
-      // Older ZNC API compat: trailing starts at token index 3
       CString trailing = sLine.Token(3, true);    // ":nick1 nick2 ..."
-      trailing.TrimLeft(CString(":"));           // Trim leading ':'
+      trailing.TrimLeft(CString(":"));
 
       bool present = false;
       VCString names; trailing.Split(" ", names, false);
       for (const auto& n : names) {
         if (n.Equals(Primary, false)) { present = true; break; }
       }
-      if (!present) TryReclaim();
 
-      // Swallow 303 responses caused by our own ISON polls so they do not appear
-      // in the client status window. ISONQueryPending counts outstanding module-sent
-      // ISONs; a counter rather than a bool correctly handles multiple in-flight 303
-      // responses (e.g. from a brief duplicate timer race). If the count is above zero
-      // this 303 is ours — decrement and swallow. Manual /ison commands sent by the
-      // user do not increment the counter and are always passed through normally.
-      if (ISONQueryPending > 0) { ISONQueryPending--; return HALT; }
-      return CONTINUE;
+      time_t now = std::time(nullptr);
+      while (!PendingIson.empty() && now - PendingIson.front().sent > kIsonReplyMaxAge)
+        PendingIson.pop_front();
+      if (PendingIson.empty()) return CONTINUE;
+
+      IsonQuery q = PendingIson.front();
+      PendingIson.pop_front();
+      if (q.askedPrimary && !present) TryReclaim();
+      return q.mine ? HALT : CONTINUE;
     }
 
     // MONITOR online/offline numerics
@@ -481,6 +572,7 @@ class CKeepNickInstant : public CModule {
         // subscribed to Primary on this connection.
         MonitorUsable = true;
         MonitorActive = true;
+        MonitorProbeAt = 0;
         MonitorKnownFree = (cmd == "731");
         if (cmd == "731") TryReclaim();
       }
@@ -516,6 +608,7 @@ class CKeepNickInstant : public CModule {
         MonitorActive = false;
         MonitorKnownFree = false;
         MonitorProbeSent = false;
+        MonitorProbeAt = 0;
         ForceArmBackend(IntervalSec);
         if (ours) return HALT; // swallow — module-generated probe, no client noise
         PutModule("MONITOR unsupported on this connection; falling back to ISON.");
@@ -626,28 +719,28 @@ class CKeepNickInstant : public CModule {
       }
     }
     else if (cmd == "interval") {
-      unsigned v = sCmdLine.Token(1).ToUInt();
-      if (v>=5 && v<=300) { IntervalSec=v; SaveNV(); PutModule("Interval set to " + CString(v) + "s (ISON frequency when backend resolves to ISON and you don't own the nick)."); }
+      unsigned v = 0;
+      if (ParseSetting(sCmdLine.Token(1), 5, 300, v)) { IntervalSec=v; SaveNV(); PutModule("Interval set to " + CString(v) + "s (ISON frequency when backend resolves to ISON and you don't own the nick)."); }
       else PutModule("Usage: Interval <seconds 5-300> — Default 5s.");
     }
     else if (cmd == "idlegap") {
-      unsigned v = sCmdLine.Token(1).ToUInt();
-      if (v<=30) { IdleGapSec=v; SaveNV(); PutModule("IdleGap set to " + CString(v) + "s. Skip a backend tick if you've sent anything in the last IdleGap seconds."); }
+      unsigned v = 0;
+      if (ParseSetting(sCmdLine.Token(1), 0, 30, v)) { IdleGapSec=v; SaveNV(); PutModule("IdleGap set to " + CString(v) + "s. Skip a backend tick if you've sent anything in the last IdleGap seconds."); }
       else PutModule("Usage: IdleGap <seconds 0-30> — Default 2s.");
     }
     else if (cmd == "startdelay") {
-      unsigned v = sCmdLine.Token(1).ToUInt();
-      if (v<=600) { StartDelaySec=v; SaveNV(); PutModule("StartDelay set to " + CString(v) + "s. First backend action after connect (join-safe). Effective next connect."); }
+      unsigned v = 0;
+      if (ParseSetting(sCmdLine.Token(1), 0, 600, v)) { StartDelaySec=v; SaveNV(); PutModule("StartDelay set to " + CString(v) + "s. First backend action after connect (join-safe). Effective next connect."); }
       else PutModule("Usage: StartDelay <seconds 0-600> — Default 90s.");
     }
     else if (cmd == "jitter") {
-      unsigned v = sCmdLine.Token(1).ToUInt();
-      if (v<=10) { JitterSec=v; SaveNV(); PutModule("Jitter set to 0.." + CString(v) + "s. Random extra wait added to each scheduled backend tick."); }
+      unsigned v = 0;
+      if (ParseSetting(sCmdLine.Token(1), 0, 10, v)) { JitterSec=v; SaveNV(); PutModule("Jitter set to 0.." + CString(v) + "s. Random extra wait added to each scheduled backend tick."); }
       else PutModule("Usage: Jitter <seconds 0-10> — Default 0s.");
     }
     else if (cmd == "mingap") {
-      unsigned v = sCmdLine.Token(1).ToUInt();
-      if (v<=30) { MinGapSec=v; SaveNV(); PutModule("MinGap set to " + CString(v) + "s. Minimum spacing between NICK attempts (dedupe)."); }
+      unsigned v = 0;
+      if (ParseSetting(sCmdLine.Token(1), 0, 30, v)) { MinGapSec=v; SaveNV(); PutModule("MinGap set to " + CString(v) + "s. Minimum spacing between NICK attempts (dedupe)."); }
       else PutModule("Usage: MinGap <seconds 0-30> — Default 3s.");
     }
     else if (cmd == "poke") {
@@ -659,7 +752,7 @@ class CKeepNickInstant : public CModule {
     else if (cmd == "show" || cmd.empty() || cmd == "help") {
       CString cur = GetNetwork() ? GetNetwork()->GetIRCNick().GetNick() : "<none>";
       PutModule("keepnick_instant — auto-backend nick reclaim (MONITOR when available, otherwise ISON; idle-aware & join-safe).");
-      PutModule("Version: 1.6.9");
+      PutModule("Version: " KEEPNICK_INSTANT_VERSION);
       PutModule("Current state:");
       PutModule("  Status: " + CString(Enabled ? "ENABLED" : "DISABLED"));
       PutModule("  Primary: " + Primary + "   |   Current: " + cur);
@@ -700,7 +793,7 @@ void CISONOnceTimer::RunJob() {
 
   if (!m->Enabled) return;
 
-  m->RunBackendCheckNow(false);
+  m->RunBackendCheckNow(false, /*bScheduled=*/true);
   m->RearmBackend();
 }
 
@@ -717,6 +810,6 @@ void CRearmTimer::RunJob() {
 
 template<> void TModInfo<CKeepNickInstant>(CModInfo& Info) {
   Info.SetHasArgs(true);
-  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/437/303/421 swallow, timer cleanup, ISON counter, nick validation, match-gated MONITOR state)");
+  Info.SetDescription("Auto-backend, idle-aware, join-safe nick reclaim for ZNC (MONITOR when available with remembered offline state and local retry cadence, otherwise ISON; OnRaw pre-filter, hot-reload MONITOR detect, 433/437/303/421 swallow, timer cleanup, per-query ISON reply matching, unanswered-MONITOR fallback, nick validation, match-gated MONITOR state)");
 }
-NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v1.6.9")
+NETWORKMODULEDEFS(CKeepNickInstant, "Auto-backend keepnick (MONITOR/ISON instant-ish, hot-reload safe, local MONITOR retry state) v" KEEPNICK_INSTANT_VERSION)
